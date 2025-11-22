@@ -1,0 +1,19 @@
+# 1. 使用輕量級的 Python 基礎鏡像
+FROM python:3.9-slim
+
+# 2. 設置工作目錄
+WORKDIR /app
+
+# 3. 複製依賴清單並安裝
+# (所以請務必先執行 pip freeze > requirements.txt)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 4. 複製所有代碼文件到容器內
+COPY . .
+
+# 5. 設置環境變量 (讓 Python 打印日誌不緩存，方便查看)
+ENV PYTHONUNBUFFERED=1
+
+# 6. 啟動命令
+CMD ["python", "main.py"]

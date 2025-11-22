@@ -1,0 +1,16 @@
+# --- 機密文件 (絕對不能上傳) ---
+.env
+service_account.json
+
+# --- 系統垃圾與緩存 ---
+__pycache__/
+*.pyc
+.DS_Store
+
+# --- 虛擬環境 ---
+venv/
+.venv/
+
+# --- 本地生成的臨時文件 ---
+temp_downloads/
+MF_Import_Data.csv
