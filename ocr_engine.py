@@ -7,14 +7,15 @@ load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
 
 if not api_key:
-    raise ValueError("⚠️ 嚴重錯誤: 未找到 GEMINI_API_KEY")
+    raise ValueError("⚠️ 重大エラー: GEMINI_API_KEYが見つかりません。.envを確認してください")
 
 genai.configure(api_key=api_key)
 model = genai.GenerativeModel('gemini-2.0-flash-exp') 
 
 def process_pipeline(file_path):
     filename = os.path.basename(file_path)
-    print(f"🧠 Gemini 正在進行財務級別校對 (V5.0): {filename} ...")
+    # 日語日誌
+    print(f"🧠 Geminiが画像を解析中: {filename} ...")
     
     try:
         with open(file_path, "rb") as f:
@@ -26,41 +27,39 @@ def process_pipeline(file_path):
         elif ".heic" in ext: mime_type = "image/heic"
         elif ".pdf" in ext: mime_type = "application/pdf"
 
-        # === V5.0 Prompt ===
+        # === Prompt 已漢化為日語，以提高對日本收據的理解力 ===
         prompt = """
-        你是一個審計級別的會計助手。請處理這張可能包含混合稅率的單據。
-        任務：準確提取 8% 和 10% 的【交易金額】，並生成 JSON。
+        あなたはプロの経理担当者です。この領収書（または請求書）を分析し、混合税率を考慮してデータを抽出してください。
         
-        【⚠️ 核心指令：抓取「對象額」，不要抓「稅額」】
-        收據底部通常有兩列數字，請務必區分清楚：
-        1. **對象額 (Target Amount)**：通常寫著 "対象額"、"税抜"、"Tax Base"。 -> **這才是我們要的金額！**
-        2. **稅額 (Tax Amount)**：通常寫著 "消費税"、"税"、"Tax"。 -> **絕對不要抓這個數字！**
+        【⚠️ 重要：金額の正確性について】
+        レシート下部にある「税率別内訳（対象額・税抜金額）」を最優先で参照してください。
+        1. **対象額 (Target Amount)**： "税抜"、"対象額"、"Tax Base" と記載されている数字を取得してください。（消費税額ではありません！）
+        2. **計算禁止**：商品価格を自分で足し算しないでください。必ずレシートの集計値を読み取ってください。
         
-        【提取規則】
-        1. 請查找 "8% 対象額" (或類似字樣) 對應的數字 -> 作為 8% 金額。
-        2. 請查找 "10% 対象額" (或類似字樣) 對應的數字 -> 作為 10% 金額。
-        3. 如果找不到 "対象額" 字樣，請找數值較大的那個數字（因為本金通常比稅額大）。
-        4. **禁止計算**：嚴禁你自己去加減上面的商品價格。
+        【抽出ルール】
+        1. "8% 対象額" (軽減税率) の数字を探す -> 8%金額とする。
+        2. "10% 対象額" (標準税率) の数字を探す -> 10%金額とする。
+        3. "対象額"が見つからない場合は、税額よりも大きい数字（本体価格）を選んでください。
         
-        【摘要填寫】
-        1. 10% 金額極小 (< 20円) 且無明顯商品名 -> 填 "レジ袋"。
-        2. 8% 部分 -> 填 "食料品" 或具體品名。
+        【摘要(Description)の入力ルール】
+        1. 10%対象の金額が小さく(< 20円)、品名が不明な場合は "レジ袋" と記入してください。
+        2. 8%対象は "食料品" または具体的な品名を記入してください。
         
-        請返回如下 JSON 格式：
+        以下のJSONフォーマットのみを返してください（Markdownタグ不要）：
         {
             "date": "YYYY/MM/DD",
-            "vendor": "供應商名稱",
-            "category": "推測會計科目",
+            "vendor": "店舗名・業者名",
+            "category": "勘定科目 (例: 会議費, 消耗品費, 仕入高)",
             "split_items": [
                 {
-                    "amount": "8%部分的【對象額】 (純數字)",
+                    "amount": "8%対象額 (半角数字)",
                     "tax_type": "課対仕入8% (軽)",
-                    "description": "8%部分的商品摘要"
+                    "description": "8%部分の摘要"
                 },
                 {
-                    "amount": "10%部分的【對象額】 (純數字)",
+                    "amount": "10%対象額 (半角数字)",
                     "tax_type": "課対仕入10%",
-                    "description": "10%部分的商品摘要"
+                    "description": "10%部分の摘要"
                 }
             ]
         }
@@ -75,5 +74,5 @@ def process_pipeline(file_path):
         return json.loads(text)
 
     except Exception as e:
-        print(f"❌ 識別失敗: {e}")
+        print(f"❌ 解析失敗: {e}")
         return None

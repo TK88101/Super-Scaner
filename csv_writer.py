@@ -10,9 +10,6 @@ MF_HEADERS = [
 OUTPUT_FILE = "MF_Import_Data.csv"
 
 def append_to_csv(data):
-    """
-    支持寫入多行數據 (針對混合稅率)
-    """
     file_exists = os.path.isfile(OUTPUT_FILE)
     
     with open(OUTPUT_FILE, mode='a', newline='', encoding='shift_jis') as f:
@@ -21,29 +18,28 @@ def append_to_csv(data):
         if not file_exists:
             writer.writerow(MF_HEADERS)
             
-        # 獲取 AI 拆分好的列表
         items = data.get("split_items", [])
         
-        # 遍歷列表，有幾種稅率就寫幾行
         for item in items:
             amount = item.get("amount")
             if not amount or int(amount) == 0:
-                continue # 跳過金額為0的空行
+                continue
 
             row = [
-                data.get("date"),                # 日期 (共用)
-                data.get("category"),            # 科目 (共用)
+                data.get("date"),                
+                data.get("category"),            
                 "",
-                item.get("tax_type"),            # 各自的稅率
-                amount,                          # 各自的金額
+                item.get("tax_type"),            
+                amount,                          
                 "",
                 "現金",
                 "",
                 "対象外",
                 amount,
                 "",
-                f"{data.get('vendor')} - {item.get('description')}" # 摘要帶上具體內容
+                f"{data.get('vendor')} - {item.get('description')}" 
             ]
             
             writer.writerow(row)
-            print(f"💾 已寫入 CSV 行 ({item.get('tax_type')}): {amount}")
+            # 日語日誌：寫入成功
+            print(f"💾 CSVに行を追加: {item.get('tax_type')} - ¥{amount}")

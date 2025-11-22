@@ -9,7 +9,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from ocr_engine import process_pipeline
 from csv_writer import append_to_csv
 
-# ================= 1. 加載配置 =================
+# ================= 配置區域 =================
 load_dotenv()
 INPUT_FOLDER_ID = os.getenv("INPUT_FOLDER_ID")
 PROCESSED_FOLDER_ID = os.getenv("PROCESSED_FOLDER_ID")
@@ -18,9 +18,8 @@ SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE")
 LOCAL_DOWNLOAD_DIR = './temp_downloads'
 CSV_FILENAME = "MF_Import_Data.csv"
 
-# 檢查配置是否完整
 if not INPUT_FOLDER_ID or not PROCESSED_FOLDER_ID or not CSV_FOLDER_ID or not SERVICE_ACCOUNT_FILE:
-    print("❌ 錯誤：請檢查 .env 文件配置，確保包含 INPUT, PROCESSED, CSV 三個文件夾的 ID")
+    print("❌ エラー：.envファイルの設定を確認してください (配置錯誤)")
     exit(1)
 # ==============================================
 
@@ -43,7 +42,7 @@ def download_file(service, file_id, file_name):
     file_path = os.path.join(LOCAL_DOWNLOAD_DIR, file_name)
     request = service.files().get_media(fileId=file_id)
     
-    print(f"⬇️  正在下載: {file_name} ...")
+    print(f"⬇️  ダウンロード中: {file_name} ...")
     fh = io.FileIO(file_path, 'wb')
     downloader = MediaIoBaseDownload(fh, request)
     done = False
@@ -59,72 +58,64 @@ def move_file(service, file_id, previous_folder_id, new_folder_id):
             removeParents=previous_folder_id,
             fields='id, parents'
         ).execute()
-        print(f"📦 原始圖片已歸檔至 Processed 文件夾")
+        print(f"📦 元画像を処理済みフォルダ(Processed)へ移動しました")
     except Exception as e:
-        print(f"⚠️ 移動文件時發生警告: {e}")
+        print(f"⚠️ ファイル移動中に警告が発生しました: {e}")
 
 def sync_csv_to_drive(service):
     """
-    將 CSV 同步到專用的 CSV_Exports 文件夾
+    將 CSV 同步到雲端 (日語日誌)
     """
-    print("☁️  正在將最新 CSV 同步到 [CSV_Exports] 文件夾...")
+    print("☁️  最新のCSVをクラウドへ同期中...")
     
-    # 1. 在 CSV 專用文件夾中查找同名文件
-    query = f"name = '{CSV_FILENAME}' and '{CSV_FOLDER_ID}' in parents and trashed = false"
-    results = service.files().list(q=query, fields="files(id)").execute()
-    files = results.get('files', [])
+    try:
+        query = f"name = '{CSV_FILENAME}' and '{CSV_FOLDER_ID}' in parents and trashed = false"
+        results = service.files().list(q=query, fields="files(id)").execute()
+        files = results.get('files', [])
 
-    media = MediaFileUpload(CSV_FILENAME, mimetype='text/csv')
+        media = MediaFileUpload(CSV_FILENAME, mimetype='text/csv')
 
-    if not files:
-        # A. 如果沒有：創建新文件
-        file_metadata = {
-            'name': CSV_FILENAME,
-            'parents': [CSV_FOLDER_ID] # <--- 指定傳到新文件夾
-        }
-        service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields='id'
-        ).execute()
-        print("✅ 已在雲端創建新的 CSV 報表")
-    else:
-        # B. 如果有：更新現有文件
-        file_id = files[0]['id']
-        service.files().update(
-            fileId=file_id,
-            media_body=media
-        ).execute()
-        print("✅ 已更新雲端現有的 CSV 報表")
+        if not files:
+            # 創建新文件
+            file_metadata = {'name': CSV_FILENAME, 'parents': [CSV_FOLDER_ID]}
+            service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+            print("✅ クラウド上に新しいCSVを作成しました")
+        else:
+            # 更新現有文件
+            file_id = files[0]['id']
+            service.files().update(fileId=file_id, media_body=media).execute()
+            print("✅ クラウド上のCSVを更新しました")
+
+    except Exception as e:
+        print(f"⚠️ クラウド同期エラー (権限/容量の問題の可能性があります): {e}")
+        print("👉 ローカルのCSV (MF_Import_Data.csv) は正常に保存されています。")
 
 def process_file_mock(service, file_path):
-    print(f"⚙️  開始處理文件: {os.path.basename(file_path)}")
+    print(f"⚙️  処理開始: {os.path.basename(file_path)}")
     
     result = process_pipeline(file_path)
     
     if result:
-        print("\n" + "="*15 + " 🎯 處理結果 " + "="*15)
-        print(f"📅 日期: {result.get('date')}")
-        print(f"🏪 廠商: {result.get('vendor')}")
-        print(f"🧾 包含稅率: {[item['tax_type'] for item in result.get('split_items', [])]}")
+        print("\n" + "="*15 + " 🎯 解析結果 " + "="*15)
+        print(f"📅 日付: {result.get('date')}")
+        print(f"🏪 取引先: {result.get('vendor')}")
+        # 為了簡潔，這裡只打印基本信息，詳細信息在CSV中
         print("="*40 + "\n")
         
         # 1. 寫入本地 CSV
         append_to_csv(result)
         
-        # 2. 同步上傳到 CSV 專用文件夾
+        # 2. 同步上傳
         sync_csv_to_drive(service)
         
         return True
     else:
-        print("⚠️ 處理失敗")
+        print("⚠️ 解析に失敗しました")
         return False
 
 def main():
-    print("🚀 Super Scaner 全自動版啟動！(分離式存儲)")
-    print(f"📂 監聽文件夾: {INPUT_FOLDER_ID}")
-    print(f"📂 圖片歸檔夾: {PROCESSED_FOLDER_ID}")
-    print(f"📂 報表存放夾: {CSV_FOLDER_ID}")
+    print("🚀 Super Scaner 自動化システム起動！")
+    print(f"📂 監視フォルダID: ...{INPUT_FOLDER_ID[-5:]}")
     print("-" * 30)
 
     service = get_drive_service()
@@ -138,43 +129,40 @@ def main():
                 time.sleep(3)
                 continue
             
-            print("\n\n🔎 發現新文件！")
+            print("\n\n🔎 新しいファイルを検出しました！")
 
             for file in files:
                 file_id = file['id']
                 file_name = file['name']
                 
-                # 1. 防止 CSV 被錯誤下載
-                if file_name == CSV_FILENAME:
-                    continue
+                if file_name == CSV_FILENAME: continue
 
-                # 2. 【新增】格式過濾 (白名單檢查)
-                ext = os.path.splitext(file_name)[1].lower() # 獲取後綴名 (如 .jpg)
-                # 定義支援的格式
+                # 後綴名過濾
+                ext = os.path.splitext(file_name)[1].lower()
                 SUPPORTED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.heic', '.pdf']
                 
                 if ext not in SUPPORTED_EXTENSIONS:
-                    print(f"⚠️ 跳過不支援的文件格式: {file_name}")
-                    continue # 直接跳過，不下載也不處理
+                    print(f"⚠️ 未対応のフォーマットです。スキップします: {file_name}")
+                    continue 
 
-                # 3. 下載文件
                 local_path = download_file(service, file_id, file_name)
                 
-                # 4. 處理流程
+                # 處理流程
                 success = process_file_mock(service, local_path)
                 
                 if success:
-                    # 成功後，把原始圖片移動到 Processed 歸檔
                     move_file(service, file_id, INPUT_FOLDER_ID, PROCESSED_FOLDER_ID)
-                
+                else:
+                    print("⚠️ ファイル処理失敗。ログを確認してください。")
+
                 if os.path.exists(local_path):
                     os.remove(local_path)
-                    print("🧹 本地清理完成")
+                    print("🧹 一時ファイルを削除しました")
                 
                 print("=" * 30)
 
         except Exception as e:
-            print(f"\n❌ 錯誤: {e}")
+            print(f"\n❌ システムエラー: {e}")
             time.sleep(5)
 
 if __name__ == "__main__":
