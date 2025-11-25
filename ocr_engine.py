@@ -7,15 +7,59 @@ load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
 
 if not api_key:
-    raise ValueError("⚠️ 重大エラー: GEMINI_API_KEYが見つかりません。.envを確認してください")
+    raise ValueError("⚠️ 嚴重錯誤: 未找到 GEMINI_API_KEY")
 
 genai.configure(api_key=api_key)
 model = genai.GenerativeModel('gemini-2.0-flash-exp') 
 
+def verify_tax_math(candidates, rate):
+    """
+    數學驗算V2.0:
+    同時支持「稅前價」和「含稅價」的反推驗證
+    """
+    # 1. 數據清洗
+    nums = []
+    for c in candidates:
+        try:
+            # 去除逗號、日圓符號、空格
+            clean_str = str(c).replace(',', '').replace('¥', '').replace('円', '').strip()
+            clean_num = float(clean_str)
+            nums.append(clean_num)
+        except:
+            continue
+            
+    # 從大到小排序
+    nums = sorted(list(set(nums)), reverse=True)
+
+    # 2. 暴力比對
+    for amount in nums:
+        # 遍歷剩下的數字尋找稅額
+        for tax in nums:
+            if amount <= tax: continue # 本金通常大於稅額
+            
+            # === 情況 A：假設 amount 是「稅前金額 (Net)」===
+            # 公式：稅前 * 稅率 = 稅額
+            expected_tax_a = amount * rate
+            if abs(expected_tax_a - tax) <= 2.0: # 允許 2日圓誤差
+                return int(amount), int(tax)
+            
+            # === 情況 B：假設 amount 是「含稅金額 (Gross)」===
+            # 公式：含稅 - (含稅 / (1+稅率)) = 稅額
+            # 也就是：倒推出稅前金額
+            expected_net = amount / (1 + rate)
+            expected_tax_b = amount - expected_net
+            
+            if abs(expected_tax_b - tax) <= 2.0:
+                # 驗算成功！這是一個含稅價。
+                # 我們需要返回「稅前金額」給 CSV (MoneyForward 標準)
+                true_net = int(amount - tax)
+                return true_net, int(tax)
+                
+    return None, None
+
 def process_pipeline(file_path):
     filename = os.path.basename(file_path)
-    # 日語日誌
-    print(f"🧠 Geminiが画像を解析中: {filename} ...")
+    print(f"🧠 Gemini 正在進行雙重數學驗算: {filename} ...")
     
     try:
         with open(file_path, "rb") as f:
@@ -27,41 +71,21 @@ def process_pipeline(file_path):
         elif ".heic" in ext: mime_type = "image/heic"
         elif ".pdf" in ext: mime_type = "application/pdf"
 
-        # === Prompt 已漢化為日語，以提高對日本收據的理解力 ===
+        # Prompt 保持不變，依然是讓它抓取所有數字
         prompt = """
-        あなたはプロの経理担当者です。この領収書（または請求書）を分析し、混合税率を考慮してデータを抽出してください。
+        你是一個數據提取機器人。請提取收據底部「税率別内訳 (Tax Breakdown)」區域出現的所有數字。
         
-        【⚠️ 重要：金額の正確性について】
-        レシート下部にある「税率別内訳（対象額・税抜金額）」を最優先で参照してください。
-        1. **対象額 (Target Amount)**： "税抜"、"対象額"、"Tax Base" と記載されている数字を取得してください。（消費税額ではありません！）
-        2. **計算禁止**：商品価格を自分で足し算しないでください。必ずレシートの集計値を読み取ってください。
-        
-        【抽出ルール】
-        1. "8% 対象額" (軽減税率) の数字を探す -> 8%金額とする。
-        2. "10% 対象額" (標準税率) の数字を探す -> 10%金額とする。
-        3. "対象額"が見つからない場合は、税額よりも大きい数字（本体価格）を選んでください。
-        
-        【摘要(Description)の入力ルール】
-        1. 10%対象の金額が小さく(< 20円)、品名が不明な場合は "レジ袋" と記入してください。
-        2. 8%対象は "食料品" または具体的な品名を記入してください。
-        
-        以下のJSONフォーマットのみを返してください（Markdownタグ不要）：
+        請返回 JSON：
         {
             "date": "YYYY/MM/DD",
-            "vendor": "店舗名・業者名",
-            "category": "勘定科目 (例: 会議費, 消耗品費, 仕入高)",
-            "split_items": [
-                {
-                    "amount": "8%対象額 (半角数字)",
-                    "tax_type": "課対仕入8% (軽)",
-                    "description": "8%部分の摘要"
-                },
-                {
-                    "amount": "10%対象額 (半角数字)",
-                    "tax_type": "課対仕入10%",
-                    "description": "10%部分の摘要"
-                }
-            ]
+            "vendor": "供應商名稱",
+            "description_raw": "主要商品摘要",
+            "tax_8_area": {
+                "candidates": ["數字1", "數字2", "數字3", "合計金額"]
+            },
+            "tax_10_area": {
+                "candidates": ["數字1", "數字2", "數字3", "合計金額"]
+            }
         }
         """
 
@@ -71,8 +95,41 @@ def process_pipeline(file_path):
         ])
         
         text = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(text)
+        raw_data = json.loads(text)
+        
+        final_split_items = []
+        
+        # 驗算 8%
+        candidates_8 = raw_data.get("tax_8_area", {}).get("candidates", [])
+        amount_8, tax_8 = verify_tax_math(candidates_8, 0.08)
+        
+        if amount_8:
+            final_split_items.append({
+                "amount": amount_8,
+                "tax_type": "課対仕入8% (軽)",
+                "description": raw_data.get("description_raw") + " (食品等)"
+            })
+            
+        # 驗算 10%
+        candidates_10 = raw_data.get("tax_10_area", {}).get("candidates", [])
+        amount_10, tax_10 = verify_tax_math(candidates_10, 0.10)
+        
+        if amount_10:
+            desc = raw_data.get("description_raw")
+            if amount_10 < 50: desc = "レジ袋"
+            final_split_items.append({
+                "amount": amount_10,
+                "tax_type": "課対仕入10%",
+                "description": desc
+            })
+
+        return {
+            "date": raw_data.get("date"),
+            "vendor": raw_data.get("vendor"),
+            "category": "未分類",
+            "split_items": final_split_items
+        }
 
     except Exception as e:
-        print(f"❌ 解析失敗: {e}")
+        print(f"❌ 識別失敗: {e}")
         return None
