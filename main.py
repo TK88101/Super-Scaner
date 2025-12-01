@@ -9,8 +9,8 @@ from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 # 引入我們的模塊
 from ocr_engine import process_pipeline
 from csv_writer import append_to_csv
-from notifier import send_notification  # <--- 新增
-import config                           # <--- 新增
+from notifier import send_notification
+import config                          
 
 # ================= 配置區域 =================
 load_dotenv()
