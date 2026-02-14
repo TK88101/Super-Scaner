@@ -155,30 +155,43 @@ def process_file(service, file_path, uploader_name, chat_id, doc_type=DocType.RE
     result = process_pipeline(file_path, doc_type=doc_type)
 
     if result:
+        # マルチドキュメント対応: list に正規化
+        if isinstance(result, list):
+            results = result
+        else:
+            results = [result]
+
         print("\n" + "=" * 15 + " 🎯 解析結果 " + "=" * 15)
-        print(f"📅 日付: {result.get('date')}")
-        print(f"🏪 取引先: {result.get('vendor')}")
-        print(f"📋 文書タイプ: {type_label}")
-        entries = result.get('entries', [])
-        print(f"📊 仕訳行数: {len(entries)}")
+        for idx, r in enumerate(results):
+            if len(results) > 1:
+                print(f"\n📄 文書 {idx+1}/{len(results)}:")
+            print(f"📅 日付: {r.get('date')}")
+            print(f"🏪 取引先: {r.get('vendor')}")
+            print(f"📋 文書タイプ: {type_label}")
+            entries = r.get('entries', [])
+            print(f"📊 仕訳行数: {len(entries)}")
         print("=" * 40 + "\n")
 
         # 寫入 CSV
-        result['uploader'] = uploader_name
-
         file_id = ensure_latest_csv_from_drive(service)
-        append_to_csv(result)
+        for r in results:
+            r['uploader'] = uploader_name
+            append_to_csv(r)
         sync_csv_to_drive(service, existing_file_id=file_id)
 
-        # 金額集計
-        amount_info = sum(int(e.get('amount', 0)) for e in entries)
+        # 金額集計（全文書合算）
+        total_amount = sum(
+            sum(int(e.get('amount', 0)) for e in r.get('entries', []))
+            for r in results
+        )
+        vendor_list = ", ".join(r.get('vendor', '') for r in results)
 
         send_notification(
             filename=os.path.basename(file_path),
             status="Success",
             uploader_name=uploader_name,
             chat_id=chat_id,
-            details=f"文書タイプ: {type_label}\n取引先: {result.get('vendor')}\n合計金額: ¥{amount_info}"
+            details=f"文書タイプ: {type_label}\n取引先: {vendor_list}\n合計金額: ¥{total_amount}\n文書数: {len(results)}"
         )
 
         return True

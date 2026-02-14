@@ -91,22 +91,52 @@ def _call_gemini(file_path, prompt):
 
 PROMPTS = {
     DocType.RECEIPT: """
-あなたはプロの経理担当者です。領収書・レシート画像を分析し、会計ソフト用データを抽出してください。
+あなたはプロの経理担当者です。画像に写っている全ての書類（領収書・レシート・受取書・振込控え等）を分析してください。
+
+重要: 画像に複数の書類が含まれる場合は、全ての書類を別々に抽出してください。
 
 【出力JSONフォーマット】
 {
-    "date": "YYYY/MM/DD",
-    "vendor": "取引先名",
-    "invoice_num": "Tから始まる13桁番号 (なければ空文字)",
-    "payment_method": "支払い方法 (現金, クレジットカード, PayPay, 振込)",
-    "memo": "メモ",
-    "description_raw": "品代",
-    "debit_account": "費用の勘定科目を推定 (消耗品費, 旅費交通費, 交際費, 会議費, 通信費, 福利厚生費, 雑費 など)",
-    "tax_8_area": { "candidates": ["8%エリアの全数字"] },
-    "tax_10_area": { "candidates": ["10%エリアの全数字"] }
+    "documents": [
+        {
+            "doc_category": "receipt | bank_transfer | fee_receipt",
+            "date": "YYYY/MM/DD",
+            "vendor": "取引先名（発行者、または振込の場合は振込依頼人）",
+            "invoice_num": "Tから始まる13桁番号 (なければ空文字)",
+            "payment_method": "支払い方法 (現金, クレジットカード, PayPay, 振込, ATM)",
+            "memo": "メモ（振込先名、用途など）",
+            "items": [
+                {
+                    "description": "品目・内容",
+                    "amount": 税込金額(数値),
+                    "tax_rate": 0.08 or 0.10 or 0,
+                    "tax_amount": 消費税額(数値, なければ0),
+                    "debit_account": "費用の勘定科目を推定"
+                }
+            ]
+        }
+    ]
 }
 
-注意: debit_account は画像の内容から最も適切な費用科目を推定してください。
+【doc_categoryの判定基準】
+- "receipt": 通常の領収書・レシート（コンビニ、店舗等での購入）
+- "bank_transfer": 銀行振込の受取書・振込控え（振込金額本体。税区分は「対象外」）
+- "fee_receipt": 振込手数料の領収証（ATM手数料、コンビニ手数料等。課税対象）
+
+【勘定科目の推定基準】
+- bank_transfer: debit_account は "未払金"（既存の買掛金・未払金の支払い）
+- fee_receipt: debit_account は "支払手数料"
+- receipt: 内容から推定 (消耗品費, 旅費交通費, 交際費, 会議費, 通信費, 福利厚生費, 雑費 など)
+
+【tax_rate の判定基準】
+- 食品・飲料(酒類除く): 0.08
+- それ以外の課税品目: 0.10
+- 銀行振込本体(bank_transfer): 0（非課税・対象外）
+
+注意:
+- 画像に1枚の書類しかなくても、必ず documents 配列で返してください
+- 金額は数値型(カンマなし)で返してください
+- 振込受取書では、vendor は振込依頼人（支払い元の会社名）を記載してください
 """,
 
     DocType.PURCHASE_INVOICE: """
@@ -191,8 +221,88 @@ PROMPTS = {
 # エントリビルダー（各文書タイプの仕訳生成ロジック）
 # ============================================================
 
+def _determine_credit_account(pay_method, doc_category="receipt"):
+    """支払方法とドキュメントカテゴリから貸方科目を決定"""
+    if doc_category == "bank_transfer":
+        return "普通預金"
+
+    if any(x in pay_method for x in ["クレジット", "Credit", "Card", "VISA", "Master"]):
+        return "未払金"
+    elif any(x in pay_method for x in ["振込", "ATM"]):
+        return "普通預金"
+    elif "PayPay" in pay_method:
+        return "未払金"
+
+    return "現金"
+
+
+def _determine_tax_types(doc_category, tax_rate):
+    """ドキュメントカテゴリと税率から借方・貸方税区分を決定"""
+    if doc_category == "bank_transfer" or tax_rate == 0:
+        return "対象外", "対象外"
+    elif tax_rate == 0.08:
+        return "課対仕入8% (軽)", "対象外"
+    else:  # 0.10
+        return "課対仕入10%", "対象外"
+
+
+def _build_entries_for_single_doc(doc):
+    """documents配列の1要素（単一書類）から仕訳エントリを生成"""
+    entries = []
+    doc_category = doc.get("doc_category", "receipt")
+
+    # 貸方科目決定
+    pay_method = str(doc.get("payment_method", "現金"))
+    credit_account = _determine_credit_account(pay_method, doc_category)
+
+    for item in doc.get("items", []):
+        amount = item.get("amount", 0)
+        if not amount or int(amount) == 0:
+            continue
+
+        tax_rate = item.get("tax_rate", 0.10)
+        debit_account = item.get("debit_account", "消耗品費")
+
+        # 税区分決定
+        debit_tax_type, credit_tax_type = _determine_tax_types(
+            doc_category, tax_rate
+        )
+
+        entries.append({
+            "debit_account": debit_account,
+            "debit_tax_type": debit_tax_type,
+            "credit_account": credit_account,
+            "credit_tax_type": credit_tax_type,
+            "amount": int(amount),
+            "description": item.get("description", ""),
+        })
+
+    return entries
+
+
 def _build_entries_from_receipt(raw_data):
-    """領収書データから仕訳エントリを生成"""
+    """領収書データから仕訳エントリを生成（新旧フォーマット両対応）"""
+    # 旧フォーマット（documents キーなし）: レガシーロジック
+    if "documents" not in raw_data:
+        return _build_entries_from_receipt_legacy(raw_data)
+
+    # 新フォーマット: documents 配列
+    # NOTE: 複数文書の場合は process_pipeline 側で処理するため、
+    #       ここでは単一文書のフォールバックのみ対応
+    documents = raw_data.get("documents", [])
+    if len(documents) == 1:
+        return _build_entries_for_single_doc(documents[0])
+
+    # 複数文書は process_pipeline で処理済みのはずだが、
+    # 万が一ここに来た場合は全文書のエントリを結合して返す
+    all_entries = []
+    for doc in documents:
+        all_entries.extend(_build_entries_for_single_doc(doc))
+    return all_entries
+
+
+def _build_entries_from_receipt_legacy(raw_data):
+    """旧フォーマット用: tax_8_area/tax_10_area ベースのロジック（後方互換）"""
     entries = []
     debit_account = raw_data.get("debit_account", "消耗品費")
 
@@ -403,15 +513,9 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT):
         doc_type: 文書タイプ (DocType 定数)
 
     Returns:
-        {
-            "doc_type": str,
-            "date": str,
-            "vendor": str,
-            "invoice_num": str,
-            "memo": str,
-            "entries": [{debit_account, debit_tax_type, credit_account, ...}]
-        }
-        or None if parsing fails
+        dict: 単一文書の場合（通常）
+        list[dict]: 複数文書検出時（領収書のみ）
+        None: 解析失敗時
     """
     filename = os.path.basename(file_path)
     type_label = DOC_TYPE_CONFIG.get(doc_type, {}).get("label", doc_type)
@@ -429,6 +533,43 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT):
             print("⚠️ AIの応答がJSONではありませんでした")
             return None
 
+        # ── 領収書マルチドキュメント処理 ──
+        if doc_type == DocType.RECEIPT and "documents" in raw_data:
+            documents = raw_data["documents"]
+            if not documents:
+                print("⚠️ documents配列が空です")
+                return None
+
+            print(f"📑 {len(documents)} 件の書類を検出")
+
+            results = []
+            for i, doc in enumerate(documents, 1):
+                doc_cat = doc.get("doc_category", "receipt")
+                vendor = doc.get("vendor", "不明")
+                print(f"  [{i}] {doc_cat}: {vendor}")
+
+                entries = _build_entries_for_single_doc(doc)
+                if not entries:
+                    print(f"  ⚠️ エントリなし（スキップ）")
+                    continue
+
+                results.append({
+                    "doc_type": doc_type,
+                    "date": doc.get("date"),
+                    "vendor": vendor,
+                    "invoice_num": doc.get("invoice_num", ""),
+                    "memo": doc.get("memo", ""),
+                    "entries": entries,
+                })
+
+            if len(results) == 0:
+                return None
+            elif len(results) == 1:
+                return results[0]       # 単一文書: dict を返す（後方互換）
+            else:
+                return results          # 複数文書: list を返す
+
+        # ── 通常パス（他の文書タイプ、または旧フォーマット領収書）──
         builder = ENTRY_BUILDERS.get(doc_type)
         if not builder:
             print(f"⚠️ エントリビルダーが未登録: {doc_type}")

@@ -82,21 +82,31 @@ def process_local_file(file_info):
         print(f"❌ 解析失敗: {file_name}")
         return False
 
-    # 結果表示
-    entries = result.get("entries", [])
-    print(f"\n🎯 解析結果:")
-    print(f"   📅 日付: {result.get('date')}")
-    print(f"   🏪 取引先: {result.get('vendor')}")
-    print(f"   📊 仕訳行数: {len(entries)}")
+    # マルチドキュメント対応: list に正規化
+    if isinstance(result, list):
+        results = result
+    else:
+        results = [result]
 
-    for i, entry in enumerate(entries, 1):
-        print(f"   [{i}] 借方: {entry.get('debit_account')} ¥{entry.get('amount')} "
-              f"({entry.get('debit_tax_type')}) → "
-              f"貸方: {entry.get('credit_account')} ({entry.get('credit_tax_type')})")
+    for idx, r in enumerate(results):
+        if len(results) > 1:
+            print(f"\n  📄 文書 {idx+1}/{len(results)}: {r.get('vendor', '不明')}")
 
-    # CSV 書き込み
-    result["uploader"] = "LocalTest"
-    append_to_csv(result)
+        # 結果表示
+        entries = r.get("entries", [])
+        print(f"\n🎯 解析結果:")
+        print(f"   📅 日付: {r.get('date')}")
+        print(f"   🏪 取引先: {r.get('vendor')}")
+        print(f"   📊 仕訳行数: {len(entries)}")
+
+        for i, entry in enumerate(entries, 1):
+            print(f"   [{i}] 借方: {entry.get('debit_account')} ¥{entry.get('amount')} "
+                  f"({entry.get('debit_tax_type')}) → "
+                  f"貸方: {entry.get('credit_account')} ({entry.get('credit_tax_type')})")
+
+        # CSV 書き込み
+        r["uploader"] = "LocalTest"
+        append_to_csv(r)
 
     # 処理済みフォルダへ移動
     dest = os.path.join(PROCESSED_DIR, file_name)
