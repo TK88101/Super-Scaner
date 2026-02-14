@@ -1,0 +1,140 @@
+[
+  {
+    "id": 1,
+    "category": "infrastructure",
+    "description": "doc_types.py - 文档类型枚举(DocType)和会计科目默认映射(DOC_TYPE_CONFIG)",
+    "steps": [
+      "创建 DocType 类，定义 RECEIPT/SALES_INVOICE/PURCHASE_INVOICE/SALARY_SLIP 常量",
+      "创建 DOC_TYPE_CONFIG 字典，每种类型含 default_debit/default_credit/credit_tax_type",
+      "验证: python -c 'from doc_types import DocType, DOC_TYPE_CONFIG; print(DOC_TYPE_CONFIG)'"
+    ],
+    "passes": true
+  },
+  {
+    "id": 2,
+    "category": "infrastructure",
+    "description": "config.py - load_folder_map() 函数，从环境变量映射文件夹ID到DocType",
+    "steps": [
+      "新增 load_folder_map() 函数，读取 FOLDER_RECEIPT_ID 等环境变量",
+      "向后兼容: INPUT_FOLDER_ID 默认映射为 RECEIPT",
+      "验证: 导入函数不报错，现有代码不受影响"
+    ],
+    "passes": true
+  },
+  {
+    "id": 3,
+    "category": "core",
+    "description": "csv_writer.py - 支持新的 entries 格式（通用会计分录）",
+    "steps": [
+      "重构 append_to_csv() 支持 entries 列表格式",
+      "每个 entry 包含完整借方/贷方科目信息",
+      "验证: 构造新格式 data 调用 append_to_csv，检查 CSV 27列正确"
+    ],
+    "passes": true
+  },
+  {
+    "id": 4,
+    "category": "core",
+    "description": "csv_writer.py - 向后兼容旧 split_items 格式",
+    "steps": [
+      "新增 _convert_legacy_split_items() 转换函数",
+      "检测到 split_items 自动转为 entries",
+      "验证: 旧格式 data 调用 append_to_csv 输出与改动前一致"
+    ],
+    "passes": true
+  },
+  {
+    "id": 5,
+    "category": "core",
+    "description": "csv_writer.py - 取引No 自动递增编号",
+    "steps": [
+      "新增 _get_next_transaction_no() 读取 CSV 最大编号+1",
+      "同一笔交易多行分录共享同一个取引No",
+      "验证: 追加多笔数据后取引No正确递增"
+    ],
+    "passes": true
+  },
+  {
+    "id": 6,
+    "category": "core",
+    "description": "ocr_engine.py - 类型路由架构: process_pipeline 增加 doc_type 参数",
+    "steps": [
+      "process_pipeline(file_path) 改为 process_pipeline(file_path, doc_type='receipt')",
+      "新增 PROMPTS 和 ENTRY_BUILDERS 字典按 doc_type 分发",
+      "保留 verify_tax_math() 和 extract_json() 不变",
+      "验证: 调用 process_pipeline(path, 'receipt') 仍返回正确结果"
+    ],
+    "passes": true
+  },
+  {
+    "id": 7,
+    "category": "core",
+    "description": "ocr_engine.py - 领收书返回新 entries 格式（不再返回 split_items）",
+    "steps": [
+      "新增 _build_entries_from_receipt() 函数",
+      "返回格式统一为 {doc_type, date, vendor, entries: [...]}",
+      "领收书 prompt 增加 debit_account 字段（AI推断费用科目）",
+      "验证: 用领收书测试图片确认金额/税率拆分一致，debit_account 不为'未分類'"
+    ],
+    "passes": true
+  },
+  {
+    "id": 8,
+    "category": "feature",
+    "description": "ocr_engine.py - 支付/仕入请求书 prompt 和 entry builder",
+    "steps": [
+      "新增专用 prompt: 提取请求日/供应商/发票号/品目/金额/税率/支付方式/费用科目",
+      "新增 _build_entries_from_purchase_invoice(): 借方仕入高/費用科目, 贷方買掛金/普通預金",
+      "注册到 ENTRY_BUILDERS['purchase_invoice']",
+      "验证: 用3个测试文件确认金额和科目正确"
+    ],
+    "passes": true
+  },
+  {
+    "id": 9,
+    "category": "feature",
+    "description": "ocr_engine.py - 売上请求书 prompt 和 entry builder",
+    "steps": [
+      "新增专用 prompt: 提取请求日/客户名/发票号/品目/金额/税率",
+      "新增 _build_entries_from_sales_invoice(): 借方売掛金, 贷方売上高, 税区分'課税売上'系列",
+      "注册到 ENTRY_BUILDERS['sales_invoice']",
+      "验证: 用2025年9月.pdf测试文件确认方向正确(借方売掛金/贷方売上高)"
+    ],
+    "passes": true
+  },
+  {
+    "id": 10,
+    "category": "feature",
+    "description": "ocr_engine.py - 赁金台帐/给与明细 prompt 和 entry builder",
+    "steps": [
+      "新增专用 prompt: 提取支给日/员工名/总支给额/社保/所得税/住民税/差引支给额",
+      "新增 _build_entries_from_salary_slip(): 多行分录(給料手当/預り金)",
+      "注册到 ENTRY_BUILDERS['salary_slip']",
+      "验证: 用给与明细PDF测试文件确认多行分录和金额正确"
+    ],
+    "passes": true
+  },
+  {
+    "id": 11,
+    "category": "integration",
+    "description": "main.py - 多文件夹监控: 从单一 INPUT_FOLDER_ID 改为遍历 folder_map",
+    "steps": [
+      "main() 循环改为遍历 config.load_folder_map() 的所有文件夹",
+      "process_file_mock 改名 process_file，增加 doc_type 参数",
+      "调用 process_pipeline(path, doc_type=doc_type)",
+      "向后兼容: 仅配置 INPUT_FOLDER_ID 时仍正常工作"
+    ],
+    "passes": true
+  },
+  {
+    "id": 12,
+    "category": "integration",
+    "description": "端到端测试: 全部6个测试文件正确处理并生成符合模板的CSV",
+    "steps": [
+      "依次处理: 领收书JPG, 3个支付请求书, 売上请求书PDF, 给与明细PDF",
+      "检查CSV: 27列格式对齐标准模板",
+      "检查: 取引No递增、科目正确、税区分正确、向后兼容"
+    ],
+    "passes": true
+  }
+]

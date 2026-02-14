@@ -1,0 +1,35 @@
+== Super Scaner 项目进度 ==
+
+=== Session 1 (2026-02-14) ===
+状态: 初始化完成
+完成:
+- 分析现有代码架构（main.py, ocr_engine.py, csv_writer.py, config.py, notifier.py）
+- 浏览 Google Drive 训练测试资料（6个文件 + 3个文档）
+- 学习 Anthropic Effective Harnesses 方法论和 claude-quickstarts 模式
+- 制定 7 步实施计划并获得审批
+- 创建 feature_list.json（12个功能点）和 claude-progress.txt
+
+当前进度: 2/12 features passing
+
+=== Session 2 (2026-02-14) ===
+状态: 全部 12/12 Features 完成!
+完成:
+- Step 1: 创建 doc_types.py (Feature #1 ✅) + 修改 config.py (Feature #2 ✅)
+  - Git commit: 0142300
+- Step 2: 重构 csv_writer.py (Feature #3, #4, #5 ✅)
+  - entries 格式 + 旧 split_items 向后兼容 + 取引No 自动递增
+  - Git commit: c5eac55
+- Step 3: 重构 ocr_engine.py (Feature #6, #7, #8, #9, #10 ✅)
+  - 类型路由架构: PROMPTS + ENTRY_BUILDERS 字典
+  - 4种文档类型: 领收书/支付请求书/売上请求书/给与明细
+  - Git commit: 90c562c
+- Step 4: 集成 main.py (Feature #11 ✅)
+  - 多文件夹监控 via folder_map
+  - process_file 支持 doc_type 参数
+  - Git commit: 3c68da2
+- 端到端集成测试 (Feature #12 ✅)
+  - 4种文档类型 → 11行仕訳 → 27列 CSV 全部验证通过
+  - 取引No: [1,2,3,4] 正确递增
+  - 借方/贷方科目、税区分全部正确
+
+当前进度: 12/12 features passing
