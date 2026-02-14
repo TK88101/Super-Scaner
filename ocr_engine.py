@@ -12,7 +12,7 @@ if not api_key:
     raise ValueError("⚠️ 重大エラー: GEMINI_API_KEYが見つかりません")
 
 genai.configure(api_key=api_key)
-model = genai.GenerativeModel('gemini-2.0-flash-exp')
+model = genai.GenerativeModel('gemini-2.0-flash')
 
 
 # ============================================================

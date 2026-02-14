@@ -1,0 +1,5 @@
+# Ignore test image files but keep directory structure
+*
+!.gitignore
+!*/
+!*/.gitkeep
