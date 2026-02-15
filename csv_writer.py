@@ -66,12 +66,16 @@ def _convert_legacy_split_items(data):
 
 def append_to_csv(data):
     file_exists = os.path.isfile(OUTPUT_FILE)
-    file_empty = (not file_exists) or (os.path.getsize(OUTPUT_FILE) == 0)
+    needs_header = not file_exists
+    if file_exists:
+        with open(OUTPUT_FILE, mode='r', encoding='utf-8-sig') as check_f:
+            content = check_f.read().strip()
+            needs_header = (len(content) == 0)
 
     with open(OUTPUT_FILE, mode='a', newline='', encoding='utf-8-sig') as f:
         writer = csv.writer(f)
 
-        if file_empty:
+        if needs_header:
             writer.writerow(MF_HEADERS)
 
         # entries 形式を優先、なければ旧 split_items から変換
