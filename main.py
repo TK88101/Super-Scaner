@@ -120,6 +120,17 @@ def ensure_latest_csv_from_drive(service):
             done = False
             while done is False:
                 status, done = downloader.next_chunk()
+
+        # ダウンロードしたCSVの末尾に改行がない場合、追記時に行が結合してしまう問題を防止
+        with open(CSV_FILENAME, 'rb') as f:
+            f.seek(0, 2)  # ファイル末尾へ
+            if f.tell() > 0:
+                f.seek(-1, 2)
+                if f.read(1) != b'\n':
+                    with open(CSV_FILENAME, 'a', encoding='utf-8-sig') as af:
+                        af.write('\n')
+                    print("🔧 CSVファイル末尾に改行を補完しました")
+
         return file_id
     else:
         return None
@@ -132,17 +143,31 @@ def sync_csv_to_drive(service, existing_file_id=None):
         if existing_file_id:
             service.files().update(fileId=existing_file_id, media_body=media).execute()
             print("✅ クラウド上のCSVを更新しました (Update)")
-        else:
-            query = f"name = '{CSV_FILENAME}' and '{CSV_FOLDER_ID}' in parents and trashed = false"
-            results = service.files().list(q=query, fields="files(id)").execute()
-            files = results.get('files', [])
-            if files:
-                service.files().update(fileId=files[0]['id'], media_body=media).execute()
-                print("✅ クラウド上のCSVを更新しました (Update)")
+            return
+
+        # existing_file_id が未指定の場合、再検索してからアップロード
+        query = f"name = '{CSV_FILENAME}' and '{CSV_FOLDER_ID}' in parents and trashed = false"
+        results = service.files().list(q=query, fields="files(id)").execute()
+        files = results.get('files', [])
+        if files:
+            service.files().update(fileId=files[0]['id'], media_body=media).execute()
+            print("✅ クラウド上のCSVを更新しました (Update)")
+            return
+
+        # Drive 上に CSV が存在しない → Service Account では新規作成できない
+        # まず Service Account での作成を試みる
+        try:
+            file_metadata = {'name': CSV_FILENAME, 'parents': [CSV_FOLDER_ID]}
+            service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+            print("✅ クラウド上に新しいCSVを作成しました (Create)")
+        except Exception as create_err:
+            if 'storageQuotaExceeded' in str(create_err) or 'storage quota' in str(create_err).lower():
+                print("⚠️ Service Account にはストレージ容量がないため、新規CSVを作成できません。")
+                print(f"   → Google Drive の CSV フォルダに空の '{CSV_FILENAME}' を手動で作成してください。")
+                print(f"   → CSV フォルダ ID: {CSV_FOLDER_ID}")
+                print("   → 作成後、次回処理時に自動的に内容が書き込まれます。")
             else:
-                file_metadata = {'name': CSV_FILENAME, 'parents': [CSV_FOLDER_ID]}
-                service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-                print("✅ クラウド上に新しいCSVを作成しました (Create)")
+                raise create_err
     except Exception as e:
         print(f"⚠️ クラウド同期エラー: {e}")
 
@@ -207,6 +232,24 @@ def process_file(service, file_path, uploader_name, chat_id, doc_type=DocType.RE
         return False
 
 
+def _check_csv_on_drive(service):
+    """起動時にDrive上のCSVファイルの存在を確認"""
+    query = f"name = '{CSV_FILENAME}' and '{CSV_FOLDER_ID}' in parents and trashed = false"
+    results = service.files().list(q=query, fields="files(id, name)").execute()
+    files = results.get('files', [])
+
+    if files:
+        print(f"✅ Drive上のCSVファイルを確認: {CSV_FILENAME}")
+        return True
+    else:
+        print(f"⚠️ Drive上に '{CSV_FILENAME}' が見つかりません。")
+        print(f"   Service Account ではファイルの新規作成ができないため、")
+        print(f"   Google Drive の CSV フォルダに空の '{CSV_FILENAME}' を手動で作成してください。")
+        print(f"   CSV フォルダ ID: {CSV_FOLDER_ID}")
+        print(f"   ※ ローカルCSVへの書き込みは正常に動作します。Drive同期のみ失敗します。")
+        return False
+
+
 def main():
     print("🚀 Super Scaner 自動化システム起動！(Multi-Type)")
     print(f"📂 監視フォルダ数: {len(folder_map)}")
@@ -216,6 +259,9 @@ def main():
     print("-" * 30)
 
     service = get_drive_service()
+
+    # Drive上のCSVファイル存在チェック
+    _check_csv_on_drive(service)
 
     while True:
         try:
