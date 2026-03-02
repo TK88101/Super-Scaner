@@ -1,6 +1,8 @@
 # --- 機密文件 (絕對不能上傳) ---
 .env
 service_account.json
+SuperScaner.pem
+*.pem
 
 # --- 系統垃圾與緩存 ---
 __pycache__/

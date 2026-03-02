@@ -1,0 +1,23 @@
+# --- Secrets ---
+.env
+.env.*
+service_account.json
+SuperScaner.pem
+*.pem
+
+# --- Git metadata ---
+.git
+.gitignore
+
+# --- Python cache / venv ---
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Local runtime artifacts ---
+temp_downloads/
+MF_Import_Data.csv
+*.log

@@ -1,9 +1,16 @@
 import os
+import io
 import json
 import re
 import google.generativeai as genai
 from dotenv import load_dotenv
 from doc_types import DocType, DOC_TYPE_CONFIG
+
+try:
+    from pypdf import PdfReader, PdfWriter
+except Exception:
+    PdfReader = None
+    PdfWriter = None
 
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
@@ -13,6 +20,12 @@ if not api_key:
 
 genai.configure(api_key=api_key)
 model = genai.GenerativeModel('gemini-2.0-flash')
+
+GEMINI_GENERATION_CONFIG = {
+    "temperature": 0,
+    "response_mime_type": "application/json",
+    "max_output_tokens": 8192,
+}
 
 
 # ============================================================
@@ -49,11 +62,36 @@ def verify_tax_math(candidates, rate):
 
 def extract_json(text):
     """JSON抽出強化関数"""
+    if not text:
+        return None
+
+    text = text.strip()
+
+    # 1) JSON文字列そのもの
     try:
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
         return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 2) fenced code block 内の JSON
+    block_match = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if block_match:
+        try:
+            return json.loads(block_match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    # 3) 文中の最初の JSON object / array
+    try:
+        obj_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if obj_match:
+            return json.loads(obj_match.group(0))
+
+        arr_match = re.search(r'\[.*\]', text, re.DOTALL)
+        if arr_match:
+            return json.loads(arr_match.group(0))
+
+        return None
     except json.JSONDecodeError:
         return None
 
@@ -72,17 +110,66 @@ def _get_mime_type(file_path):
     return "image/jpeg"
 
 
-def _call_gemini(file_path, prompt):
+def _get_finish_reason(response):
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            return ""
+        return str(getattr(candidates[0], "finish_reason", "")) or ""
+    except Exception:
+        return ""
+
+
+def _call_gemini_bytes(file_data, mime_type, prompt):
     """Gemini API を呼び出して JSON を返す"""
+    response = model.generate_content(
+        [
+            {"mime_type": mime_type, "data": file_data},
+            prompt
+        ],
+        generation_config=GEMINI_GENERATION_CONFIG,
+    )
+
+    text = (getattr(response, "text", "") or "").strip()
+    parsed = extract_json(text)
+    if parsed is None:
+        finish_reason = _get_finish_reason(response)
+        print(
+            f"⚠️ Gemini応答のJSON解析失敗 "
+            f"(finish_reason={finish_reason or 'unknown'}, len={len(text)})"
+        )
+    return parsed
+
+
+def _call_gemini(file_path, prompt):
     with open(file_path, "rb") as f:
         file_data = f.read()
     mime_type = _get_mime_type(file_path)
+    return _call_gemini_bytes(file_data, mime_type, prompt)
 
-    response = model.generate_content([
-        {"mime_type": mime_type, "data": file_data},
-        prompt
-    ])
-    return extract_json(response.text)
+
+def _split_pdf_pages(file_path):
+    """PDF を 1ページずつの bytes 配列に分割"""
+    if PdfReader is None or PdfWriter is None:
+        print("⚠️ pypdf未導入のため、PDF分割解析をスキップします")
+        return None
+
+    try:
+        reader = PdfReader(file_path)
+        if len(reader.pages) <= 1:
+            return None
+
+        page_payloads = []
+        for page in reader.pages:
+            writer = PdfWriter()
+            writer.add_page(page)
+            buf = io.BytesIO()
+            writer.write(buf)
+            page_payloads.append(buf.getvalue())
+        return page_payloads
+    except Exception as e:
+        print(f"⚠️ PDFページ分割失敗: {e}")
+        return None
 
 
 # ============================================================
@@ -519,6 +606,55 @@ ENTRY_BUILDERS = {
 }
 
 
+def _normalize_receipt_results(raw_data, prefix=""):
+    """領収書レスポンスを統一結果(list[dict])に正規化"""
+    results = []
+
+    # 新フォーマット: documents 配列
+    if isinstance(raw_data, dict) and "documents" in raw_data:
+        documents = raw_data.get("documents") or []
+        if not documents:
+            print(f"{prefix}⚠️ documents配列が空です")
+            return []
+
+        print(f"{prefix}📑 {len(documents)} 件の書類を検出")
+
+        for i, doc in enumerate(documents, 1):
+            doc_cat = doc.get("doc_category", "receipt")
+            vendor = doc.get("vendor", "不明")
+            print(f"{prefix}  [{i}] {doc_cat}: {vendor}")
+
+            entries = _build_entries_for_single_doc(doc)
+            if not entries:
+                print(f"{prefix}  ⚠️ エントリなし（スキップ）")
+                continue
+
+            results.append({
+                "doc_type": DocType.RECEIPT,
+                "date": doc.get("date"),
+                "vendor": vendor,
+                "invoice_num": doc.get("invoice_num", ""),
+                "memo": doc.get("memo", ""),
+                "entries": entries,
+            })
+        return results
+
+    # 旧フォーマット: 単一書類
+    entries = _build_entries_from_receipt(raw_data or {})
+    if not entries:
+        return []
+
+    results.append({
+        "doc_type": DocType.RECEIPT,
+        "date": (raw_data or {}).get("date"),
+        "vendor": (raw_data or {}).get("vendor", ""),
+        "invoice_num": (raw_data or {}).get("invoice_num", ""),
+        "memo": (raw_data or {}).get("memo", ""),
+        "entries": entries,
+    })
+    return results
+
+
 # ============================================================
 # メインパイプライン
 # ============================================================
@@ -546,41 +682,49 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT):
             print(f"⚠️ 未対応の文書タイプ: {doc_type}")
             return None
 
-        raw_data = _call_gemini(file_path, prompt)
+        # 受領書PDFはページ分割で長文JSON切断を回避する
+        mime_type = _get_mime_type(file_path)
+        if doc_type == DocType.RECEIPT and mime_type == "application/pdf":
+            page_payloads = _split_pdf_pages(file_path)
+            if page_payloads:
+                print(f"📄 大型PDF対応: {len(page_payloads)}ページを分割解析します")
+                merged_results = []
+                failed_pages = 0
 
+                for idx, payload in enumerate(page_payloads, 1):
+                    prefix = f"[p{idx}] "
+                    page_raw_data = _call_gemini_bytes(payload, "application/pdf", prompt)
+                    if not page_raw_data:
+                        failed_pages += 1
+                        print(f"{prefix}⚠️ AIの応答がJSONではありませんでした")
+                        continue
+
+                    page_results = _normalize_receipt_results(page_raw_data, prefix=prefix)
+                    if not page_results:
+                        print(f"{prefix}⚠️ 有効な仕訳エントリが見つかりません")
+                        continue
+                    merged_results.extend(page_results)
+
+                if merged_results:
+                    print(
+                        f"✅ PDF分割解析完了: {len(merged_results)}件抽出 "
+                        f"(失敗ページ: {failed_pages})"
+                    )
+                    if len(merged_results) == 1:
+                        return merged_results[0]
+                    return merged_results
+
+                print("⚠️ PDF分割解析でも有効結果を取得できませんでした")
+                return None
+
+        raw_data = _call_gemini(file_path, prompt)
         if not raw_data:
             print("⚠️ AIの応答がJSONではありませんでした")
             return None
 
-        # ── 領収書マルチドキュメント処理 ──
-        if doc_type == DocType.RECEIPT and "documents" in raw_data:
-            documents = raw_data["documents"]
-            if not documents:
-                print("⚠️ documents配列が空です")
-                return None
-
-            print(f"📑 {len(documents)} 件の書類を検出")
-
-            results = []
-            for i, doc in enumerate(documents, 1):
-                doc_cat = doc.get("doc_category", "receipt")
-                vendor = doc.get("vendor", "不明")
-                print(f"  [{i}] {doc_cat}: {vendor}")
-
-                entries = _build_entries_for_single_doc(doc)
-                if not entries:
-                    print(f"  ⚠️ エントリなし（スキップ）")
-                    continue
-
-                results.append({
-                    "doc_type": doc_type,
-                    "date": doc.get("date"),
-                    "vendor": vendor,
-                    "invoice_num": doc.get("invoice_num", ""),
-                    "memo": doc.get("memo", ""),
-                    "entries": entries,
-                })
-
+        # ── 領収書処理（新旧フォーマット両対応）──
+        if doc_type == DocType.RECEIPT:
+            results = _normalize_receipt_results(raw_data)
             if len(results) == 0:
                 return None
             elif len(results) == 1:
@@ -588,7 +732,7 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT):
             else:
                 return results          # 複数文書: list を返す
 
-        # ── 通常パス（他の文書タイプ、または旧フォーマット領収書）──
+        # ── 通常パス（他の文書タイプ）──
         builder = ENTRY_BUILDERS.get(doc_type)
         if not builder:
             print(f"⚠️ エントリビルダーが未登録: {doc_type}")

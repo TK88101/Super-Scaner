@@ -81,16 +81,96 @@ python main.py
 
 ```text
 Super Scaner/
-├── .env                   # [機密] 環境變量 (Git 已忽略)
-├── .gitignore             # Git 忽略清單
-├── Dockerfile             # Docker 部署配置
-├── requirements.txt       # Python 依賴庫
-├── service_account.json   # [機密] Google Drive 權限鑰匙 (Git 已忽略)
+├── .env                        # [機密] 環境變量 (Git 已忽略)
+├── .gitignore                  # Git 忽略清單
+├── .dockerignore               # Docker 忽略清單
+├── Dockerfile                  # Docker 部署配置
+├── PRD.md                      # 產品需求文檔
+├── requirements.txt            # Python 依賴庫
+├── service_account.json        # [機密] Google Drive 權限鑰匙 (Git 已忽略)
 │
-├── main.py                # [主程序] 流程控制、文件監聽、雲端同步
-├── ocr_engine.py          # [AI 引擎] 調用 Gemini 進行視覺識別與稅率拆分
-└── csv_writer.py          # [寫入器] 生成 MoneyForward 格式 CSV
+├── main.py                     # [主程序] 流程控制、文件監聽、雲端同步
+├── ocr_engine.py               # [AI 引擎] 調用 Gemini 進行視覺識別與稅率拆分
+├── csv_writer.py               # [寫入器] 生成 MoneyForward 格式 CSV
+│
+├── scripts/
+│   └── deploy_ec2.sh           # AWS EC2 一鍵部署腳本
+│
+└── monitoring/                 # 監控子系統
+    ├── system_metrics.py       # 系統指標採集 (CPU/RAM/Disk)
+    ├── docker_metrics.py       # Docker 容器狀態與日誌採集
+    ├── log_parser.py           # 日誌解析與統計提取
+    ├── sheets_writer.py        # Google Sheets 寫入器 (含行數限制管理)
+    ├── metrics_pusher.py       # 指標推送主控腳本 (cron 每分鐘執行)
+    ├── cleanup.py              # 每小時定期清理 Sheets 舊數據
+    ├── install_cron.sh         # EC2 cron 安裝腳本
+    └── tests/                  # 單元測試
 ```
+
+---
+
+## ☁️ AWS EC2 一鍵部署 (Ubuntu + Docker)
+
+本專案新增了可直接執行的部署腳本：
+`scripts/deploy_ec2.sh`
+
+### 快速部署
+在本機終端執行：
+```bash
+cd "/Users/ibridgezhao/Documents/Super Scaner"
+chmod +x scripts/deploy_ec2.sh
+
+# 建議明確指定目標主機
+EC2_HOST=13.112.35.6 EC2_USER=ubuntu \
+SSH_KEY="/Users/ibridgezhao/Documents/Super Scaner/SuperScaner.pem" \
+bash scripts/deploy_ec2.sh
+```
+
+### 安全說明
+* `SuperScaner.pem` 僅用於本機 SSH 連線，不會被上傳到 VPS。
+* 腳本只會上傳兩個機密文件：
+  * `.env`
+  * `service_account.json`
+* 容器啟動時使用：
+  * `--env-file /home/ubuntu/super-scaner-secrets/.env`
+  * `-v /home/ubuntu/super-scaner-secrets/service_account.json:/app/service_account.json:ro`
+
+---
+
+## 📊 監控系統 (Monitoring Dashboard)
+
+本項目內置了 **AWS EC2 即時監控系統**，每分鐘自動將伺服器健康數據推送到 Google Sheets 儀表板。
+
+### 監控指標
+* 🖥️ **系統指標：** CPU 使用率、RAM 使用率、磁盤使用率
+* 🐳 **Docker 狀態：** 容器運行狀態、啟動時間
+* 📋 **應用日誌：** OCR 處理成功/失敗統計
+* 🗃️ **數據保留：** 心跳數據保留 24 小時（1440 筆），日誌保留 500 筆
+
+### 所需環境變量
+```env
+MONITOR_SPREADSHEET_ID=你的_Google_Sheets_ID
+```
+
+### 部署監控
+```bash
+# 安裝 cron 任務 (每分鐘執行一次)
+bash monitoring/install_cron.sh
+
+# 手動測試推送
+python monitoring/metrics_pusher.py
+
+# 手動觸發清理
+python monitoring/cleanup.py
+```
+
+### Google Sheets 儀表板結構
+| 分頁 | 內容 |
+|------|------|
+| Heartbeat | 每分鐘系統指標 |
+| Logs | 應用錯誤與事件日誌 |
+| Stats | 每日處理統計 |
+| Summary | 系統概覽 |
 
 ---
 
