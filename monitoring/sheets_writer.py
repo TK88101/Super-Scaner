@@ -23,10 +23,6 @@ class SheetsWriter:
         now = datetime.now(JST).strftime('%Y-%m-%d %H:%M:%S')
         row = [now, container_status, restart_count, cpu_pct, ram_pct, disk_pct]
         sheet.append_row(row, value_input_option='USER_ENTERED')
-        # 超過上限時刪除最舊的行（保留 header 第1行）
-        all_rows = sheet.get_all_values()
-        if len(all_rows) > MAX_HEARTBEAT_ROWS + 1:
-            sheet.delete_rows(2, len(all_rows) - MAX_HEARTBEAT_ROWS)
 
     def write_logs(self, log_entries: List[Dict]):
         sheet = self._get_sheet('logs')
@@ -34,9 +30,21 @@ class SheetsWriter:
             return
         rows = [[e.get('timestamp', ''), e.get('level', 'INFO'), e.get('message', '')] for e in log_entries]
         sheet.append_rows(rows, value_input_option='USER_ENTERED')
-        all_rows = sheet.get_all_values()
-        if len(all_rows) > MAX_LOG_ROWS + 1:
-            sheet.delete_rows(2, len(all_rows) - MAX_LOG_ROWS)
+
+    def cleanup(self):
+        """清理各 Sheet 超出上限的舊資料，每小時由 cron 執行一次"""
+        configs = [
+            ('heartbeat', MAX_HEARTBEAT_ROWS),
+            ('logs', MAX_LOG_ROWS),
+            ('processing_stats', 90),  # 保留最近 90 天
+        ]
+        for sheet_name, max_rows in configs:
+            sheet = self._get_sheet(sheet_name)
+            all_rows = sheet.get_all_values()
+            excess = len(all_rows) - 1 - max_rows  # 扣掉 header
+            if excess > 0:
+                sheet.delete_rows(2, excess)
+                print(f'[cleanup] {sheet_name}: 刪除 {excess} 行')
 
     def update_daily_stats(self, date_str: str, success_count: int,
                            fail_count: int, total_amount_jpy: int):
