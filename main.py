@@ -1,10 +1,12 @@
 import os
 import time
 import io
+import random
 from dotenv import load_dotenv
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.errors import HttpError
 
 # 引入我們的模塊
 from ocr_engine import process_pipeline
@@ -41,13 +43,27 @@ def get_drive_service():
     return build('drive', 'v3', credentials=creds)
 
 
+def _call_with_retry(func, max_retries=5):
+    """Google API 500/503 暫時性エラーに対して指数バックオフでリトライ"""
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except HttpError as e:
+            if e.resp.status in (500, 503) and attempt < max_retries - 1:
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                print(f"\n⚠️ Google API 一時エラー (HTTP {e.resp.status})、{wait:.1f}秒後リトライ ({attempt+1}/{max_retries-1})...")
+                time.sleep(wait)
+            else:
+                raise
+
+
 def list_files(service, folder_id):
     query = f"'{folder_id}' in parents and trashed = false"
-    results = service.files().list(
+    results = _call_with_retry(lambda: service.files().list(
         q=query,
         orderBy='createdTime',
         fields="nextPageToken, files(id, name, lastModifyingUser, md5Checksum)"
-    ).execute()
+    ).execute())
     return results.get('files', [])
 
 
@@ -86,12 +102,12 @@ def is_duplicate_file(service, md5_checksum):
 
     try:
         query = f"'{PROCESSED_FOLDER_ID}' in parents and trashed = false"
-        results = service.files().list(
+        results = _call_with_retry(lambda: service.files().list(
             q=query,
             orderBy='createdTime desc',
             pageSize=200,
             fields="files(id, name, md5Checksum)"
-        ).execute()
+        ).execute())
 
         files = results.get('files', [])
         for file in files:
