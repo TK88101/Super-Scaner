@@ -1,5 +1,6 @@
 import csv
 import os
+import re
 
 MF_HEADERS = [
     "取引No", "取引日", "借方勘定科目", "借方補助科目", "借方部門", "借方取引先",
@@ -11,6 +12,38 @@ MF_HEADERS = [
 ]
 
 OUTPUT_FILE = "MF_Import_Data.csv"
+
+
+def _sanitize_invoice_num(raw):
+    """T番号（適格請求書発行事業者登録番号）のバリデーションと正規化。
+
+    正しい形式: T + 13桁の数字 (例: T1234567890123)
+    不正な値は空文字に変換してMFインポートエラーを防止する。
+
+    対処する異常パターン:
+    - ハイフン付き (T9-2900-0104-2145 → T9290001042145)
+    - 小文字t (t8340001018917 → T8340001018917)
+    - 領収書番号の誤認 (HD00..., 00012025... → 空文字)
+    - 桁数不正 (T23300, T78104775316 → 空文字)
+    """
+    if not raw:
+        return ""
+
+    s = str(raw).strip()
+
+    # ハイフン除去 (例: T9-2900-0104-2145 → T9290001042145)
+    s = s.replace("-", "")
+
+    # 小文字tを大文字Tに変換
+    if s.startswith("t"):
+        s = "T" + s[1:]
+
+    # T + 13桁の数字であることを検証
+    if re.match(r'^T\d{13}$', s):
+        return s
+
+    # 不正な形式は空文字にする
+    return ""
 
 
 def _get_next_transaction_no():
@@ -88,7 +121,7 @@ def append_to_csv(data):
             return
 
         uploader_name = data.get('uploader', '')
-        invoice_num = data.get('invoice_num', '')
+        invoice_num = _sanitize_invoice_num(data.get('invoice_num', ''))
         vendor_name = data.get('vendor', '')
         memo = data.get('memo', '')
         transaction_no = _get_next_transaction_no()
@@ -110,7 +143,7 @@ def append_to_csv(data):
                 "",                                      # 借方部門
                 vendor_name,                             # 借方取引先
                 entry.get("debit_tax_type", ""),         # 借方税区分
-                entry.get("debit_invoice", invoice_num), # 借方インボイス
+                _sanitize_invoice_num(entry.get("debit_invoice", invoice_num)), # 借方インボイス
                 amount,                                  # 借方金額
                 entry.get("debit_tax_amount", ""),       # 借方税額
                 entry.get("credit_account", ""),         # 貸方勘定科目
