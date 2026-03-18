@@ -17,10 +17,14 @@ import gspread
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
-# プロジェクトルートの .env を読み込む
+# .env を読み込む（secrets ディレクトリ → プロジェクトルートの順で探す）
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_dir = os.path.dirname(script_dir)
-load_dotenv(os.path.join(project_dir, '.env'))
+secrets_env = os.path.expanduser("~/super-scaner-secrets/.env")
+if os.path.exists(secrets_env):
+    load_dotenv(secrets_env)
+else:
+    load_dotenv(os.path.join(project_dir, '.env'))
 
 # 環境変数からの設定
 # EC2 実行時は secrets ディレクトリのパスを使用
