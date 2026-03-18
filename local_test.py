@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from ocr_engine import process_pipeline
-from csv_writer import append_to_csv
+from sheets_output import SheetsOutputWriter
 from doc_types import DocType, DOC_TYPE_CONFIG
 import config
 
@@ -63,8 +63,8 @@ def scan_local_files():
     return files
 
 
-def process_local_file(file_info):
-    """1ファイルを処理: OCR → CSV 書き込み"""
+def process_local_file(file_info, sheets_writer):
+    """1ファイルを処理: OCR → Google Sheets 書き込み"""
     file_path = file_info["path"]
     doc_type = file_info["doc_type"]
     file_name = file_info["name"]
@@ -75,7 +75,7 @@ def process_local_file(file_info):
     print(f"📋 文書タイプ: {type_label}")
     print(f"{'='*50}")
 
-    # Gemini OCR
+    # Cloud Vision OCR + Gemini
     result = process_pipeline(file_path, doc_type=doc_type)
 
     if not result:
@@ -104,9 +104,14 @@ def process_local_file(file_info):
                   f"({entry.get('debit_tax_type')}) → "
                   f"貸方: {entry.get('credit_account')} ({entry.get('credit_tax_type')})")
 
-        # CSV 書き込み
+        # Google Sheets 書き込み
         r["uploader"] = "LocalTest"
-        append_to_csv(r)
+        sheets_writer.append_entries(
+            employee_name="LocalTest",
+            doc_type=doc_type,
+            entries_data=r,
+            source_url="",
+        )
 
     # 処理済みフォルダへ移動
     dest = os.path.join(PROCESSED_DIR, file_name)
@@ -120,9 +125,21 @@ def process_local_file(file_info):
 
 
 def main():
-    print("🚀 Super Scaner ローカルテストモード起動")
+    print("🚀 Super Scaner ローカルテストモード起動 (Sheets出力版)")
     print(f"📂 テストフォルダ: {os.path.abspath(TEST_DIR)}")
     print("-" * 50)
+
+    # Google Sheets 接続
+    if not config.OUTPUT_SPREADSHEET_ID:
+        print("❌ OUTPUT_SPREADSHEET_ID が未設定です。.env を確認してください。")
+        return
+
+    sa_file = os.getenv("SERVICE_ACCOUNT_FILE", "service_account.json")
+    sheets_writer = SheetsOutputWriter(
+        spreadsheet_id=config.OUTPUT_SPREADSHEET_ID,
+        credentials_file=sa_file,
+    )
+    print(f"✅ Google Sheets 接続完了")
 
     # ディレクトリ準備
     ensure_dirs()
@@ -149,7 +166,7 @@ def main():
 
     for file_info in files:
         try:
-            if process_local_file(file_info):
+            if process_local_file(file_info, sheets_writer):
                 success_count += 1
             else:
                 fail_count += 1
@@ -157,12 +174,15 @@ def main():
             print(f"❌ エラー: {file_info['name']} - {e}")
             fail_count += 1
 
+    # 取引No を Sheets に書き戻す
+    sheets_writer.flush()
+
     # サマリー
     print("\n" + "=" * 50)
     print(f"📊 処理結果サマリー")
     print(f"   ✅ 成功: {success_count} 件")
     print(f"   ❌ 失敗: {fail_count} 件")
-    print(f"   📄 CSV: {os.path.abspath('MF_Import_Data.csv')}")
+    print(f"   📗 Sheets: https://docs.google.com/spreadsheets/d/{config.OUTPUT_SPREADSHEET_ID}/edit")
     print("=" * 50)
 
 

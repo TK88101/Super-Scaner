@@ -281,6 +281,9 @@ def main():
                         os.remove(local_path)
                         print("🧹 一時ファイルを削除しました")
 
+                    # 取引No を Sheets に書き戻す
+                    sheets_writer.flush()
+
                     print("=" * 30)
 
             if not found_any:

@@ -123,7 +123,13 @@ def _get_finish_reason(response):
 
 def _ocr_with_cloud_vision(image_bytes):
     """Google Cloud Vision API で OCR テキストを取得"""
-    client = vision.ImageAnnotatorClient()
+    sa_file = os.getenv("SERVICE_ACCOUNT_FILE", "service_account.json")
+    if os.path.exists(sa_file):
+        from google.oauth2 import service_account as sa_auth
+        credentials = sa_auth.Credentials.from_service_account_file(sa_file)
+        client = vision.ImageAnnotatorClient(credentials=credentials)
+    else:
+        client = vision.ImageAnnotatorClient()
     image = vision.Image(content=image_bytes)
     response = client.document_text_detection(image=image)
 
