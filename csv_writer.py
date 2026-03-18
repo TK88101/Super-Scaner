@@ -1,6 +1,7 @@
 import csv
 import os
 import re
+from datetime import datetime, timezone, timedelta
 
 MF_HEADERS = [
     "取引No", "取引日", "借方勘定科目", "借方補助科目", "借方部門", "借方取引先",
@@ -126,6 +127,8 @@ def append_to_csv(data):
         memo = data.get('memo', '')
         transaction_no = _get_next_transaction_no()
 
+        JST = timezone(timedelta(hours=9))
+
         for entry in entries:
             amount = entry.get("amount")
             if not amount or int(amount) == 0:
@@ -134,6 +137,8 @@ def append_to_csv(data):
             description = f"{vendor_name} - {entry.get('description', '')}"
             if uploader_name:
                 description += f" [担当: {uploader_name}]"
+
+            now_jst = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
 
             row = [
                 transaction_no,                          # 取引No
@@ -159,9 +164,9 @@ def append_to_csv(data):
                 "",                                      # タグ
                 "",                                      # MF仕訳タイプ
                 "",                                      # 決算整理仕訳
-                "",                                      # 作成日時
+                now_jst,                                 # 作成日時
                 uploader_name,                           # 作成者
-                "",                                      # 最終更新日時
+                now_jst,                                 # 最終更新日時
                 uploader_name                            # 最終更新者
             ]
 

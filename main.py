@@ -129,23 +129,25 @@ def ensure_latest_csv_from_drive(service):
 
     if files:
         file_id = files[0]['id']
-        print(f"🔄 クラウドから最新のCSVを同期中...")
-        request = service.files().get_media(fileId=file_id)
-        with io.FileIO(CSV_FILENAME, 'wb') as fh:
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while done is False:
-                status, done = downloader.next_chunk()
+        # === デモモード: Driveからの既存データ復元をスキップ ===
+        print(f"🎬 デモモード: クラウドCSVのダウンロードをスキップ（既存データを復元しない）")
+        # print(f"🔄 クラウドから最新のCSVを同期中...")
+        # request = service.files().get_media(fileId=file_id)
+        # with io.FileIO(CSV_FILENAME, 'wb') as fh:
+        #     downloader = MediaIoBaseDownload(fh, request)
+        #     done = False
+        #     while done is False:
+        #         status, done = downloader.next_chunk()
 
-        # ダウンロードしたCSVの末尾に改行がない場合、追記時に行が結合してしまう問題を防止
-        with open(CSV_FILENAME, 'rb') as f:
-            f.seek(0, 2)  # ファイル末尾へ
-            if f.tell() > 0:
-                f.seek(-1, 2)
-                if f.read(1) != b'\n':
-                    with open(CSV_FILENAME, 'a', encoding='utf-8-sig') as af:
-                        af.write('\n')
-                    print("🔧 CSVファイル末尾に改行を補完しました")
+        # # ダウンロードしたCSVの末尾に改行がない場合、追記時に行が結合してしまう問題を防止
+        # with open(CSV_FILENAME, 'rb') as f:
+        #     f.seek(0, 2)  # ファイル末尾へ
+        #     if f.tell() > 0:
+        #         f.seek(-1, 2)
+        #         if f.read(1) != b'\n':
+        #             with open(CSV_FILENAME, 'a', encoding='utf-8-sig') as af:
+        #                 af.write('\n')
+        #                 print("🔧 CSVファイル末尾に改行を補完しました")
 
         return file_id
     else:
