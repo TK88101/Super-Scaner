@@ -29,6 +29,7 @@ def detect_anomalies(entry, parent_data=None):
             "type": "high_amount",
             "message": f"金額が10万円を超えています: ¥{amount:,}",
             "severity": "low",
+            "col": 8,  # 借方金額(円) = I列 (0始まり index 8)
         })
 
     # 日付が空
@@ -38,6 +39,7 @@ def detect_anomalies(entry, parent_data=None):
             "type": "missing_date",
             "message": "取引日が空です",
             "severity": "high",
+            "col": 1,  # 取引日 = B列
         })
 
     # 取引先が空
@@ -47,6 +49,7 @@ def detect_anomalies(entry, parent_data=None):
             "type": "missing_vendor",
             "message": "取引先が空です",
             "severity": "medium",
+            "col": 5,  # 借方取引先 = F列
         })
 
     # T番号がサニタイズで除去された
@@ -56,6 +59,7 @@ def detect_anomalies(entry, parent_data=None):
             "type": "invalid_t_number",
             "message": f"T番号が不正な形式のため除去: {raw_invoice}",
             "severity": "medium",
+            "col": 7,  # 借方インボイス = H列
         })
 
     return flags

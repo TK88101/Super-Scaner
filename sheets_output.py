@@ -241,17 +241,23 @@ class SheetsOutputWriter:
                     raise
 
     def _apply_anomaly_highlight(self, worksheet, row_num, flags):
-        """異常行にハイライトを適用"""
-        color = Color(1, 1, 0.7)  # デフォルト: 薄い黄色
+        """異常セルにハイライトを適用（該当セルのみ）"""
         for flag in flags:
-            if flag.get("severity") == "high":
-                color = Color(1, 0.8, 0.8)  # 赤系
-                break
-            elif flag.get("severity") == "medium":
-                color = Color(1, 0.9, 0.7)  # オレンジ系
+            severity = flag.get("severity", "low")
+            if severity == "high":
+                color = Color(1, 0.8, 0.8)    # 赤系
+            elif severity == "medium":
+                color = Color(1, 0.9, 0.7)    # オレンジ系
+            else:
+                color = Color(1, 1, 0.7)       # 薄い黄色
 
-        fmt = CellFormat(backgroundColor=color)
-        format_cell_range(worksheet, f"A{row_num}:AB{row_num}", fmt)
+            col_index = flag.get("col")
+            if col_index is not None:
+                # 該当セルのみハイライト (0始まり → A=1)
+                col_letter = chr(ord('A') + col_index)
+                cell_ref = f"{col_letter}{row_num}"
+                fmt = CellFormat(backgroundColor=color)
+                format_cell_range(worksheet, cell_ref, fmt)
 
 
 def _sanitize_invoice_num(raw):
