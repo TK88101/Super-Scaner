@@ -7,10 +7,8 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaInMemoryUpload
-
 # 引入我們的模塊
-from ocr_engine import process_pipeline, _split_pdf_pages, _get_mime_type
+from ocr_engine import process_pipeline
 from sheets_output import SheetsOutputWriter
 from notifier import send_notification
 from doc_types import DocType, DOC_TYPE_CONFIG
@@ -98,25 +96,6 @@ def move_file(service, file_id, previous_folder_id, new_folder_id):
         print(f"⚠️ ファイル移動中に警告が発生しました: {e}")
 
 
-def upload_page_to_drive(service, page_bytes, filename, folder_id):
-    """単ページ PDF を Drive にアップロードし、webViewLink を返す"""
-    if not folder_id:
-        return ""
-    try:
-        media = MediaInMemoryUpload(page_bytes, mimetype='application/pdf')
-        file_metadata = {'name': filename, 'parents': [folder_id]}
-        uploaded = _call_with_retry(lambda: service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields='id, webViewLink'
-        ).execute())
-        link = uploaded.get('webViewLink', '')
-        print(f"📤 単ページPDFアップロード: {filename}")
-        return link
-    except Exception as e:
-        print(f"⚠️ 単ページPDFアップロード失敗: {e}")
-        return ""
-
 
 def is_duplicate_file(service, md5_checksum):
     """Processed フォルダ中の重複チェック"""
@@ -176,33 +155,20 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
             print(f"📊 仕訳行数: {len(entries)}")
         print("=" * 40 + "\n")
 
-        # 単ページ PDF アップロード → source_url 生成
-        split_folder = config.SPLIT_PDF_FOLDER_ID
-        mime_type = _get_mime_type(file_path)
-
-        # 多ページ PDF の場合：各ページを Drive にアップロード
-        page_urls = {}
-        if mime_type == "application/pdf":
-            page_payloads = _split_pdf_pages(file_path)
-            if page_payloads and split_folder:
-                for page_info in page_payloads:
-                    url = upload_page_to_drive(
-                        service, page_info["data"],
-                        page_info["filename"], split_folder
-                    )
-                    page_urls[page_info["page_num"]] = url
-
-        # source_url: 単ページ/画像は元ファイルの Drive URL を使用
-        if not page_urls and drive_file_id:
-            default_source_url = f"https://drive.google.com/file/d/{drive_file_id}/view"
-        else:
-            default_source_url = ""
+        # source_url: 元ファイルの Drive URL + ページ番号
+        # (SA storageQuotaExceeded のため単ページ PDF アップロードは不可)
+        base_url = ""
+        if drive_file_id:
+            base_url = f"https://drive.google.com/file/d/{drive_file_id}/view"
 
         # Google Sheets に書き込み
         for idx, r in enumerate(results):
             r['uploader'] = uploader_name
-            # ページ番号に基づく source_url（多ページ PDF の場合）
-            source_url = page_urls.get(idx + 1, default_source_url)
+            # 多ページ PDF: URL に #page=N を付与
+            if len(results) > 1:
+                source_url = f"{base_url}#page={idx + 1}" if base_url else ""
+            else:
+                source_url = base_url
             sheets_writer.append_entries(
                 employee_name=uploader_name,
                 doc_type=doc_type,
