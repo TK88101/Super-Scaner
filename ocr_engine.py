@@ -389,8 +389,11 @@ def _determine_credit_account(pay_method, doc_category="receipt"):
         return "普通預金"
     elif "PayPay" in pay_method:
         return "未払金"
+    elif any(x in pay_method for x in ["現金", "cash"]):
+        return "現金"
 
-    return "現金"
+    # デフォルト: 未払金（顧客要望による変更）
+    return "未払金"
 
 
 def _determine_tax_types(doc_category, tax_rate):

@@ -44,9 +44,9 @@ JST = timezone(timedelta(hours=9))
 RETENTION_DAYS = 90  # バックアップ tab の保持日数（3ヶ月）
 
 # tab 名のパターン: {名前}_{文書タイプ}
-TAB_PATTERN = re.compile(r'^.+_(領収書|請求書|給与明細)$')
+TAB_PATTERN = re.compile(r'^.+_(領収書|支払請求書|売上請求書|給与明細)$')
 # バックアップ tab 名のパターン: 2026-03-18_池田尚也_領収書
-BACKUP_TAB_PATTERN = re.compile(r'^(\d{4}-\d{2}-\d{2})_.+_(領収書|請求書|給与明細)$')
+BACKUP_TAB_PATTERN = re.compile(r'^(\d{4}-\d{2}-\d{2})_.+_(領収書|支払請求書|売上請求書|給与明細)$')
 
 
 def log(msg):
