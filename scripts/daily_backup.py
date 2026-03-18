@@ -37,9 +37,12 @@ OUTPUT_SPREADSHEET_ID = os.getenv("OUTPUT_SPREADSHEET_ID", "")
 BACKUP_SPREADSHEET_ID = os.getenv("BACKUP_SPREADSHEET_ID", "")
 
 JST = timezone(timedelta(hours=9))
+RETENTION_DAYS = 90  # バックアップ tab の保持日数（3ヶ月）
 
 # tab 名のパターン: {名前}_{文書タイプ}
 TAB_PATTERN = re.compile(r'^.+_(領収書|請求書|給与明細)$')
+# バックアップ tab 名のパターン: 2026-03-18_池田尚也_領収書
+BACKUP_TAB_PATTERN = re.compile(r'^(\d{4}-\d{2}-\d{2})_.+_(領収書|請求書|給与明細)$')
 
 
 def log(msg):
@@ -102,6 +105,33 @@ def main():
             log(f"  ⚠️ クリア失敗 ({tab_name}): {e}")
 
     log(f"🏁 バックアップ完了: {backed_up} tab バックアップ, {cleared} tab クリア")
+
+    # 古いバックアップ tab を削除（90日超過）
+    cleanup_old_backups(backup_ss, today)
+
+
+def cleanup_old_backups(backup_ss, today_str):
+    """RETENTION_DAYS を超えたバックアップ tab を削除"""
+    today_date = datetime.strptime(today_str, "%Y-%m-%d").date()
+    deleted = 0
+
+    for ws in backup_ss.worksheets():
+        m = BACKUP_TAB_PATTERN.match(ws.title)
+        if not m:
+            continue
+
+        try:
+            tab_date = datetime.strptime(m.group(1), "%Y-%m-%d").date()
+            age_days = (today_date - tab_date).days
+            if age_days > RETENTION_DAYS:
+                backup_ss.del_worksheet(ws)
+                log(f"  🗑️ 古いバックアップを削除: {ws.title} ({age_days}日前)")
+                deleted += 1
+        except ValueError:
+            continue
+
+    if deleted:
+        log(f"  🧹 {deleted} 個の古いバックアップ tab を削除")
 
 
 if __name__ == "__main__":
