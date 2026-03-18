@@ -1,79 +1,84 @@
 # 🧾 Super Scaner - 自動化會計憑證處理機器人
 
 ## 📖 項目簡介
-這是一個基於 Python 和 Google Gemini AI 的企業級自動化工具。它能全天候監聽 Google Drive，將員工上傳的**發票、收據 (PDF/圖片)** 自動進行 OCR 識別，提取關鍵財務數據（日期、金額、稅率拆分），並生成符合 **MoneyForward** 導入標準的 CSV 報表。
+
+基於 Python + Cloud Vision OCR + Gemini AI 的企業級自動化工具。全天候監聽 Google Drive，將員工上傳的 **發票、收據 (PDF/圖片)** 自動識別提取，結果直接寫入 **Google Sheets**，按員工和文書類型自動分 Tab，異常數據自動標色。
 
 ### 🌟 核心功能
-* 📂 **自動監聽：** 實時監控 Google Drive 指定文件夾 (Input)。
-* 🧠 **AI 視覺識別：** 使用 **Gemini 2.0 Flash** 進行高精度 OCR，無需傳統 OCR 庫。
-* 🧾 **混合稅率拆分：** 自動區分 **8% (食品/輕減)** 和 **10% (標準)** 稅率。
-* ☁️ **雲端同步：** 自動生成並更新雲端 **CSV_Exports** 文件夾中的報表。
-* 🛡️ **格式過濾：** 自動忽略 Word/Excel 等不支持的格式，只處理圖片與 PDF。
-* 🗄️ **自動歸檔：** 處理完畢後自動將原始文件移入 **Processed** 文件夾。
+* 📂 **多文件夾監聽：** 按文書類型分別監控（領収書/請求書/給与明細）
+* 🔍 **雙引擎 OCR：** Cloud Vision 文字識別 + Gemini AI 結構化提取（自動回退）
+* 📊 **Google Sheets 輸出：** 按員工分 Tab，異常單元格標色（紅/橙/黃）
+* 🗺️ **科目自動映射：** AI 通用名 → MoneyForward 正確科目名
+* 🔗 **原票 URL 追蹤：** 每行數據關聯原始 PDF 鏈接 + 頁碼
+* 💾 **每日自動備份：** 22:00 JST 備份到獨立 Spreadsheet，90 天保留
+* 🛡️ **異常檢測：** 日期空/取引先空/T番號不正/高額 → 對應單元格標色
 
 ---
 
-## 🛠️ 本地開發環境搭建 (Local Setup)
+## 🏗️ 系統架構
 
-### 1. 準備工作
-確保電腦已安裝 **Python 3.9** 或更高版本，以及 **Git**。
+```
+員工上傳 PDF → Drive 文件夾 (領収書/請求書/給与明細)
+                    ↓ (3秒輪詢)
+              Cloud Vision OCR → 純文字
+                    ↓
+              Gemini AI → 結構化 JSON
+                    ↓
+              科目映射 + 異常檢測
+                    ↓
+              Google Sheets 寫入 (按員工分Tab + 異常標色)
+                    ↓
+              原文件歸檔 + Chatwork 通知
 
-### 2. 建立虛擬環境
-```bash
-# 1. 創建虛擬環境
-python3 -m venv venv
-
-# 2. 激活環境 (Mac/Linux)
-source venv/bin/activate
-# Windows 用戶請執行: .\venv\Scripts\activate
+              22:00 JST: 工作Sheet → 備份Sheet → 清空
 ```
 
-### 3. 安裝依賴
+---
+
+## 🛠️ 本地開發環境搭建
+
+### 1. 安裝依賴
 ```bash
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
----
-
-## 🔑 配置說明 (Configuration)
-
-本項目依賴 **Google Cloud** 和 **Google AI** 服務。請確保根目錄下有以下兩個配置文件。
-
-### 1. `.env` 文件 (環境變量)
-請在根目錄新建 `.env` 文件，填入以下內容：
-
+### 2. 配置 `.env`
 ```env
-# --- Google Drive 文件夾 ID (從瀏覽器網址欄獲取) ---
-INPUT_FOLDER_ID=你的_Input_文件夾ID
-PROCESSED_FOLDER_ID=你的_Processed_文件夾ID
-CSV_FOLDER_ID=你的_CSV_Exports_文件夾ID
-
-# --- 認證文件路徑 ---
+# Google Drive
+FOLDER_RECEIPT_ID=領収書文件夾ID
+FOLDER_PURCHASE_INVOICE_ID=請求書文件夾ID
+FOLDER_SALARY_SLIP_ID=給与明細文件夾ID
+PROCESSED_FOLDER_ID=歸檔文件夾ID
 SERVICE_ACCOUNT_FILE=service_account.json
 
-# --- AI 模型密鑰 ---
-GEMINI_API_KEY=你的_AIza開頭的Key
+# Google Sheets
+OUTPUT_SPREADSHEET_ID=工作用SpreadsheetID
+BACKUP_SPREADSHEET_ID=備份用SpreadsheetID
+
+# AI
+GEMINI_API_KEY=你的AIza開頭的Key
+
+# 通知 (可選)
+CHATWORK_API_TOKEN=你的Token
+CHATWORK_ROOM_ID=房間ID
 ```
 
-### 2. `service_account.json` (機器人鑰匙)
-* 從 Google Cloud Console 下載的 JSON 密鑰文件。
-* **重要：** 務必在 Google Drive 將 `Input`, `Processed`, `CSV_Exports` 三個文件夾 **共用 (Share)** 給 JSON 文件中的 `client_email` 地址（必須設為 **編輯者 Editor**）。
+### 3. 準備 Google 資源
+1. 建立 `MF_Import_Data` 試算表 → 共享給 SA 為編輯者
+2. 建立 `MF_Backup` 試算表 → 共享給 SA 為編輯者
+3. 建立 3 個輸入文件夾（領収書/請求書/給与明細）→ 共享給 SA
+4. (可選) 啟用 GCP Cloud Vision API + Billing
 
----
-
-## 🚀 如何運行 (Usage)
-
-### 啟動機器人
-在終端機執行：
+### 4. 運行
 ```bash
+# 生產模式 (監聽 Drive)
 python main.py
-```
 
-### 使用流程
-1.  員工將發票/收據 (JPG, PNG, PDF) 上傳至 Google Drive 的 **Input** 文件夾。
-2.  機器人自動下載並識別 (終端機顯示進度)。
-3.  識別成功後，會自動更新 **CSV_Exports** 文件夾裡的 `MF_Import_Data.csv`。
-4.  原始圖片會被移動到 **Processed** 文件夾歸檔。
+# 本地測試 (不需要 Drive)
+python local_test.py
+```
 
 ---
 
@@ -81,161 +86,78 @@ python main.py
 
 ```text
 Super Scaner/
-├── .env                        # [機密] 環境變量 (Git 已忽略)
-├── .gitignore                  # Git 忽略清單
-├── .dockerignore               # Docker 忽略清單
-├── Dockerfile                  # Docker 部署配置
-├── PRD.md                      # 產品需求文檔
-├── requirements.txt            # Python 依賴庫
-├── service_account.json        # [機密] Google Drive 權限鑰匙 (Git 已忽略)
-│
-├── main.py                     # [主程序] 流程控制、文件監聽、雲端同步
-├── ocr_engine.py               # [AI 引擎] 調用 Gemini 進行視覺識別與稅率拆分
-├── csv_writer.py               # [寫入器] 生成 MoneyForward 格式 CSV
+├── main.py                     # 主程序：Drive 監聽 + Sheets 寫入
+├── ocr_engine.py               # Cloud Vision OCR + Gemini AI 雙引擎
+├── sheets_output.py            # Google Sheets 輸出（Tab管理/分割線/異常標色）
+├── anomaly_detector.py         # 異常檢測模組
+├── config.py                   # 配置管理 + 科目映射 (ACCOUNT_MAP)
+├── doc_types.py                # 文書類型定義 + Tab 後綴映射
+├── notifier.py                 # Chatwork 通知
+├── csv_writer.py               # [廢止] 舊版 CSV 寫入器（參考保留）
+├── local_test.py               # 本地測試腳本
 │
 ├── scripts/
-│   └── deploy_ec2.sh           # AWS EC2 一鍵部署腳本
+│   ├── deploy_ec2.sh           # AWS EC2 一鍵部署
+│   ├── daily_backup.py         # 每日備份腳本 (22:00 JST cron)
+│   └── install_daily_cron.sh   # Cron 安裝腳本
 │
-└── monitoring/                 # 監控子系統
-    ├── system_metrics.py       # 系統指標採集 (CPU/RAM/Disk)
-    ├── docker_metrics.py       # Docker 容器狀態與日誌採集
-    ├── log_parser.py           # 日誌解析與統計提取
-    ├── sheets_writer.py        # Google Sheets 寫入器 (含行數限制管理)
-    ├── metrics_pusher.py       # 指標推送主控腳本 (cron 每分鐘執行)
-    ├── cleanup.py              # 每小時定期清理 Sheets 舊數據
-    ├── install_cron.sh         # EC2 cron 安裝腳本
-    └── tests/                  # 單元測試
+├── monitoring/                 # 監控子系統
+│   ├── metrics_pusher.py       # 指標推送
+│   ├── cleanup.py              # 數據清理
+│   └── ...
+│
+├── Dockerfile                  # Docker 部署
+├── requirements.txt            # Python 依賴
+├── PRD.md                      # 產品需求文檔
+└── README.md                   # 本文件
 ```
 
 ---
 
-## ☁️ AWS EC2 一鍵部署 (Ubuntu + Docker)
+## ☁️ AWS EC2 部署
 
-本專案新增了可直接執行的部署腳本：
-`scripts/deploy_ec2.sh`
-
-### 快速部署
-在本機終端執行：
 ```bash
-cd "/Users/ibridgezhao/Documents/Super Scaner"
-chmod +x scripts/deploy_ec2.sh
-
-# 建議明確指定目標主機
+# 一鍵部署
 EC2_HOST=13.112.35.6 EC2_USER=ubuntu \
-SSH_KEY="/Users/ibridgezhao/Documents/Super Scaner/SuperScaner.pem" \
+SSH_KEY="SuperScaner.pem" \
 bash scripts/deploy_ec2.sh
 ```
 
-### 安全說明
-* `SuperScaner.pem` 僅用於本機 SSH 連線，不會被上傳到 VPS。
-* 腳本只會上傳兩個機密文件：
-  * `.env`
-  * `service_account.json`
-* 容器啟動時使用：
-  * `--env-file /home/ubuntu/super-scaner-secrets/.env`
-  * `-v /home/ubuntu/super-scaner-secrets/service_account.json:/app/service_account.json:ro`
+部署腳本會自動：上傳 secrets → 拉取代碼 → Docker build → 啟動容器 → 安裝備份 cron
 
 ---
 
-## 📊 監控系統 (Monitoring Dashboard)
+## 📊 Google Sheets 輸出格式
 
-本項目內置了 **AWS EC2 即時監控系統**，每分鐘自動將伺服器健康數據推送到 Google Sheets 儀表板。
+### Tab 命名
+- `池田尚也_領収書` — 池田的領収書數據
+- `池田尚也_請求書` — 池田的請求書數據
+- `_config` — 系統配置（取引No 管理）
 
-### 監控指標
-* 🖥️ **系統指標：** CPU 使用率、RAM 使用率、磁盤使用率
-* 🐳 **Docker 狀態：** 容器運行狀態、啟動時間
-* 📋 **應用日誌：** OCR 處理成功/失敗統計
-* 🗃️ **數據保留：** 心跳數據保留 24 小時（1440 筆），日誌保留 500 筆
+### 欄位 (28列)
+MF 標準 27 列 + 原票URL (第28列)
 
-### 所需環境變量
-```env
-MONITOR_SPREADSHEET_ID=你的_Google_Sheets_ID
-```
-
-### 部署監控
-```bash
-# 安裝 cron 任務 (每分鐘執行一次)
-bash monitoring/install_cron.sh
-
-# 手動測試推送
-python monitoring/metrics_pusher.py
-
-# 手動觸發清理
-python monitoring/cleanup.py
-```
-
-### Google Sheets 儀表板結構
-| 分頁 | 內容 |
-|------|------|
-| Heartbeat | 每分鐘系統指標 |
-| Logs | 應用錯誤與事件日誌 |
-| Stats | 每日處理統計 |
-| Summary | 系統概覽 |
+### 異常標色
+| 異常 | 標色位置 | 顏色 |
+|------|---------|------|
+| 日期為空 | B列 | 🔴 紅色 |
+| 取引先為空 | F列 | 🟠 橙色 |
+| T番號不正 | H列 | 🟠 橙色 |
+| 金額 > 10萬 | I列 | 🟡 黃色 |
 
 ---
 
-## 🚢 GCP 服務器部署指南 (Server Deployment)
+## ⚠️ 常見問題
 
-本項目支持 Docker 容器化部署，推薦使用 **Google Cloud Platform (GCP)** 的 **Compute Engine**。
+**Q: Cloud Vision OCR 報 BILLING_DISABLED？**
+→ GCP 項目需啟用 Billing。不啟用也能用（自動回退到 Gemini Vision），但數字精度稍低。
 
-**推薦配置：**
-* **OS:** Ubuntu 22.04 LTS
-* **Machine:** e2-micro (或 e2-small)
-* **Disk:** 20GB Standard Persistent Disk
+**Q: Sheets API 報 429 Quota exceeded？**
+→ 已通過緩存和重試機制優化。大量文件（26頁+）會自動限流處理。
 
-### 第一步：環境準備
-SSH 登錄服務器後，安裝 Docker 和 Git：
-```bash
-sudo apt-get update
-sudo apt-get install -y docker.io git
-```
-
-### 第二步：下載代碼
-由於是私有倉庫，需要配置 Deploy Key：
-```bash
-# 1. 生成密鑰 (一路回車)
-ssh-keygen -t ed25519 -C "gcp_server"
-
-# 2. 查看公鑰 (複製內容添加到 GitHub -> Repo Settings -> Deploy keys)
-cat ~/.ssh/id_ed25519.pub
-
-# 3. 下載代碼
-git clone git@github.com:TK88101/Super-Scaner.git
-cd Super-Scaner
-```
-
-### 第三步：上傳機密文件
-使用 SSH 工具 (如 VS Code Remote 或 GCP 控制台右上角的 "Upload files") 將以下兩個本地文件上傳到服務器項目目錄中：
-1.  `.env`
-2.  `service_account.json`
-
-### 第四步：Docker 啟動 (後台運行)
-```bash
-# 1. 構建鏡像
-sudo docker build -t super-scaner .
-
-# 2. 啟動容器 (設置為自動重啟，保證 24/7 在線)
-sudo docker run -d --restart always --name scan-bot super-scaner
-```
-
-### 常用運維指令
-* **查看日誌：** `sudo docker logs -f scan-bot`
-* **停止服務：** `sudo docker stop scan-bot`
-* **重啟服務：** `sudo docker restart scan-bot`
+**Q: Service Account 報 storageQuotaExceeded？**
+→ SA 無法新建 Drive 文件。Spreadsheet 和文件夾需手動預建並共享給 SA。
 
 ---
 
-## ⚠️ 常見問題 (FAQ)
-
-**Q1: 報錯 "Service Accounts do not have storage quota"？**
-* **原因：** 機器人嘗試在你的個人免費版 Google Drive 創建新文件。
-* **解決：** 請手動在 `CSV_Exports` 文件夾裡上傳一個空的 `MF_Import_Data.csv`，機器人就會自動切換為「更新模式」，不會報錯。企業版 Workspace 帳號無此限制。
-
-**Q2: AI 識別金額不準確？**
-* **解決：** 本項目已在 Prompt 中加入了「審計級」指令，強制 AI 讀取收據底部的「稅率匯總欄」，並禁止 AI 自行計算加總，從而保證金額 100% 準確。
-
-**Q3: 換了電腦怎麼辦？**
-* 下載代碼 -> 放入 `.env` 和 `json` 鑰匙 -> `pip install -r requirements.txt` -> `python main.py`。一鍵復活！
-
----
-*Generated for Project Super Scaner*
+*Generated for Project Super Scaner v2.0*
