@@ -19,7 +19,7 @@ fi
 # Optional SSH key path. If empty, ssh/scp use your ~/.ssh/config rules.
 SSH_KEY="${SSH_KEY:-${PROJECT_DIR}/SuperScaner.pem}"
 
-DEPLOY_BRANCH="${DEPLOY_BRANCH:-claude/festive-jennings}"
+DEPLOY_BRANCH="${DEPLOY_BRANCH:-feature/restructure-sheets-ocr}"
 REPO_SSH_URL="${REPO_SSH_URL:-git@github.com:TK88101/Super-Scaner.git}"
 REMOTE_APP_DIR="${REMOTE_APP_DIR:-/home/ubuntu/apps/super-scaner}"
 REMOTE_SECRETS_DIR="${REMOTE_SECRETS_DIR:-/home/ubuntu/super-scaner-secrets}"
@@ -93,6 +93,9 @@ run_ssh "sudo docker logs --tail 100 ${DOCKER_CONTAINER}"
 
 log "Checking image layer for secrets"
 run_ssh "sudo docker run --rm --entrypoint sh \"${DOCKER_IMAGE}\" -c 'ls -1 /app | grep -E \"SuperScaner\\.pem|\\.env|service_account\\.json\" && exit 1 || echo \"No secrets in image layer\"'"
+
+log "Installing daily backup cron"
+run_ssh "set -euo pipefail; cd \"${REMOTE_APP_DIR}\"; chmod +x scripts/install_daily_cron.sh; bash scripts/install_daily_cron.sh || true"
 
 log "Deployment finished"
 printf "Container: %s\nImage: %s\nHost: %s\n" "${DOCKER_CONTAINER}" "${DOCKER_IMAGE}" "${SSH_DEST}"

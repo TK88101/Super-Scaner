@@ -48,6 +48,14 @@ DOC_TYPE_CONFIG = {
     },
 }
 
+# Tab 名のサフィックス（Google Sheets 出力用）
+DOC_TYPE_TAB_SUFFIX = {
+    DocType.RECEIPT: "領収書",
+    DocType.PURCHASE_INVOICE: "請求書",
+    DocType.SALES_INVOICE: "請求書",
+    DocType.SALARY_SLIP: "給与明細",
+}
+
 # 環境変数名とDocTypeの対応
 ENV_FOLDER_MAP = {
     "FOLDER_RECEIPT_ID": DocType.RECEIPT,

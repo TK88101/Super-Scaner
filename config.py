@@ -4,6 +4,24 @@
 import os
 from doc_types import DocType, ENV_FOLDER_MAP
 
+# === 出力先 Google Spreadsheet ID ===
+OUTPUT_SPREADSHEET_ID = os.getenv("OUTPUT_SPREADSHEET_ID", "")
+BACKUP_SPREADSHEET_ID = os.getenv("BACKUP_SPREADSHEET_ID", "")
+SPLIT_PDF_FOLDER_ID = os.getenv("SPLIT_PDF_FOLDER_ID", "")
+
+# === 科目マッピング（AI 出力名 → MF 正確名） ===
+ACCOUNT_MAP = {
+    "消耗品費": "備品・消耗品費",
+    "雑費": "市場調査費",       # 要确认：是否所有雑費都映射
+    "旅費交通費": "旅費交通費",
+    "車両費": "車両費",
+    "通信費": "通信費",
+    "租税公課": "租税公課",
+    "広告宣伝費": "広告宣伝費",
+    # 贷方默认：現金 → 未払金
+    "現金": "未払金",
+}
+
 # === 員工名單映射表 ===
 # Key: 員工的 Google 郵箱地址
 # Value: 

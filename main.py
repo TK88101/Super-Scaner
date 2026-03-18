@@ -5,12 +5,13 @@ import random
 from dotenv import load_dotenv
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.http import MediaIoBaseDownload
 from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaInMemoryUpload
 
 # 引入我們的模塊
-from ocr_engine import process_pipeline
-from csv_writer import append_to_csv
+from ocr_engine import process_pipeline, _split_pdf_pages, _get_mime_type
+from sheets_output import SheetsOutputWriter
 from notifier import send_notification
 from doc_types import DocType, DOC_TYPE_CONFIG
 import config
@@ -18,13 +19,15 @@ import config
 # ================= 配置區域 =================
 load_dotenv()
 PROCESSED_FOLDER_ID = os.getenv("PROCESSED_FOLDER_ID")
-CSV_FOLDER_ID = os.getenv("CSV_FOLDER_ID")
 SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE")
 LOCAL_DOWNLOAD_DIR = './temp_downloads'
-CSV_FILENAME = "MF_Import_Data.csv"
 
-if not PROCESSED_FOLDER_ID or not CSV_FOLDER_ID or not SERVICE_ACCOUNT_FILE:
+if not PROCESSED_FOLDER_ID or not SERVICE_ACCOUNT_FILE:
     print("❌ エラー：.envファイルの設定を確認してください (配置錯誤)")
+    exit(1)
+
+if not config.OUTPUT_SPREADSHEET_ID:
+    print("❌ エラー：OUTPUT_SPREADSHEET_ID が設定されていません。")
     exit(1)
 
 # フォルダマッピング読み込み
@@ -95,6 +98,26 @@ def move_file(service, file_id, previous_folder_id, new_folder_id):
         print(f"⚠️ ファイル移動中に警告が発生しました: {e}")
 
 
+def upload_page_to_drive(service, page_bytes, filename, folder_id):
+    """単ページ PDF を Drive にアップロードし、webViewLink を返す"""
+    if not folder_id:
+        return ""
+    try:
+        media = MediaInMemoryUpload(page_bytes, mimetype='application/pdf')
+        file_metadata = {'name': filename, 'parents': [folder_id]}
+        uploaded = _call_with_retry(lambda: service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id, webViewLink'
+        ).execute())
+        link = uploaded.get('webViewLink', '')
+        print(f"📤 単ページPDFアップロード: {filename}")
+        return link
+    except Exception as e:
+        print(f"⚠️ 単ページPDFアップロード失敗: {e}")
+        return ""
+
+
 def is_duplicate_file(service, md5_checksum):
     """Processed フォルダ中の重複チェック"""
     if not md5_checksum:
@@ -122,78 +145,16 @@ def is_duplicate_file(service, md5_checksum):
         return False
 
 
-def ensure_latest_csv_from_drive(service):
-    query = f"name = '{CSV_FILENAME}' and '{CSV_FOLDER_ID}' in parents and trashed = false"
-    results = service.files().list(q=query, fields="files(id)").execute()
-    files = results.get('files', [])
 
-    if files:
-        file_id = files[0]['id']
-        # === デモモード: Driveからの既存データ復元をスキップ ===
-        print(f"🎬 デモモード: クラウドCSVのダウンロードをスキップ（既存データを復元しない）")
-        # print(f"🔄 クラウドから最新のCSVを同期中...")
-        # request = service.files().get_media(fileId=file_id)
-        # with io.FileIO(CSV_FILENAME, 'wb') as fh:
-        #     downloader = MediaIoBaseDownload(fh, request)
-        #     done = False
-        #     while done is False:
-        #         status, done = downloader.next_chunk()
-
-        # # ダウンロードしたCSVの末尾に改行がない場合、追記時に行が結合してしまう問題を防止
-        # with open(CSV_FILENAME, 'rb') as f:
-        #     f.seek(0, 2)  # ファイル末尾へ
-        #     if f.tell() > 0:
-        #         f.seek(-1, 2)
-        #         if f.read(1) != b'\n':
-        #             with open(CSV_FILENAME, 'a', encoding='utf-8-sig') as af:
-        #                 af.write('\n')
-        #                 print("🔧 CSVファイル末尾に改行を補完しました")
-
-        return file_id
-    else:
-        return None
+# CSV 関連関数は sheets_output.py に移行済み (廃止)
 
 
-def sync_csv_to_drive(service, existing_file_id=None):
-    print("☁️  最新のCSVをクラウドへアップロード中...")
-    media = MediaFileUpload(CSV_FILENAME, mimetype='text/csv')
-    try:
-        if existing_file_id:
-            service.files().update(fileId=existing_file_id, media_body=media).execute()
-            print("✅ クラウド上のCSVを更新しました (Update)")
-            return
-
-        # existing_file_id が未指定の場合、再検索してからアップロード
-        query = f"name = '{CSV_FILENAME}' and '{CSV_FOLDER_ID}' in parents and trashed = false"
-        results = service.files().list(q=query, fields="files(id)").execute()
-        files = results.get('files', [])
-        if files:
-            service.files().update(fileId=files[0]['id'], media_body=media).execute()
-            print("✅ クラウド上のCSVを更新しました (Update)")
-            return
-
-        # Drive 上に CSV が存在しない → Service Account では新規作成できない
-        # まず Service Account での作成を試みる
-        try:
-            file_metadata = {'name': CSV_FILENAME, 'parents': [CSV_FOLDER_ID]}
-            service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-            print("✅ クラウド上に新しいCSVを作成しました (Create)")
-        except Exception as create_err:
-            if 'storageQuotaExceeded' in str(create_err) or 'storage quota' in str(create_err).lower():
-                print("⚠️ Service Account にはストレージ容量がないため、新規CSVを作成できません。")
-                print(f"   → Google Drive の CSV フォルダに空の '{CSV_FILENAME}' を手動で作成してください。")
-                print(f"   → CSV フォルダ ID: {CSV_FOLDER_ID}")
-                print("   → 作成後、次回処理時に自動的に内容が書き込まれます。")
-            else:
-                raise create_err
-    except Exception as e:
-        print(f"⚠️ クラウド同期エラー: {e}")
-
-
-def process_file(service, file_path, uploader_name, chat_id, doc_type=DocType.RECEIPT):
-    """ファイルを処理し、CSV に書き込み、通知を送信する"""
+def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
+                  doc_type=DocType.RECEIPT, drive_file_id=None):
+    """ファイルを処理し、Google Sheets に書き込み、通知を送信する"""
     type_label = DOC_TYPE_CONFIG.get(doc_type, {}).get("label", doc_type)
-    print(f"⚙️  処理開始: {os.path.basename(file_path)} [{type_label}] (担当: {uploader_name})")
+    filename = os.path.basename(file_path)
+    print(f"⚙️  処理開始: {filename} [{type_label}] (担当: {uploader_name})")
 
     result = process_pipeline(file_path, doc_type=doc_type)
 
@@ -215,12 +176,39 @@ def process_file(service, file_path, uploader_name, chat_id, doc_type=DocType.RE
             print(f"📊 仕訳行数: {len(entries)}")
         print("=" * 40 + "\n")
 
-        # 寫入 CSV
-        file_id = ensure_latest_csv_from_drive(service)
-        for r in results:
+        # 単ページ PDF アップロード → source_url 生成
+        split_folder = config.SPLIT_PDF_FOLDER_ID
+        mime_type = _get_mime_type(file_path)
+
+        # 多ページ PDF の場合：各ページを Drive にアップロード
+        page_urls = {}
+        if mime_type == "application/pdf":
+            page_payloads = _split_pdf_pages(file_path)
+            if page_payloads and split_folder:
+                for page_info in page_payloads:
+                    url = upload_page_to_drive(
+                        service, page_info["data"],
+                        page_info["filename"], split_folder
+                    )
+                    page_urls[page_info["page_num"]] = url
+
+        # source_url: 単ページ/画像は元ファイルの Drive URL を使用
+        if not page_urls and drive_file_id:
+            default_source_url = f"https://drive.google.com/file/d/{drive_file_id}/view"
+        else:
+            default_source_url = ""
+
+        # Google Sheets に書き込み
+        for idx, r in enumerate(results):
             r['uploader'] = uploader_name
-            append_to_csv(r)
-        sync_csv_to_drive(service, existing_file_id=file_id)
+            # ページ番号に基づく source_url（多ページ PDF の場合）
+            source_url = page_urls.get(idx + 1, default_source_url)
+            sheets_writer.append_entries(
+                employee_name=uploader_name,
+                doc_type=doc_type,
+                entries_data=r,
+                source_url=source_url,
+            )
 
         # 金額集計（全文書合算）
         total_amount = sum(
@@ -230,7 +218,7 @@ def process_file(service, file_path, uploader_name, chat_id, doc_type=DocType.RE
         vendor_list = ", ".join(r.get('vendor', '') for r in results)
 
         send_notification(
-            filename=os.path.basename(file_path),
+            filename=filename,
             status="Success",
             uploader_name=uploader_name,
             chat_id=chat_id,
@@ -240,7 +228,7 @@ def process_file(service, file_path, uploader_name, chat_id, doc_type=DocType.RE
         return True
     else:
         send_notification(
-            filename=os.path.basename(file_path),
+            filename=filename,
             status="Failed",
             uploader_name=uploader_name,
             chat_id=chat_id,
@@ -250,26 +238,8 @@ def process_file(service, file_path, uploader_name, chat_id, doc_type=DocType.RE
         return False
 
 
-def _check_csv_on_drive(service):
-    """起動時にDrive上のCSVファイルの存在を確認"""
-    query = f"name = '{CSV_FILENAME}' and '{CSV_FOLDER_ID}' in parents and trashed = false"
-    results = service.files().list(q=query, fields="files(id, name)").execute()
-    files = results.get('files', [])
-
-    if files:
-        print(f"✅ Drive上のCSVファイルを確認: {CSV_FILENAME}")
-        return True
-    else:
-        print(f"⚠️ Drive上に '{CSV_FILENAME}' が見つかりません。")
-        print(f"   Service Account ではファイルの新規作成ができないため、")
-        print(f"   Google Drive の CSV フォルダに空の '{CSV_FILENAME}' を手動で作成してください。")
-        print(f"   CSV フォルダ ID: {CSV_FOLDER_ID}")
-        print(f"   ※ ローカルCSVへの書き込みは正常に動作します。Drive同期のみ失敗します。")
-        return False
-
-
 def main():
-    print("🚀 Super Scaner 自動化システム起動！(Multi-Type)")
+    print("🚀 Super Scaner 自動化システム起動！(Sheets出力版)")
     print(f"📂 監視フォルダ数: {len(folder_map)}")
     for fid, dtype in folder_map.items():
         label = DOC_TYPE_CONFIG.get(dtype, {}).get("label", dtype)
@@ -278,8 +248,12 @@ def main():
 
     service = get_drive_service()
 
-    # Drive上のCSVファイル存在チェック
-    _check_csv_on_drive(service)
+    # Google Sheets 出力ライター初期化
+    sheets_writer = SheetsOutputWriter(
+        spreadsheet_id=config.OUTPUT_SPREADSHEET_ID,
+        credentials_file=SERVICE_ACCOUNT_FILE,
+    )
+    print(f"✅ Google Sheets 接続完了: ...{config.OUTPUT_SPREADSHEET_ID[-5:]}")
 
     while True:
         try:
@@ -299,9 +273,6 @@ def main():
                     file_id = file['id']
                     file_name = file['name']
                     md5 = file.get('md5Checksum')
-
-                    if file_name == CSV_FILENAME:
-                        continue
 
                     # 1. 防重檢測
                     if is_duplicate_file(service, md5):
@@ -329,7 +300,11 @@ def main():
                     # 4. 下載與處理
                     local_path = download_file(service, file_id, file_name)
 
-                    success = process_file(service, local_path, uploader_name, chat_id, doc_type=doc_type)
+                    success = process_file(
+                        service, sheets_writer, local_path,
+                        uploader_name, chat_id,
+                        doc_type=doc_type, drive_file_id=file_id
+                    )
 
                     if success:
                         move_file(service, file_id, input_folder_id, PROCESSED_FOLDER_ID)

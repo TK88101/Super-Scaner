@@ -3,6 +3,7 @@ import io
 import json
 import re
 import google.generativeai as genai
+from google.cloud import vision
 from dotenv import load_dotenv
 from doc_types import DocType, DOC_TYPE_CONFIG
 
@@ -120,8 +121,38 @@ def _get_finish_reason(response):
         return ""
 
 
+def _ocr_with_cloud_vision(image_bytes):
+    """Google Cloud Vision API で OCR テキストを取得"""
+    client = vision.ImageAnnotatorClient()
+    image = vision.Image(content=image_bytes)
+    response = client.document_text_detection(image=image)
+
+    if response.error.message:
+        raise Exception(f"Cloud Vision API error: {response.error.message}")
+
+    return response.full_text_annotation.text or ""
+
+
+def _call_gemini_text(ocr_text, prompt):
+    """OCR テキストを Gemini に送って構造化データを抽出"""
+    full_prompt = f"{prompt}\n\n--- OCRテキスト ---\n{ocr_text}"
+    response = model.generate_content(
+        [full_prompt],
+        generation_config=GEMINI_GENERATION_CONFIG,
+    )
+    text = (getattr(response, "text", "") or "").strip()
+    parsed = extract_json(text)
+    if parsed is None:
+        finish_reason = _get_finish_reason(response)
+        print(
+            f"⚠️ Gemini応答のJSON解析失敗 "
+            f"(finish_reason={finish_reason or 'unknown'}, len={len(text)})"
+        )
+    return parsed
+
+
 def _call_gemini_bytes(file_data, mime_type, prompt):
-    """Gemini API を呼び出して JSON を返す"""
+    """Gemini API を呼び出して JSON を返す (フォールバック用)"""
     response = model.generate_content(
         [
             {"mime_type": mime_type, "data": file_data},
@@ -149,7 +180,7 @@ def _call_gemini(file_path, prompt):
 
 
 def _split_pdf_pages(file_path):
-    """PDF を 1ページずつの bytes 配列に分割"""
+    """PDF を 1ページずつの dict 配列に分割 (metadata 付き)"""
     if PdfReader is None or PdfWriter is None:
         print("⚠️ pypdf未導入のため、PDF分割解析をスキップします")
         return None
@@ -159,13 +190,18 @@ def _split_pdf_pages(file_path):
         if len(reader.pages) <= 1:
             return None
 
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
         page_payloads = []
-        for page in reader.pages:
+        for i, page in enumerate(reader.pages, 1):
             writer = PdfWriter()
             writer.add_page(page)
             buf = io.BytesIO()
             writer.write(buf)
-            page_payloads.append(buf.getvalue())
+            page_payloads.append({
+                "page_num": i,
+                "data": buf.getvalue(),
+                "filename": f"{base_name}_p{i}.pdf",
+            })
         return page_payloads
     except Exception as e:
         print(f"⚠️ PDFページ分割失敗: {e}")
@@ -178,9 +214,9 @@ def _split_pdf_pages(file_path):
 
 PROMPTS = {
     DocType.RECEIPT: """
-あなたはプロの経理担当者です。画像に写っている全ての書類（領収書・レシート・受取書・振込控え等）を分析してください。
+あなたはプロの経理担当者です。以下のOCRテキストから全ての書類（領収書・レシート・受取書・振込控え等）を分析してください。
 
-重要: 画像に複数の書類が含まれる場合は、全ての書類を別々に抽出してください。
+重要: テキストに複数の書類が含まれる場合は、全ての書類を別々に抽出してください。
 
 【出力JSONフォーマット】
 {
@@ -210,10 +246,15 @@ PROMPTS = {
 - "bank_transfer": 銀行振込の受取書・振込控え（振込金額本体。税区分は「対象外」）
 - "fee_receipt": 振込手数料の領収証（ATM手数料、コンビニ手数料等。課税対象）
 
+【勘定科目の選択肢】以下の科目名を優先して使用してください：
+備品・消耗品費, 旅費交通費, 車両費, 通信費, 租税公課, 広告宣伝費,
+支払手数料, 交際費, 会議費, 福利厚生費, 未払金, 普通預金, 市場調査費
+上記にない場合のみ一般的な科目名を使用してください。
+
 【勘定科目の推定基準】
 - bank_transfer: debit_account は "未払金"（既存の買掛金・未払金の支払い）
 - fee_receipt: debit_account は "支払手数料"
-- receipt: 内容から推定 (消耗品費, 旅費交通費, 交際費, 会議費, 通信費, 福利厚生費, 雑費 など)
+- receipt: 内容から推定（上記の選択肢から選ぶ）
 
 【tax_rate の判定基準】
 - 食品・飲料(酒類除く): 0.08
@@ -229,23 +270,23 @@ PROMPTS = {
 - クレジットカード明細 → "クレジットカード"
 
 【date の取得方法（重要）】
-- 書類に印字された日付を最優先
-- 印字の日付欄が空白の場合は、以下の順で日付を探す:
-  1. 取扱日付印・受付印（赤いスタンプ/印章）の中の数字（例: "9.16" → 当年の9月16日）
+- 書類に記載された日付を最優先
+- 日付欄が空白の場合は、以下の順で日付を探す:
+  1. 取扱日付印・受付印の中の数字（例: "9.16" → 当年の9月16日）
   2. 書類下部の「ご依頼人」欄付近のスタンプ日付
-  3. 同一画像内の他の書類の日付（同日の取引である可能性が高い）
+  3. 同一テキスト内の他の書類の日付（同日の取引である可能性が高い）
 - 印章の日付形式: "M.DD", "MM.DD", "R7.9.16", "2025.9.16" など → 西暦 YYYY/MM/DD に変換
-- 年が不明な場合は、同一画像内の他の書類の年、または現在の年（2025年）を使用
+- 年が不明な場合は、同一テキスト内の他の書類の年、または現在の年（2026年）を使用
 - dateは可能な限り必ず出力してください。空文字は最終手段です
 
 注意:
-- 画像に1枚の書類しかなくても、必ず documents 配列で返してください
+- テキストに1枚の書類しかなくても、必ず documents 配列で返してください
 - 金額は数値型(カンマなし)で返してください
 - 振込受取書では、vendor は振込依頼人（支払い元の会社名）を記載してください
 """,
 
     DocType.PURCHASE_INVOICE: """
-あなたはプロの経理担当者です。支払請求書・仕入請求書を分析し、会計ソフト用データを抽出してください。
+あなたはプロの経理担当者です。以下のOCRテキストから支払請求書・仕入請求書を分析し、会計ソフト用データを抽出してください。
 
 【出力JSONフォーマット】
 {
@@ -259,13 +300,17 @@ PROMPTS = {
             "amount": 税抜金額(数値),
             "tax_rate": 税率(0.08 or 0.10),
             "tax_amount": 消費税額(数値),
-            "debit_account": "費用の勘定科目を推定 (仕入高, 外注費, 消耗品費, 通信費 など)"
+            "debit_account": "費用の勘定科目を推定"
         }
     ],
     "total_amount": 合計金額(税込, 数値),
     "payment_method": "支払い方法 (振込, 口座振替, 現金 など)",
     "due_date": "支払期日 (あれば YYYY/MM/DD)"
 }
+
+【勘定科目の選択肢】以下の科目名を優先して使用してください：
+仕入高, 外注費, 備品・消耗品費, 通信費, 広告宣伝費, 旅費交通費, 車両費, 租税公課, 市場調査費
+上記にない場合のみ一般的な科目名を使用してください。
 
 注意:
 - 複数品目がある場合はitems配列に全て含めてください
@@ -274,7 +319,7 @@ PROMPTS = {
 """,
 
     DocType.SALES_INVOICE: """
-あなたはプロの経理担当者です。売上請求書を分析し、会計ソフト用データを抽出してください。
+あなたはプロの経理担当者です。以下のOCRテキストから売上請求書を分析し、会計ソフト用データを抽出してください。
 
 【出力JSONフォーマット】
 {
@@ -299,7 +344,7 @@ PROMPTS = {
 """,
 
     DocType.SALARY_SLIP: """
-あなたはプロの経理担当者です。賃金台帳・給与明細書を分析し、会計ソフト用データを抽出してください。
+あなたはプロの経理担当者です。以下のOCRテキストから賃金台帳・給与明細書を分析し、会計ソフト用データを抽出してください。
 
 【出力JSONフォーマット】
 {
@@ -674,7 +719,7 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT):
     """
     filename = os.path.basename(file_path)
     type_label = DOC_TYPE_CONFIG.get(doc_type, {}).get("label", doc_type)
-    print(f"🧠 Geminiが{type_label}を分析中: {filename} ...")
+    print(f"🧠 Cloud Vision + Gemini で{type_label}を分析中: {filename} ...")
 
     try:
         prompt = PROMPTS.get(doc_type)
@@ -691,9 +736,24 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT):
                 merged_results = []
                 failed_pages = 0
 
-                for idx, payload in enumerate(page_payloads, 1):
+                for idx, page_info in enumerate(page_payloads, 1):
                     prefix = f"[p{idx}] "
-                    page_raw_data = _call_gemini_bytes(payload, "application/pdf", prompt)
+                    page_data = page_info["data"] if isinstance(page_info, dict) else page_info
+
+                    # Cloud Vision OCR → Gemini Text (フォールバック: Gemini Vision)
+                    page_raw_data = None
+                    try:
+                        ocr_text = _ocr_with_cloud_vision(page_data)
+                        if ocr_text.strip():
+                            print(f"{prefix}📝 OCR完了 ({len(ocr_text)}文字)")
+                            page_raw_data = _call_gemini_text(ocr_text, prompt)
+                    except Exception as ocr_err:
+                        print(f"{prefix}⚠️ Cloud Vision OCR失敗: {ocr_err}")
+
+                    if not page_raw_data:
+                        print(f"{prefix}🔄 フォールバック: Gemini Vision で再試行")
+                        page_raw_data = _call_gemini_bytes(page_data, "application/pdf", prompt)
+
                     if not page_raw_data:
                         failed_pages += 1
                         print(f"{prefix}⚠️ AIの応答がJSONではありませんでした")
@@ -717,7 +777,23 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT):
                 print("⚠️ PDF分割解析でも有効結果を取得できませんでした")
                 return None
 
-        raw_data = _call_gemini(file_path, prompt)
+        # 単一ファイル: Cloud Vision OCR → Gemini Text (フォールバック: Gemini Vision)
+        raw_data = None
+        with open(file_path, "rb") as f:
+            file_data = f.read()
+
+        try:
+            ocr_text = _ocr_with_cloud_vision(file_data)
+            if ocr_text.strip():
+                print(f"📝 OCR完了 ({len(ocr_text)}文字)")
+                raw_data = _call_gemini_text(ocr_text, prompt)
+        except Exception as ocr_err:
+            print(f"⚠️ Cloud Vision OCR失敗: {ocr_err}")
+
+        if not raw_data:
+            print("🔄 フォールバック: Gemini Vision で再試行")
+            raw_data = _call_gemini(file_path, prompt)
+
         if not raw_data:
             print("⚠️ AIの応答がJSONではありませんでした")
             return None
