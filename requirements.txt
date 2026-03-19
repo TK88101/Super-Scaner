@@ -35,3 +35,7 @@ urllib3==2.5.0
 gspread>=6.1.2
 gspread-formatting>=1.2.0
 google-cloud-vision>=3.7.0
+paddleocr>=3.4
+paddlepaddle>=3.3
+opencv-python-headless
+pdf2image
