@@ -223,6 +223,34 @@ def _call_gemini_bytes(file_data, mime_type, prompt):
     return parsed
 
 
+def _call_gemini_cross_validate(ocr_text, file_data, mime_type, prompt):
+    """Strategy C: OCR テキストと原画像の両方を Gemini に送信"""
+    cross_prompt = (
+        f"{prompt}\n\n"
+        f"--- 参考: OCR認識テキスト (誤認識の可能性あり、画像と照合して修正してください) ---\n"
+        f"{ocr_text}\n"
+        f"--- OCRテキスト終了 ---\n\n"
+        f"上記のOCRテキストは参考情報です。画像の内容を直接確認し、"
+        f"OCRテキストに誤りがあれば画像を優先してください。"
+    )
+    response = model.generate_content(
+        [
+            {"mime_type": mime_type, "data": file_data},
+            cross_prompt,
+        ],
+        generation_config=GEMINI_GENERATION_CONFIG,
+    )
+    text = (getattr(response, "text", "") or "").strip()
+    parsed = extract_json(text)
+    if parsed is None:
+        finish_reason = _get_finish_reason(response)
+        print(
+            f"⚠️ Gemini応答のJSON解析失敗 "
+            f"(finish_reason={finish_reason or 'unknown'}, len={len(text)})"
+        )
+    return parsed
+
+
 def _call_gemini(file_path, prompt):
     with open(file_path, "rb") as f:
         file_data = f.read()
