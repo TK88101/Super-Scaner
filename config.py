@@ -9,6 +9,10 @@ OUTPUT_SPREADSHEET_ID = os.getenv("OUTPUT_SPREADSHEET_ID", "")
 BACKUP_SPREADSHEET_ID = os.getenv("BACKUP_SPREADSHEET_ID", "")
 SPLIT_PDF_FOLDER_ID = os.getenv("SPLIT_PDF_FOLDER_ID", "")
 
+# === OCR 戦略設定 ===
+OCR_STRATEGY = os.getenv("OCR_STRATEGY", "B")
+OCR_CONFIDENCE_THRESHOLD = float(os.getenv("OCR_CONFIDENCE_THRESHOLD", "0.7"))
+
 # === 科目マッピング（AI 出力名 → MF 正確名） ===
 ACCOUNT_MAP = {
     "消耗品費": "備品・消耗品費",
