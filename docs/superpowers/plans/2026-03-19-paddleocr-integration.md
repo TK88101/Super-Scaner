@@ -857,7 +857,7 @@ git commit -m "feat: add benchmark_ocr.py for A/B/C strategy accuracy comparison
 
 - [ ] **Step 1: Add system packages for PaddleOCR and poppler**
 
-After `WORKDIR /app` line, add:
+Between `WORKDIR /app` and `COPY requirements.txt .` (before pip install, so system deps are available), add:
 ```dockerfile
 # PaddleOCR + pdf2image system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
