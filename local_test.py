@@ -23,6 +23,7 @@ from ocr_engine import process_pipeline
 from sheets_output import SheetsOutputWriter
 from doc_types import DocType, DOC_TYPE_CONFIG
 import config
+import argparse
 
 # ================= 設定 =================
 TEST_DIR = "./test_images"
@@ -63,7 +64,7 @@ def scan_local_files():
     return files
 
 
-def process_local_file(file_info, sheets_writer):
+def process_local_file(file_info, sheets_writer, strategy=None):
     """1ファイルを処理: OCR → Google Sheets 書き込み"""
     file_path = file_info["path"]
     doc_type = file_info["doc_type"]
@@ -76,7 +77,7 @@ def process_local_file(file_info, sheets_writer):
     print(f"{'='*50}")
 
     # Cloud Vision OCR + Gemini
-    result = process_pipeline(file_path, doc_type=doc_type)
+    result = process_pipeline(file_path, doc_type=doc_type, ocr_strategy=strategy)
 
     if not result:
         print(f"❌ 解析失敗: {file_name}")
@@ -126,6 +127,12 @@ def process_local_file(file_info, sheets_writer):
 
 def main():
     print("🚀 Super Scaner ローカルテストモード起動 (Sheets出力版)")
+
+    parser = argparse.ArgumentParser(description="Super Scaner Local Test")
+    parser.add_argument("--strategy", choices=["A", "B", "C"], default=None,
+                        help="OCR strategy override (default: config.OCR_STRATEGY)")
+    args = parser.parse_args()
+
     print(f"📂 テストフォルダ: {os.path.abspath(TEST_DIR)}")
     print("-" * 50)
 
@@ -166,7 +173,7 @@ def main():
 
     for file_info in files:
         try:
-            if process_local_file(file_info, sheets_writer):
+            if process_local_file(file_info, sheets_writer, strategy=args.strategy):
                 success_count += 1
             else:
                 fail_count += 1
