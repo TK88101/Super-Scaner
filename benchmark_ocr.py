@@ -30,6 +30,19 @@ from doc_types import DocType
 # Ground Truth 読み込み
 # ============================================================
 
+def normalize_date(date_str):
+    """日付文字列を正規化: '2025/2/1' と '2025/02/01' を同一視"""
+    if not date_str:
+        return ""
+    parts = date_str.strip().split("/")
+    if len(parts) == 3:
+        try:
+            return f"{int(parts[0])}/{int(parts[1])}/{int(parts[2])}"
+        except ValueError:
+            pass
+    return date_str.strip()
+
+
 def load_ground_truth(csv_path):
     """Ground truth CSV を読み込み、取引No でグループ化して返す。
 
@@ -48,7 +61,7 @@ def load_ground_truth(csv_path):
             vendor = memo.split(" - ")[0].strip() if " - " in memo else memo.strip()
 
             groups[txn_no].append({
-                "date": row["取引日"].strip(),
+                "date": normalize_date(row["取引日"]),
                 "debit_account": row["借方勘定科目"].strip(),
                 "debit_tax_type": row["借方税区分"].strip(),
                 "debit_amount": int(row["借方金額(円)"].strip()),
@@ -171,7 +184,7 @@ def match_results_to_ground_truth(results, gt_groups):
     # 生成結果をグループ化 (date + vendor → entries)
     result_groups = defaultdict(list)
     for r in results:
-        date = r.get("date", "")
+        date = normalize_date(r.get("date", ""))
         vendor = r.get("vendor", "")
         for entry in r.get("entries", []):
             result_groups[(date, vendor)].append({
