@@ -1,8 +1,8 @@
 # 📄 Super Scaner — 產品需求文檔 (PRD)
 
-> **版本:** 2.0
+> **版本:** 2.1
 > **日期:** 2026-03-19
-> **狀態:** CSV→Google Sheets 重構完成，待客戶測試
+> **狀態:** PaddleOCR 統合完了 (Strategy C)，Cloud Vision コメントアウト（クライアント確認待ち）
 
 ---
 
@@ -10,7 +10,7 @@
 
 ### 1.1 產品定位
 
-**Super Scaner** 是一款面向日本中小型企業（特別是會計事務所）的 **自動化會計憑證處理機器人**。它通過 Google Drive 文件監聽 + Cloud Vision OCR + Gemini AI 結構化提取，將員工上傳的發票、收據等財務單據自動轉換為符合 **MoneyForward（マネーフォワード）** 導入標準的會計數據，直接寫入 Google Sheets。
+**Super Scaner** 是一款面向日本中小型企業（特別是會計事務所）的 **自動化會計憑證處理機器人**。它通過 Google Drive 文件監聽 + PaddleOCR（ローカル OCR）+ Gemini AI 結構化提取，將員工上傳的發票、收據等財務單據自動轉換為符合 **MoneyForward（マネーフォワード）** 導入標準的會計數據，直接寫入 Google Sheets。
 
 ### 1.2 產品願景
 
@@ -32,8 +32,8 @@
 
 | 層級 | 技術選型 |
 |------|---------|
-| **語言** | Python 3.9+ |
-| **OCR 引擎** | Google Cloud Vision API（文字識別）|
+| **語言** | Python 3.11 (PaddlePaddle 互換性) |
+| **OCR 引擎** | PaddleOCR（ローカル、無料）+ Gemini Vision（フォールバック）|
 | **AI 引擎** | Google Gemini 2.0 Flash（結構化提取）|
 | **雲端存儲** | Google Drive API v3 |
 | **數據輸出** | Google Sheets API (gspread) |
@@ -44,7 +44,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      Super Scaner v2.0                       │
+│                      Super Scaner v2.1                       │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
 │  ┌───────────┐    ┌──────────────┐    ┌────────────────┐   │
@@ -77,7 +77,8 @@
 | 文件 | 職責 | 狀態 |
 |------|------|------|
 | `main.py` | 主控制循環、Drive 文件監聽、Sheets writer 初始化 | 重構 |
-| `ocr_engine.py` | Cloud Vision OCR + Gemini Text 雙引擎、PDF 拆分 | 重構 |
+| `ocr_engine.py` | PaddleOCR + Gemini Text/Vision、PDF 拆分、Strategy A/B/C | 重構 |
+| `benchmark_ocr.py` | OCR ベンチマーク（Strategy A/B/C 比較テスト）| **新建** |
 | `sheets_output.py` | Google Sheets 寫入、Tab 管理、分割線、異常標色 | **新建** |
 | `anomaly_detector.py` | 異常檢測（日期空/取引先空/T番號不正/高額）| **新建** |
 | `config.py` | 員工映射、文件夾配置、科目映射表 (ACCOUNT_MAP) | 修改 |
@@ -98,9 +99,10 @@ main.py 偵測到新文件 (3秒輪詢)
     ↓
 下載 PDF → 拆分為單頁 (多頁PDF時)
     ↓
-每一頁:
-  ├→ Cloud Vision OCR → 純文字 (回退: Gemini Vision)
-  ├→ Gemini AI (文字輸入) → 結構化 JSON
+每一頁 (Strategy C — デフォルト):
+  ├→ PaddleOCR (ローカル) → OCR テキスト
+  ├→ OCR テキスト + 原始圖片 → Gemini AI (クロスバリデーション) → 結構化 JSON
+  ├→ (失敗時回退: Gemini Vision 單獨識別)
   ├→ 科目映射校驗 (ACCOUNT_MAP)
   └→ 異常檢測 → 標記可疑數據
     ↓
@@ -132,11 +134,15 @@ daily_backup.py:
 - 環境變量: `FOLDER_RECEIPT_ID`, `FOLDER_PURCHASE_INVOICE_ID`, `FOLDER_SALARY_SLIP_ID`
 - 向後兼容單一 `INPUT_FOLDER_ID` 模式
 
-#### F2: 雙引擎 OCR (Cloud Vision + Gemini)
+#### F2: 雙引擎 OCR (PaddleOCR + Gemini)
 
-- **主引擎:** Cloud Vision API → 純文字 OCR → Gemini Text 結構化提取
-- **回退引擎:** Gemini Vision 直接識別（Cloud Vision 不可用時自動回退）
-- 優勢: OCR 和結構化提取分離，數字精度更高
+- **Strategy A:** PaddleOCR → テキスト → Gemini Text 結構化提取
+- **Strategy B:** PaddleOCR (信頼度ゲート) → Gemini Text / Vision 分岐
+- **Strategy C (デフォルト):** PaddleOCR テキスト + 原始圖片 → Gemini デュアル入力（クロスバリデーション）
+- **回退引擎:** Gemini Vision 直接識別（PaddleOCR 失敗時自動回退）
+- 優勢: 完全無料（GCP Billing 不要）、ローカル実行で高速、Gemini とのクロスバリデーションで高精度
+- `config.py`: `OCR_STRATEGY=C`, `OCR_CONFIDENCE_THRESHOLD=0.7`
+- Cloud Vision API コードはコメントアウトで保持（クライアント確認待ち）
 
 #### F3: Google Sheets 輸出
 
@@ -153,6 +159,7 @@ AI 輸出的通用科目名自動轉換為 MF 正確名稱:
 |---------|-----------|
 | 消耗品費 | 備品・消耗品費 |
 | 雑費 | 市場調查費 (待確認) |
+| 交際費/食費/飲食費 | 市場調査費 |
 | 現金 | 未払金 |
 
 #### F5: 異常檢測 + 單元格標色
@@ -205,10 +212,11 @@ AI 輸出的通用科目名自動轉換為 MF 正確名稱:
 | 項目 | 說明 |
 |------|------|
 | SA 存儲配額 | Service Account 無法新建 Drive 文件，Spreadsheet 需手動預建 |
-| Cloud Vision | 需要 GCP Billing（每月 1000 次免費），不啟用則回退到 Gemini Vision |
+| Cloud Vision | コメントアウト済み（PaddleOCR に置換）、クライアント確認後に完全削除予定 |
+| PaddleOCR | Python 3.11 必須 (PaddlePaddle 互換性)、venv311 使用、poppler 要インストール |
 | Sheets API 限流 | 60 次/分鐘，已通過緩存+重試優化 |
 | PDF 拆分頁上傳 | SA 配額限制暫不可用，改用原始 PDF URL + #page=N |
-| 備選 OCR | 如不啟用 GCP Billing，可考慮 Umi-OCR (PaddleOCR) 離線方案 |
+| ~~備選 OCR~~ | ~~Umi-OCR (PaddleOCR)~~ → **已採用 PaddleOCR 作為主引擎 (v2.1)** |
 
 ---
 
@@ -224,7 +232,20 @@ AI 輸出的通用科目名自動轉換為 MF 正確名稱:
 | **v2.0 Phase 3** | **PDF 拆分 + 原票URL 追蹤** | ✅ 完成 |
 | **v2.0 Phase 4** | **main.py CSV→Sheets 完全替換** | ✅ 完成 |
 | **v2.0 Phase 5** | **每日備份 + 部署更新** | ✅ 完成 |
+| **v2.1** | **PaddleOCR 統合 (Strategy C)、Cloud Vision 置換、ACCOUNT_MAP 拡張** | ✅ 完成 |
+
+### v2.1 ベンチマーク結果 (294 ページ / 305 取引)
+
+| フィールド | 精度 |
+|-----------|------|
+| date (取引日) | 100% |
+| amount (金額) | 100% |
+| tax_type (税区分) | 92.3% |
+| vendor (取引先) | 93.6% |
+| invoice (インボイス番号) | 91.9% |
+| debit_account (借方勘定科目) | 89.3% |
+| credit_account (貸方勘定科目) | 76.8% |
 
 ---
 
-*本文檔反映 Super Scaner v2.0 重構狀態 (feature/restructure-sheets-ocr 分支)，截至 2026-03-19。*
+*本文檔反映 Super Scaner v2.1 PaddleOCR 統合狀態 (feature/restructure-sheets-ocr 分支)，截至 2026-03-19。*

@@ -2,11 +2,11 @@
 
 ## 📖 項目簡介
 
-基於 Python + Cloud Vision OCR + Gemini AI 的企業級自動化工具。全天候監聽 Google Drive，將員工上傳的 **發票、收據 (PDF/圖片)** 自動識別提取，結果直接寫入 **Google Sheets**，按員工和文書類型自動分 Tab，異常數據自動標色。
+基於 Python + PaddleOCR (ローカル) + Gemini AI 的企業級自動化工具。全天候監聽 Google Drive，將員工上傳的 **發票、收據 (PDF/圖片)** 自動識別提取，結果直接寫入 **Google Sheets**，按員工和文書類型自動分 Tab，異常數據自動標色。
 
 ### 🌟 核心功能
 * 📂 **多文件夾監聽：** 按文書類型分別監控（領収書/請求書/給与明細）
-* 🔍 **雙引擎 OCR：** Cloud Vision 文字識別 + Gemini AI 結構化提取（自動回退）
+* 🔍 **雙引擎 OCR：** PaddleOCR (ローカル、無料) + Gemini AI クロスバリデーション（Strategy C、自動回退）
 * 📊 **Google Sheets 輸出：** 按員工分 Tab，異常單元格標色（紅/橙/黃）
 * 🗺️ **科目自動映射：** AI 通用名 → MoneyForward 正確科目名
 * 🔗 **原票 URL 追蹤：** 每行數據關聯原始 PDF 鏈接 + 頁碼
@@ -20,9 +20,11 @@
 ```
 員工上傳 PDF → Drive 文件夾 (領収書/請求書/給与明細)
                     ↓ (3秒輪詢)
-              Cloud Vision OCR → 純文字
+              PaddleOCR (ローカル) → OCR テキスト + 原始圖片
                     ↓
-              Gemini AI → 結構化 JSON
+              Gemini AI (クロスバリデーション) → 結構化 JSON
+                    ↓ (失敗時)
+              Gemini Vision (フォールバック)
                     ↓
               科目映射 + 異常檢測
                     ↓
@@ -38,9 +40,16 @@
 ## 🛠️ 本地開發環境搭建
 
 ### 1. 安裝依賴
+
+> **注意:** PaddlePaddle 需要 Python 3.11，請使用 `venv311` 環境。
+
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+# macOS: poppler 為 pdf2image 必要依賴
+brew install poppler
+
+# 建立 Python 3.11 虛擬環境
+python3.11 -m venv venv311
+source venv311/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -77,7 +86,13 @@ CHATWORK_ROOM_ID=房間ID
 python main.py
 
 # 本地測試 (不需要 Drive)
-python local_test.py
+python local_test.py                  # デフォルト Strategy C
+python local_test.py --strategy A     # PaddleOCR → Gemini Text のみ
+python local_test.py --strategy B     # 信頼度ゲート分岐
+python local_test.py --strategy C     # デュアル入力 (推奨)
+
+# OCR ベンチマーク
+python benchmark_ocr.py               # 全 Strategy 比較テスト
 ```
 
 ---
@@ -87,14 +102,15 @@ python local_test.py
 ```text
 Super Scaner/
 ├── main.py                     # 主程序：Drive 監聽 + Sheets 寫入
-├── ocr_engine.py               # Cloud Vision OCR + Gemini AI 雙引擎
+├── ocr_engine.py               # PaddleOCR + Gemini AI 雙引擎 (Strategy A/B/C)
 ├── sheets_output.py            # Google Sheets 輸出（Tab管理/分割線/異常標色）
 ├── anomaly_detector.py         # 異常檢測模組
 ├── config.py                   # 配置管理 + 科目映射 (ACCOUNT_MAP)
 ├── doc_types.py                # 文書類型定義 + Tab 後綴映射
 ├── notifier.py                 # Chatwork 通知
 ├── csv_writer.py               # [廢止] 舊版 CSV 寫入器（參考保留）
-├── local_test.py               # 本地測試腳本
+├── local_test.py               # 本地測試腳本 (--strategy A/B/C)
+├── benchmark_ocr.py            # OCR ベンチマーク (Strategy 比較)
 │
 ├── scripts/
 │   ├── deploy_ec2.sh           # AWS EC2 一鍵部署
@@ -150,7 +166,7 @@ MF 標準 27 列 + 原票URL (第28列)
 ## ⚠️ 常見問題
 
 **Q: Cloud Vision OCR 報 BILLING_DISABLED？**
-→ GCP 項目需啟用 Billing。不啟用也能用（自動回退到 Gemini Vision），但數字精度稍低。
+→ v2.1 で PaddleOCR に置換済み（Cloud Vision コードはコメントアウトで保持）。GCP Billing 不要。
 
 **Q: Sheets API 報 429 Quota exceeded？**
 → 已通過緩存和重試機制優化。大量文件（26頁+）會自動限流處理。
@@ -160,4 +176,4 @@ MF 標準 27 列 + 原票URL (第28列)
 
 ---
 
-*Generated for Project Super Scaner v2.0*
+*Generated for Project Super Scaner v2.1 — PaddleOCR Integration*
