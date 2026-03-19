@@ -135,22 +135,23 @@ def _get_finish_reason(response):
         return ""
 
 
-def _ocr_with_cloud_vision(image_bytes):
-    """Google Cloud Vision API で OCR テキストを取得"""
-    sa_file = os.getenv("SERVICE_ACCOUNT_FILE", "service_account.json")
-    if os.path.exists(sa_file):
-        from google.oauth2 import service_account as sa_auth
-        credentials = sa_auth.Credentials.from_service_account_file(sa_file)
-        client = vision.ImageAnnotatorClient(credentials=credentials)
-    else:
-        client = vision.ImageAnnotatorClient()
-    image = vision.Image(content=image_bytes)
-    response = client.document_text_detection(image=image)
-
-    if response.error.message:
-        raise Exception(f"Cloud Vision API error: {response.error.message}")
-
-    return response.full_text_annotation.text or ""
+# === Cloud Vision API — 甲方確認待ち、コード保持 ===
+# def _ocr_with_cloud_vision(image_bytes):
+#     """Google Cloud Vision API で OCR テキストを取得"""
+#     sa_file = os.getenv("SERVICE_ACCOUNT_FILE", "service_account.json")
+#     if os.path.exists(sa_file):
+#         from google.oauth2 import service_account as sa_auth
+#         credentials = sa_auth.Credentials.from_service_account_file(sa_file)
+#         client = vision.ImageAnnotatorClient(credentials=credentials)
+#     else:
+#         client = vision.ImageAnnotatorClient()
+#     image = vision.Image(content=image_bytes)
+#     response = client.document_text_detection(image=image)
+#
+#     if response.error.message:
+#         raise Exception(f"Cloud Vision API error: {response.error.message}")
+#
+#     return response.full_text_annotation.text or ""
 
 
 def _ocr_with_paddleocr(image_bytes, mime_type="image/jpeg"):
@@ -786,13 +787,37 @@ def _normalize_receipt_results(raw_data, prefix=""):
 # メインパイプライン
 # ============================================================
 
-def process_pipeline(file_path, doc_type=DocType.RECEIPT):
+def _route_ocr_strategy(data_bytes, mime_type, prompt, ocr_strategy, prefix=""):
+    """OCR 戦略に基づいてルーティング"""
+    import config
+    raw_data = None
+    try:
+        ocr_text, ocr_conf = _ocr_with_paddleocr(data_bytes, mime_type)
+        if ocr_text.strip():
+            print(f"{prefix}📝 PaddleOCR完了 ({len(ocr_text)}文字, 置信度: {ocr_conf:.3f})")
+            if ocr_strategy == "A":
+                raw_data = _call_gemini_text(ocr_text, prompt)
+            elif ocr_strategy == "B":
+                if ocr_conf >= config.OCR_CONFIDENCE_THRESHOLD:
+                    raw_data = _call_gemini_text(ocr_text, prompt)
+                else:
+                    print(f"{prefix}⚠️ 置信度低 ({ocr_conf:.3f} < {config.OCR_CONFIDENCE_THRESHOLD}) → Gemini Vision")
+                    raw_data = _call_gemini_bytes(data_bytes, mime_type, prompt)
+            elif ocr_strategy == "C":
+                raw_data = _call_gemini_cross_validate(ocr_text, data_bytes, mime_type, prompt)
+    except Exception as ocr_err:
+        print(f"{prefix}⚠️ PaddleOCR失敗: {ocr_err}")
+    return raw_data
+
+
+def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None):
     """
     文書を分析し、統一された仕訳データを返す。
 
     Args:
         file_path: 文書ファイルのパス
         doc_type: 文書タイプ (DocType 定数)
+        ocr_strategy: OCR 戦略 (A/B/C, None=config.OCR_STRATEGY)
 
     Returns:
         dict: 単一文書の場合（通常）
@@ -801,13 +826,17 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT):
     """
     filename = os.path.basename(file_path)
     type_label = DOC_TYPE_CONFIG.get(doc_type, {}).get("label", doc_type)
-    print(f"🧠 Cloud Vision + Gemini で{type_label}を分析中: {filename} ...")
+    print(f"🧠 PaddleOCR + Gemini で{type_label}を分析中: {filename} (戦略: {ocr_strategy}) ...")
 
     try:
         prompt = PROMPTS.get(doc_type)
         if not prompt:
             print(f"⚠️ 未対応の文書タイプ: {doc_type}")
             return None
+
+        import config
+        if ocr_strategy is None:
+            ocr_strategy = config.OCR_STRATEGY
 
         # 受領書PDFはページ分割で長文JSON切断を回避する
         mime_type = _get_mime_type(file_path)
@@ -822,15 +851,9 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT):
                     prefix = f"[p{idx}] "
                     page_data = page_info["data"] if isinstance(page_info, dict) else page_info
 
-                    # Cloud Vision OCR → Gemini Text (フォールバック: Gemini Vision)
-                    page_raw_data = None
-                    try:
-                        ocr_text = _ocr_with_cloud_vision(page_data)
-                        if ocr_text.strip():
-                            print(f"{prefix}📝 OCR完了 ({len(ocr_text)}文字)")
-                            page_raw_data = _call_gemini_text(ocr_text, prompt)
-                    except Exception as ocr_err:
-                        print(f"{prefix}⚠️ Cloud Vision OCR失敗: {ocr_err}")
+                    page_raw_data = _route_ocr_strategy(
+                        page_data, "application/pdf", prompt, ocr_strategy, prefix=prefix
+                    )
 
                     if not page_raw_data:
                         print(f"{prefix}🔄 フォールバック: Gemini Vision で再試行")
@@ -859,18 +882,11 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT):
                 print("⚠️ PDF分割解析でも有効結果を取得できませんでした")
                 return None
 
-        # 単一ファイル: Cloud Vision OCR → Gemini Text (フォールバック: Gemini Vision)
         raw_data = None
         with open(file_path, "rb") as f:
             file_data = f.read()
 
-        try:
-            ocr_text = _ocr_with_cloud_vision(file_data)
-            if ocr_text.strip():
-                print(f"📝 OCR完了 ({len(ocr_text)}文字)")
-                raw_data = _call_gemini_text(ocr_text, prompt)
-        except Exception as ocr_err:
-            print(f"⚠️ Cloud Vision OCR失敗: {ocr_err}")
+        raw_data = _route_ocr_strategy(file_data, mime_type, prompt, ocr_strategy)
 
         if not raw_data:
             print("🔄 フォールバック: Gemini Vision で再試行")
