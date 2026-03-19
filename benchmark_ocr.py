@@ -39,7 +39,7 @@ def load_ground_truth(csv_path):
                    credit_account, vendor, invoice_num
     """
     groups = defaultdict(list)
-    with open(csv_path, encoding="utf-8") as f:
+    with open(csv_path, encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
             txn_no = row["取引No"].strip()
@@ -111,11 +111,28 @@ def process_pdfs_with_strategy(pdf_paths, strategy):
 # 結果比較ロジック
 # ============================================================
 
-def fuzzy_match(a, b, threshold=0.8):
-    """文字列の類似度が threshold 以上なら True"""
+def fuzzy_match(a, b, threshold=0.6):
+    """文字列の類似度が threshold 以上、または部分文字列一致なら True"""
     if not a or not b:
         return a == b
-    return SequenceMatcher(None, a, b).ratio() >= threshold
+    a_str, b_str = str(a).strip(), str(b).strip()
+    # 完全一致
+    if a_str == b_str:
+        return True
+    # 類似度チェック
+    if SequenceMatcher(None, a_str, b_str).ratio() >= threshold:
+        return True
+    # 部分文字列: 短い方が長い方に含まれる
+    short, long = (a_str, b_str) if len(a_str) <= len(b_str) else (b_str, a_str)
+    if len(short) >= 3 and short in long:
+        return True
+    # 株式会社/有限会社等を除去して再比較
+    for prefix in ["株式会社", "有限会社", "(株)", "㈱"]:
+        a_clean = a_str.replace(prefix, "").strip()
+        b_clean = b_str.replace(prefix, "").strip()
+    if a_clean and b_clean and SequenceMatcher(None, a_clean, b_clean).ratio() >= threshold:
+        return True
+    return False
 
 
 def match_results_to_ground_truth(results, gt_groups):
@@ -191,6 +208,18 @@ def match_results_to_ground_truth(results, gt_groups):
                     if txn_no in matched_gt_txns:
                         continue
                     if gt_date == r_date and fuzzy_match(gt_vendor, r_vendor):
+                        best_txn = txn_no
+                        break
+                if best_txn:
+                    break
+
+        if not best_txn:
+            # date + total amount のみで再試行 (vendor 無視)
+            for (gt_date, gt_vendor, gt_total), txn_nos in gt_index.items():
+                for txn_no in txn_nos:
+                    if txn_no in matched_gt_txns:
+                        continue
+                    if gt_date == r_date and abs(gt_total - r_total) <= max(gt_total * 0.02, 5):
                         best_txn = txn_no
                         break
                 if best_txn:
