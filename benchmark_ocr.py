@@ -289,6 +289,23 @@ def match_results_to_ground_truth(results, gt_groups):
                         field_correct[field] += 1
                     else:
                         errors.append(f"取引No {best_txn}: {field} expected={gt_val} got={r_val}")
+                elif field == "invoice_num":
+                    # ハイフン除去して比較 (GT: T9-2900-... vs Result: T9290001...)
+                    r_inv = str(r_val).replace("-", "").strip()
+                    gt_inv = str(gt_val).replace("-", "").strip()
+                    if r_inv == gt_inv:
+                        field_correct[field] += 1
+                    else:
+                        errors.append(f"取引No {best_txn}: {field} expected={gt_val} got={r_val}")
+                elif field == "debit_account":
+                    # ACCOUNT_MAP を適用して比較
+                    from config import ACCOUNT_MAP
+                    r_mapped = ACCOUNT_MAP.get(str(r_val).strip(), str(r_val).strip())
+                    gt_clean = str(gt_val).strip()
+                    if r_mapped == gt_clean or str(r_val).strip() == gt_clean:
+                        field_correct[field] += 1
+                    else:
+                        errors.append(f"取引No {best_txn}: {field} expected={gt_val} got={r_val}")
                 else:
                     if str(r_val).strip() == str(gt_val).strip():
                         field_correct[field] += 1
