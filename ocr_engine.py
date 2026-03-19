@@ -13,6 +13,20 @@ except Exception:
     PdfReader = None
     PdfWriter = None
 
+from paddleocr import PaddleOCR
+from pdf2image import convert_from_bytes
+from PIL import Image
+import numpy as np
+
+# PaddleOCR singleton
+_paddle_ocr = None
+
+def _get_paddle_ocr():
+    global _paddle_ocr
+    if _paddle_ocr is None:
+        _paddle_ocr = PaddleOCR(lang='japan')
+    return _paddle_ocr
+
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
 
@@ -137,6 +151,37 @@ def _ocr_with_cloud_vision(image_bytes):
         raise Exception(f"Cloud Vision API error: {response.error.message}")
 
     return response.full_text_annotation.text or ""
+
+
+def _ocr_with_paddleocr(image_bytes, mime_type="image/jpeg"):
+    """PaddleOCR ローカル OCR エンジン"""
+    ocr = _get_paddle_ocr()
+
+    if mime_type == "application/pdf":
+        images = convert_from_bytes(image_bytes)
+        if not images:
+            return "", 0.0
+        img_array = np.array(images[0])
+    else:
+        img = Image.open(io.BytesIO(image_bytes))
+        img_array = np.array(img.convert("RGB"))
+
+    result = ocr.predict(img_array)
+
+    if not result or not result[0]:
+        return "", 0.0
+
+    res = result[0]
+    texts = res.get("rec_texts", [])
+    scores = res.get("rec_scores", [])
+
+    if not texts:
+        return "", 0.0
+
+    ocr_text = "\n".join(texts)
+    avg_confidence = sum(scores) / len(scores) if scores else 0.0
+
+    return ocr_text, avg_confidence
 
 
 def _call_gemini_text(ocr_text, prompt):
