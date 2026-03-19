@@ -10,7 +10,7 @@ BACKUP_SPREADSHEET_ID = os.getenv("BACKUP_SPREADSHEET_ID", "")
 SPLIT_PDF_FOLDER_ID = os.getenv("SPLIT_PDF_FOLDER_ID", "")
 
 # === OCR 戦略設定 ===
-OCR_STRATEGY = os.getenv("OCR_STRATEGY", "B")
+OCR_STRATEGY = os.getenv("OCR_STRATEGY", "C")
 OCR_CONFIDENCE_THRESHOLD = float(os.getenv("OCR_CONFIDENCE_THRESHOLD", "0.7"))
 
 # === 科目マッピング（AI 出力名 → MF 正確名） ===
