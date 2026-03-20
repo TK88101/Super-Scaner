@@ -162,7 +162,18 @@ def _ocr_with_paddleocr(image_bytes, mime_type="image/jpeg"):
         images = convert_from_bytes(image_bytes)
         if not images:
             return "", 0.0
-        img_array = np.array(images[0])
+        all_texts = []
+        all_scores = []
+        for img in images:
+            img_array = np.array(img)
+            page_result = ocr.predict(img_array)
+            if page_result and page_result[0]:
+                res = page_result[0]
+                all_texts.extend(res.get("rec_texts", []))
+                all_scores.extend(res.get("rec_scores", []))
+        ocr_text = "\n".join(all_texts)
+        avg_confidence = sum(all_scores) / len(all_scores) if all_scores else 0.0
+        return ocr_text, avg_confidence
     else:
         img = Image.open(io.BytesIO(image_bytes))
         img_array = np.array(img.convert("RGB"))

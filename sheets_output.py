@@ -197,7 +197,7 @@ class SheetsOutputWriter:
             if flags:
                 anomaly_flags_list.append((len(rows) - 1, flags))
 
-            transaction_no += 1
+        transaction_no += 1
 
         if rows:
             # 一括書き込み（リトライ付き）

@@ -5,7 +5,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKUP_SCRIPT="${SCRIPT_DIR}/daily_backup.py"
 VENV_PYTHON="${VENV_PYTHON:-/usr/bin/python3}"
-LOG_FILE="/var/log/super-scaner-backup.log"
+LOG_DIR="${HOME}/logs"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/super-scaner-backup.log"
 
 # cron エントリ: 毎日 13:00 UTC (= 22:00 JST)
 CRON_ENTRY="0 13 * * * ${VENV_PYTHON} ${BACKUP_SCRIPT} >> ${LOG_FILE} 2>&1"
