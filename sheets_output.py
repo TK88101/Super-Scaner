@@ -114,7 +114,7 @@ class SheetsOutputWriter:
             source_url: 原票 PDF の webViewLink
         """
         from doc_types import DOC_TYPE_TAB_SUFFIX
-        from config import ACCOUNT_MAP
+        from config import ACCOUNT_MAP, UNKNOWN_ACCOUNT, CREDIT_SUB_ACCOUNT_RECEIPT, CREDIT_SUB_ACCOUNT_INVOICE
         from anomaly_detector import detect_anomalies
 
         tab_suffix = DOC_TYPE_TAB_SUFFIX.get(doc_type, "領収書")
@@ -147,9 +147,11 @@ class SheetsOutputWriter:
             if not amount or int(amount) == 0:
                 continue
 
-            # 科目マッピング
+            # 科目マッピング（マップにない未知科目は「未確定勘定」）
             debit_account = entry.get("debit_account", "")
             debit_account = ACCOUNT_MAP.get(debit_account, debit_account)
+            if not debit_account:
+                debit_account = UNKNOWN_ACCOUNT
 
             credit_account = entry.get("credit_account", "")
             credit_account = ACCOUNT_MAP.get(credit_account, credit_account)
@@ -172,7 +174,7 @@ class SheetsOutputWriter:
                 int(amount),
                 entry.get("debit_tax_amount", ""),
                 credit_account,
-                entry.get("credit_sub_account", uploader_name), # 貸方補助科目 = 経办人
+                self._determine_credit_sub_account(doc_type, entry, vendor_name),
                 "",                                             # 貸方部門
                 entry.get("credit_vendor", ""),
                 entry.get("credit_tax_type", "対象外"),
@@ -239,6 +241,20 @@ class SheetsOutputWriter:
                     time.sleep(wait)
                 else:
                     raise
+
+    @staticmethod
+    def _determine_credit_sub_account(doc_type, entry, vendor_name):
+        """貸方補助科目を文書タイプに応じて決定"""
+        from config import CREDIT_SUB_ACCOUNT_RECEIPT, CREDIT_SUB_ACCOUNT_INVOICE
+        from doc_types import DocType
+        # 領収書: 社長名（立替払い）
+        if doc_type == DocType.RECEIPT:
+            return entry.get("credit_sub_account", CREDIT_SUB_ACCOUNT_RECEIPT)
+        # 請求書: 請求先会社名（支払先）
+        if doc_type == DocType.PURCHASE_INVOICE:
+            return entry.get("credit_sub_account", CREDIT_SUB_ACCOUNT_INVOICE)
+        # その他
+        return entry.get("credit_sub_account", "")
 
     def _apply_anomaly_highlight(self, worksheet, row_num, flags):
         """異常セルにハイライトを適用（該当セルのみ）"""

@@ -468,20 +468,7 @@ PROMPTS = {
 
 def _determine_credit_account(pay_method, doc_category="receipt"):
     """支払方法とドキュメントカテゴリから貸方科目を決定"""
-    # 銀行振込・振込手数料: 口座から引き落とされるため普通預金
-    if doc_category in ("bank_transfer", "fee_receipt"):
-        return "普通預金"
-
-    if any(x in pay_method for x in ["クレジット", "Credit", "Card", "VISA", "Master"]):
-        return "未払金"
-    elif any(x in pay_method for x in ["振込", "ATM"]):
-        return "普通預金"
-    elif "PayPay" in pay_method:
-        return "未払金"
-    elif any(x in pay_method for x in ["現金", "cash"]):
-        return "現金"
-
-    # デフォルト: 未払金（顧客要望による変更）
+    # 顧客確認済み: 領収書・請求書とも貸方は「未払金」に統一
     return "未払金"
 
 

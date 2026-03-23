@@ -17,19 +17,41 @@ def detect_anomalies(entry, parent_data=None):
     flags = []
     parent_data = parent_data or {}
 
-    # 金額 > 10万 → 要確認
     amount = entry.get("amount", 0)
     try:
         amount = int(amount)
     except (ValueError, TypeError):
         amount = 0
 
-    if amount > 100000:
+    debit_account = entry.get("debit_account", "")
+
+    # 科目別ハイライトルール（顧客確認済み）
+    # 地代家賃・保険料・雑収入: 金額に関係なく全件ハイライト
+    always_highlight = ["地代家賃", "保険料", "雑収入"]
+    if debit_account in always_highlight:
+        flags.append({
+            "type": "account_review",
+            "message": f"{debit_account}: 要確認科目です（¥{amount:,}）",
+            "severity": "low",
+            "col": 8,
+        })
+
+    # 修繕費 > 30万
+    if debit_account == "修繕費" and amount > 300000:
         flags.append({
             "type": "high_amount",
-            "message": f"金額が10万円を超えています: ¥{amount:,}",
+            "message": f"修繕費が30万円を超えています: ¥{amount:,}",
             "severity": "low",
-            "col": 8,  # 借方金額(円) = I列 (0始まり index 8)
+            "col": 8,
+        })
+
+    # 備品・消耗品費 > 10万
+    if debit_account in ("備品・消耗品費", "消耗品費") and amount > 100000:
+        flags.append({
+            "type": "high_amount",
+            "message": f"備品・消耗品費が10万円を超えています: ¥{amount:,}",
+            "severity": "low",
+            "col": 8,
         })
 
     # 日付が空
