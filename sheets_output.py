@@ -278,13 +278,21 @@ class SheetsOutputWriter:
 
 
 def _sanitize_invoice_num(raw):
-    """T番号バリデーション（csv_writer.py から移植）"""
+    """T番号バリデーション（形式 + 法人番号チェックディジット検証）"""
     if not raw:
         return ""
     s = str(raw).strip()
     s = s.replace("-", "")
     if s.startswith("t"):
         s = "T" + s[1:]
-    if re.match(r'^T\d{13}$', s):
-        return s
-    return ""
+    if not re.match(r'^T\d{13}$', s):
+        return ""
+    # 法人番号チェックディジット検証
+    digits = s[1:]  # T を除いた13桁
+    check = int(digits[0])
+    body = digits[1:]  # 12桁の本体
+    total = sum(int(d) * (1 + (i % 2)) for i, d in enumerate(reversed(body)))
+    expected = 9 - (total % 9) if total % 9 != 0 else 9
+    if check != expected:
+        return ""
+    return s
