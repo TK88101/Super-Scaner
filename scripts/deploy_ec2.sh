@@ -19,7 +19,7 @@ fi
 # Optional SSH key path. If empty, ssh/scp use your ~/.ssh/config rules.
 SSH_KEY="${SSH_KEY:-${PROJECT_DIR}/SuperScaner.pem}"
 
-DEPLOY_BRANCH="${DEPLOY_BRANCH:-feature/restructure-sheets-ocr}"
+DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
 REPO_SSH_URL="${REPO_SSH_URL:-git@github.com:TK88101/Super-Scaner.git}"
 REMOTE_APP_DIR="${REMOTE_APP_DIR:-/home/ubuntu/apps/super-scaner}"
 REMOTE_SECRETS_DIR="${REMOTE_SECRETS_DIR:-/home/ubuntu/super-scaner-secrets}"
