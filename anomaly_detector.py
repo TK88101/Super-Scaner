@@ -45,6 +45,19 @@ def detect_anomalies(entry, parent_data=None):
             "col": 8,
         })
 
+    # 租税公課: 宿泊税・軽油税を含む場合（伊藤提案 3/24）
+    if debit_account == "租税公課":
+        desc = entry.get("description", "")
+        for keyword in ("宿泊税", "軽油税"):
+            if keyword in desc:
+                flags.append({
+                    "type": "tax_review",
+                    "message": f"租税公課に{keyword}が含まれています（¥{amount:,}）",
+                    "severity": "low",
+                    "col": 8,
+                })
+                break
+
     # 備品・消耗品費 > 10万
     if debit_account == "備品・消耗品費" and amount > 100000:
         flags.append({
