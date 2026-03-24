@@ -114,7 +114,7 @@ class SheetsOutputWriter:
             source_url: 原票 PDF の webViewLink
         """
         from doc_types import DOC_TYPE_TAB_SUFFIX
-        from config import ACCOUNT_MAP, UNKNOWN_ACCOUNT, CREDIT_SUB_ACCOUNT_RECEIPT, CREDIT_SUB_ACCOUNT_INVOICE
+        from config import ACCOUNT_MAP, UNKNOWN_ACCOUNT, CREDIT_SUB_ACCOUNT_RECEIPT
         from anomaly_detector import detect_anomalies
 
         tab_suffix = DOC_TYPE_TAB_SUFFIX.get(doc_type, "領収書")
@@ -194,8 +194,9 @@ class SheetsOutputWriter:
             ]
             rows.append(row)
 
-            # 異常検出（メモリ上で判定、API 呼び出しなし）
-            flags = detect_anomalies(entry, entries_data)
+            # 異常検出（マッピング後の科目名で判定）
+            mapped_entry = {**entry, "debit_account": debit_account}
+            flags = detect_anomalies(mapped_entry, entries_data)
             if flags:
                 anomaly_flags_list.append((len(rows) - 1, flags))
 
@@ -245,14 +246,14 @@ class SheetsOutputWriter:
     @staticmethod
     def _determine_credit_sub_account(doc_type, entry, vendor_name):
         """貸方補助科目を文書タイプに応じて決定"""
-        from config import CREDIT_SUB_ACCOUNT_RECEIPT, CREDIT_SUB_ACCOUNT_INVOICE
+        from config import CREDIT_SUB_ACCOUNT_RECEIPT
         from doc_types import DocType
         # 領収書: 社長名（立替払い）
         if doc_type == DocType.RECEIPT:
             return entry.get("credit_sub_account", CREDIT_SUB_ACCOUNT_RECEIPT)
-        # 請求書: 請求先会社名（支払先）
+        # 請求書: 取引先会社名（その会社に支払っているため）
         if doc_type == DocType.PURCHASE_INVOICE:
-            return entry.get("credit_sub_account", CREDIT_SUB_ACCOUNT_INVOICE)
+            return entry.get("credit_sub_account", vendor_name or "")
         # その他
         return entry.get("credit_sub_account", "")
 

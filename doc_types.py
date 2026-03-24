@@ -41,7 +41,7 @@ DOC_TYPE_CONFIG = {
     },
     DocType.SALARY_SLIP: {
         "label": "賃金台帳・給与明細書",
-        "default_debit": "給料手当",
+        "default_debit": "給料賃金",
         "default_credit": "普通預金",
         "debit_tax_type": "対象外",
         "credit_tax_type": "対象外",

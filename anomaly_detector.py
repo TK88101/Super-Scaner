@@ -46,7 +46,7 @@ def detect_anomalies(entry, parent_data=None):
         })
 
     # 備品・消耗品費 > 10万
-    if debit_account in ("備品・消耗品費", "消耗品費") and amount > 100000:
+    if debit_account == "備品・消耗品費" and amount > 100000:
         flags.append({
             "type": "high_amount",
             "message": f"備品・消耗品費が10万円を超えています: ¥{amount:,}",
