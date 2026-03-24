@@ -3,6 +3,7 @@ import io
 import json
 import re
 import google.generativeai as genai
+from google.cloud import vision
 from dotenv import load_dotenv
 from doc_types import DocType, DOC_TYPE_CONFIG
 
@@ -11,6 +12,20 @@ try:
 except Exception:
     PdfReader = None
     PdfWriter = None
+
+from paddleocr import PaddleOCR
+from pdf2image import convert_from_bytes
+from PIL import Image
+import numpy as np
+
+# PaddleOCR singleton
+_paddle_ocr = None
+
+def _get_paddle_ocr():
+    global _paddle_ocr
+    if _paddle_ocr is None:
+        _paddle_ocr = PaddleOCR(lang='japan')
+    return _paddle_ocr
 
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
@@ -120,8 +135,87 @@ def _get_finish_reason(response):
         return ""
 
 
+# === Cloud Vision API — 甲方確認待ち、コード保持 ===
+# def _ocr_with_cloud_vision(image_bytes):
+#     """Google Cloud Vision API で OCR テキストを取得"""
+#     sa_file = os.getenv("SERVICE_ACCOUNT_FILE", "service_account.json")
+#     if os.path.exists(sa_file):
+#         from google.oauth2 import service_account as sa_auth
+#         credentials = sa_auth.Credentials.from_service_account_file(sa_file)
+#         client = vision.ImageAnnotatorClient(credentials=credentials)
+#     else:
+#         client = vision.ImageAnnotatorClient()
+#     image = vision.Image(content=image_bytes)
+#     response = client.document_text_detection(image=image)
+#
+#     if response.error.message:
+#         raise Exception(f"Cloud Vision API error: {response.error.message}")
+#
+#     return response.full_text_annotation.text or ""
+
+
+def _ocr_with_paddleocr(image_bytes, mime_type="image/jpeg"):
+    """PaddleOCR ローカル OCR エンジン"""
+    ocr = _get_paddle_ocr()
+
+    if mime_type == "application/pdf":
+        images = convert_from_bytes(image_bytes)
+        if not images:
+            return "", 0.0
+        all_texts = []
+        all_scores = []
+        for img in images:
+            img_array = np.array(img)
+            page_result = ocr.predict(img_array)
+            if page_result and page_result[0]:
+                res = page_result[0]
+                all_texts.extend(res.get("rec_texts", []))
+                all_scores.extend(res.get("rec_scores", []))
+        ocr_text = "\n".join(all_texts)
+        avg_confidence = sum(all_scores) / len(all_scores) if all_scores else 0.0
+        return ocr_text, avg_confidence
+    else:
+        img = Image.open(io.BytesIO(image_bytes))
+        img_array = np.array(img.convert("RGB"))
+
+    result = ocr.predict(img_array)
+
+    if not result or not result[0]:
+        return "", 0.0
+
+    res = result[0]
+    texts = res.get("rec_texts", [])
+    scores = res.get("rec_scores", [])
+
+    if not texts:
+        return "", 0.0
+
+    ocr_text = "\n".join(texts)
+    avg_confidence = sum(scores) / len(scores) if scores else 0.0
+
+    return ocr_text, avg_confidence
+
+
+def _call_gemini_text(ocr_text, prompt):
+    """OCR テキストを Gemini に送って構造化データを抽出"""
+    full_prompt = f"{prompt}\n\n--- OCRテキスト ---\n{ocr_text}"
+    response = model.generate_content(
+        [full_prompt],
+        generation_config=GEMINI_GENERATION_CONFIG,
+    )
+    text = (getattr(response, "text", "") or "").strip()
+    parsed = extract_json(text)
+    if parsed is None:
+        finish_reason = _get_finish_reason(response)
+        print(
+            f"⚠️ Gemini応答のJSON解析失敗 "
+            f"(finish_reason={finish_reason or 'unknown'}, len={len(text)})"
+        )
+    return parsed
+
+
 def _call_gemini_bytes(file_data, mime_type, prompt):
-    """Gemini API を呼び出して JSON を返す"""
+    """Gemini API を呼び出して JSON を返す (フォールバック用)"""
     response = model.generate_content(
         [
             {"mime_type": mime_type, "data": file_data},
@@ -141,6 +235,34 @@ def _call_gemini_bytes(file_data, mime_type, prompt):
     return parsed
 
 
+def _call_gemini_cross_validate(ocr_text, file_data, mime_type, prompt):
+    """Strategy C: OCR テキストと原画像の両方を Gemini に送信"""
+    cross_prompt = (
+        f"{prompt}\n\n"
+        f"--- 参考: OCR認識テキスト (誤認識の可能性あり、画像と照合して修正してください) ---\n"
+        f"{ocr_text}\n"
+        f"--- OCRテキスト終了 ---\n\n"
+        f"上記のOCRテキストは参考情報です。画像の内容を直接確認し、"
+        f"OCRテキストに誤りがあれば画像を優先してください。"
+    )
+    response = model.generate_content(
+        [
+            {"mime_type": mime_type, "data": file_data},
+            cross_prompt,
+        ],
+        generation_config=GEMINI_GENERATION_CONFIG,
+    )
+    text = (getattr(response, "text", "") or "").strip()
+    parsed = extract_json(text)
+    if parsed is None:
+        finish_reason = _get_finish_reason(response)
+        print(
+            f"⚠️ Gemini応答のJSON解析失敗 "
+            f"(finish_reason={finish_reason or 'unknown'}, len={len(text)})"
+        )
+    return parsed
+
+
 def _call_gemini(file_path, prompt):
     with open(file_path, "rb") as f:
         file_data = f.read()
@@ -149,7 +271,7 @@ def _call_gemini(file_path, prompt):
 
 
 def _split_pdf_pages(file_path):
-    """PDF を 1ページずつの bytes 配列に分割"""
+    """PDF を 1ページずつの dict 配列に分割 (metadata 付き)"""
     if PdfReader is None or PdfWriter is None:
         print("⚠️ pypdf未導入のため、PDF分割解析をスキップします")
         return None
@@ -159,13 +281,18 @@ def _split_pdf_pages(file_path):
         if len(reader.pages) <= 1:
             return None
 
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
         page_payloads = []
-        for page in reader.pages:
+        for i, page in enumerate(reader.pages, 1):
             writer = PdfWriter()
             writer.add_page(page)
             buf = io.BytesIO()
             writer.write(buf)
-            page_payloads.append(buf.getvalue())
+            page_payloads.append({
+                "page_num": i,
+                "data": buf.getvalue(),
+                "filename": f"{base_name}_p{i}.pdf",
+            })
         return page_payloads
     except Exception as e:
         print(f"⚠️ PDFページ分割失敗: {e}")
@@ -178,9 +305,9 @@ def _split_pdf_pages(file_path):
 
 PROMPTS = {
     DocType.RECEIPT: """
-あなたはプロの経理担当者です。画像に写っている全ての書類（領収書・レシート・受取書・振込控え等）を分析してください。
+あなたはプロの経理担当者です。以下のOCRテキストから全ての書類（領収書・レシート・受取書・振込控え等）を分析してください。
 
-重要: 画像に複数の書類が含まれる場合は、全ての書類を別々に抽出してください。
+重要: テキストに複数の書類が含まれる場合は、全ての書類を別々に抽出してください。
 
 【出力JSONフォーマット】
 {
@@ -210,10 +337,21 @@ PROMPTS = {
 - "bank_transfer": 銀行振込の受取書・振込控え（振込金額本体。税区分は「対象外」）
 - "fee_receipt": 振込手数料の領収証（ATM手数料、コンビニ手数料等。課税対象）
 
+【勘定科目の選択肢】以下の科目名を優先して使用してください：
+備品・消耗品費, 旅費交通費, 車両費, 通信費, 水道光熱費, 修繕費,
+地代家賃, 保険料, 租税公課, 広告宣伝費, 支払手数料, 支払報酬,
+接待交際費, 会議費, 福利厚生費, 業務委託料, 荷造運賃, 新聞図書費,
+リース料, 諸会費, 外注費, 研修採用費, 未払金, 普通預金
+上記にない場合のみ一般的な科目名を使用してください。
+
 【勘定科目の推定基準】
 - bank_transfer: debit_account は "未払金"（既存の買掛金・未払金の支払い）
 - fee_receipt: debit_account は "支払手数料"
-- receipt: 内容から推定 (消耗品費, 旅費交通費, 交際費, 会議費, 通信費, 福利厚生費, 雑費 など)
+- receipt: 内容から推定（上記の選択肢から選ぶ）
+- 飲食店・レストラン・居酒屋・カフェ・バー等での飲食代 → "接待交際費"
+- ガソリンスタンド・駐車場・高速道路料金 → "車両費"
+- レンタカー → "旅費交通費"
+- タクシー → "旅費交通費"
 
 【tax_rate の判定基準】
 - 食品・飲料(酒類除く): 0.08
@@ -229,23 +367,23 @@ PROMPTS = {
 - クレジットカード明細 → "クレジットカード"
 
 【date の取得方法（重要）】
-- 書類に印字された日付を最優先
-- 印字の日付欄が空白の場合は、以下の順で日付を探す:
-  1. 取扱日付印・受付印（赤いスタンプ/印章）の中の数字（例: "9.16" → 当年の9月16日）
+- 書類に記載された日付を最優先
+- 日付欄が空白の場合は、以下の順で日付を探す:
+  1. 取扱日付印・受付印の中の数字（例: "9.16" → 当年の9月16日）
   2. 書類下部の「ご依頼人」欄付近のスタンプ日付
-  3. 同一画像内の他の書類の日付（同日の取引である可能性が高い）
+  3. 同一テキスト内の他の書類の日付（同日の取引である可能性が高い）
 - 印章の日付形式: "M.DD", "MM.DD", "R7.9.16", "2025.9.16" など → 西暦 YYYY/MM/DD に変換
-- 年が不明な場合は、同一画像内の他の書類の年、または現在の年（2025年）を使用
+- 年が不明な場合は、同一テキスト内の他の書類の年、または現在の年（2026年）を使用
 - dateは可能な限り必ず出力してください。空文字は最終手段です
 
 注意:
-- 画像に1枚の書類しかなくても、必ず documents 配列で返してください
+- テキストに1枚の書類しかなくても、必ず documents 配列で返してください
 - 金額は数値型(カンマなし)で返してください
 - 振込受取書では、vendor は振込依頼人（支払い元の会社名）を記載してください
 """,
 
     DocType.PURCHASE_INVOICE: """
-あなたはプロの経理担当者です。支払請求書・仕入請求書を分析し、会計ソフト用データを抽出してください。
+あなたはプロの経理担当者です。以下のOCRテキストから支払請求書・仕入請求書を分析し、会計ソフト用データを抽出してください。
 
 【出力JSONフォーマット】
 {
@@ -259,13 +397,18 @@ PROMPTS = {
             "amount": 税抜金額(数値),
             "tax_rate": 税率(0.08 or 0.10),
             "tax_amount": 消費税額(数値),
-            "debit_account": "費用の勘定科目を推定 (仕入高, 外注費, 消耗品費, 通信費 など)"
+            "debit_account": "費用の勘定科目を推定"
         }
     ],
     "total_amount": 合計金額(税込, 数値),
     "payment_method": "支払い方法 (振込, 口座振替, 現金 など)",
     "due_date": "支払期日 (あれば YYYY/MM/DD)"
 }
+
+【勘定科目の選択肢】以下の科目名を優先して使用してください：
+仕入高, 外注費, 備品・消耗品費, 通信費, 広告宣伝費, 旅費交通費, 車両費, 租税公課,
+支払手数料, 支払報酬, 業務委託料, 荷造運賃, 接待交際費
+上記にない場合のみ一般的な科目名を使用してください。
 
 注意:
 - 複数品目がある場合はitems配列に全て含めてください
@@ -274,7 +417,7 @@ PROMPTS = {
 """,
 
     DocType.SALES_INVOICE: """
-あなたはプロの経理担当者です。売上請求書を分析し、会計ソフト用データを抽出してください。
+あなたはプロの経理担当者です。以下のOCRテキストから売上請求書を分析し、会計ソフト用データを抽出してください。
 
 【出力JSONフォーマット】
 {
@@ -299,7 +442,7 @@ PROMPTS = {
 """,
 
     DocType.SALARY_SLIP: """
-あなたはプロの経理担当者です。賃金台帳・給与明細書を分析し、会計ソフト用データを抽出してください。
+あなたはプロの経理担当者です。以下のOCRテキストから賃金台帳・給与明細書を分析し、会計ソフト用データを抽出してください。
 
 【出力JSONフォーマット】
 {
@@ -328,18 +471,8 @@ PROMPTS = {
 
 def _determine_credit_account(pay_method, doc_category="receipt"):
     """支払方法とドキュメントカテゴリから貸方科目を決定"""
-    # 銀行振込・振込手数料: 口座から引き落とされるため普通預金
-    if doc_category in ("bank_transfer", "fee_receipt"):
-        return "普通預金"
-
-    if any(x in pay_method for x in ["クレジット", "Credit", "Card", "VISA", "Master"]):
-        return "未払金"
-    elif any(x in pay_method for x in ["振込", "ATM"]):
-        return "普通預金"
-    elif "PayPay" in pay_method:
-        return "未払金"
-
-    return "現金"
+    # 顧客確認済み: 領収書・請求書とも貸方は「未払金」に統一
+    return "未払金"
 
 
 def _determine_tax_types(doc_category, tax_rate):
@@ -659,13 +792,37 @@ def _normalize_receipt_results(raw_data, prefix=""):
 # メインパイプライン
 # ============================================================
 
-def process_pipeline(file_path, doc_type=DocType.RECEIPT):
+def _route_ocr_strategy(data_bytes, mime_type, prompt, ocr_strategy, prefix=""):
+    """OCR 戦略に基づいてルーティング"""
+    import config
+    raw_data = None
+    try:
+        ocr_text, ocr_conf = _ocr_with_paddleocr(data_bytes, mime_type)
+        if ocr_text.strip():
+            print(f"{prefix}📝 PaddleOCR完了 ({len(ocr_text)}文字, 置信度: {ocr_conf:.3f})")
+            if ocr_strategy == "A":
+                raw_data = _call_gemini_text(ocr_text, prompt)
+            elif ocr_strategy == "B":
+                if ocr_conf >= config.OCR_CONFIDENCE_THRESHOLD:
+                    raw_data = _call_gemini_text(ocr_text, prompt)
+                else:
+                    print(f"{prefix}⚠️ 置信度低 ({ocr_conf:.3f} < {config.OCR_CONFIDENCE_THRESHOLD}) → Gemini Vision")
+                    raw_data = _call_gemini_bytes(data_bytes, mime_type, prompt)
+            elif ocr_strategy == "C":
+                raw_data = _call_gemini_cross_validate(ocr_text, data_bytes, mime_type, prompt)
+    except Exception as ocr_err:
+        print(f"{prefix}⚠️ PaddleOCR失敗: {ocr_err}")
+    return raw_data
+
+
+def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None):
     """
     文書を分析し、統一された仕訳データを返す。
 
     Args:
         file_path: 文書ファイルのパス
         doc_type: 文書タイプ (DocType 定数)
+        ocr_strategy: OCR 戦略 (A/B/C, None=config.OCR_STRATEGY)
 
     Returns:
         dict: 単一文書の場合（通常）
@@ -674,13 +831,17 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT):
     """
     filename = os.path.basename(file_path)
     type_label = DOC_TYPE_CONFIG.get(doc_type, {}).get("label", doc_type)
-    print(f"🧠 Geminiが{type_label}を分析中: {filename} ...")
+    print(f"🧠 PaddleOCR + Gemini で{type_label}を分析中: {filename} (戦略: {ocr_strategy}) ...")
 
     try:
         prompt = PROMPTS.get(doc_type)
         if not prompt:
             print(f"⚠️ 未対応の文書タイプ: {doc_type}")
             return None
+
+        import config
+        if ocr_strategy is None:
+            ocr_strategy = config.OCR_STRATEGY
 
         # 受領書PDFはページ分割で長文JSON切断を回避する
         mime_type = _get_mime_type(file_path)
@@ -691,9 +852,18 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT):
                 merged_results = []
                 failed_pages = 0
 
-                for idx, payload in enumerate(page_payloads, 1):
+                for idx, page_info in enumerate(page_payloads, 1):
                     prefix = f"[p{idx}] "
-                    page_raw_data = _call_gemini_bytes(payload, "application/pdf", prompt)
+                    page_data = page_info["data"] if isinstance(page_info, dict) else page_info
+
+                    page_raw_data = _route_ocr_strategy(
+                        page_data, "application/pdf", prompt, ocr_strategy, prefix=prefix
+                    )
+
+                    if not page_raw_data:
+                        print(f"{prefix}🔄 フォールバック: Gemini Vision で再試行")
+                        page_raw_data = _call_gemini_bytes(page_data, "application/pdf", prompt)
+
                     if not page_raw_data:
                         failed_pages += 1
                         print(f"{prefix}⚠️ AIの応答がJSONではありませんでした")
@@ -717,7 +887,16 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT):
                 print("⚠️ PDF分割解析でも有効結果を取得できませんでした")
                 return None
 
-        raw_data = _call_gemini(file_path, prompt)
+        raw_data = None
+        with open(file_path, "rb") as f:
+            file_data = f.read()
+
+        raw_data = _route_ocr_strategy(file_data, mime_type, prompt, ocr_strategy)
+
+        if not raw_data:
+            print("🔄 フォールバック: Gemini Vision で再試行")
+            raw_data = _call_gemini(file_path, prompt)
+
         if not raw_data:
             print("⚠️ AIの応答がJSONではありませんでした")
             return None

@@ -20,15 +20,15 @@ class DocType:
 DOC_TYPE_CONFIG = {
     DocType.RECEIPT: {
         "label": "領収書",
-        "default_debit": "消耗品費",
-        "default_credit": "現金",
+        "default_debit": "備品・消耗品費",
+        "default_credit": "未払金",
         "debit_tax_type": "課対仕入10%",
         "credit_tax_type": "対象外",
     },
     DocType.PURCHASE_INVOICE: {
         "label": "支払請求書・仕入請求書",
         "default_debit": "仕入高",
-        "default_credit": "買掛金",
+        "default_credit": "未払金",
         "debit_tax_type": "課対仕入10%",
         "credit_tax_type": "対象外",
     },
@@ -41,11 +41,19 @@ DOC_TYPE_CONFIG = {
     },
     DocType.SALARY_SLIP: {
         "label": "賃金台帳・給与明細書",
-        "default_debit": "給料手当",
+        "default_debit": "給料賃金",
         "default_credit": "普通預金",
         "debit_tax_type": "対象外",
         "credit_tax_type": "対象外",
     },
+}
+
+# Tab 名のサフィックス（Google Sheets 出力用）
+DOC_TYPE_TAB_SUFFIX = {
+    DocType.RECEIPT: "領収書",
+    DocType.PURCHASE_INVOICE: "支払請求書",
+    DocType.SALES_INVOICE: "売上請求書",
+    DocType.SALARY_SLIP: "給与明細",
 }
 
 # 環境変数名とDocTypeの対応
