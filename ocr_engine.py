@@ -154,8 +154,32 @@ def _get_finish_reason(response):
 #     return response.full_text_annotation.text or ""
 
 
+def _parse_paddle_result(result):
+    """PaddleOCR 結果をパース（v2.x / v3.x 両対応）"""
+    texts = []
+    scores = []
+    if not result:
+        return texts, scores
+    for page in result:
+        if not page:
+            continue
+        # v2.x format: [[box, (text, score)], ...]
+        if isinstance(page, list) and len(page) > 0:
+            for line in page:
+                if isinstance(line, (list, tuple)) and len(line) >= 2:
+                    text_info = line[-1]
+                    if isinstance(text_info, (list, tuple)) and len(text_info) >= 2:
+                        texts.append(str(text_info[0]))
+                        scores.append(float(text_info[1]))
+                    elif isinstance(text_info, dict):
+                        # v3.x format
+                        texts.extend(text_info.get("rec_texts", []))
+                        scores.extend(text_info.get("rec_scores", []))
+    return texts, scores
+
+
 def _ocr_with_paddleocr(image_bytes, mime_type="image/jpeg"):
-    """PaddleOCR ローカル OCR エンジン"""
+    """PaddleOCR ローカル OCR エンジン（v2.x / v3.x 両対応）"""
     ocr = _get_paddle_ocr()
 
     if mime_type == "application/pdf":
@@ -166,11 +190,14 @@ def _ocr_with_paddleocr(image_bytes, mime_type="image/jpeg"):
         all_scores = []
         for img in images:
             img_array = np.array(img)
-            page_result = ocr.predict(img_array)
-            if page_result and page_result[0]:
-                res = page_result[0]
-                all_texts.extend(res.get("rec_texts", []))
-                all_scores.extend(res.get("rec_scores", []))
+            # v2.x: ocr.ocr(), v3.x: ocr.predict()
+            if hasattr(ocr, 'predict'):
+                page_result = ocr.predict(img_array)
+            else:
+                page_result = ocr.ocr(img_array, cls=True)
+            t, s = _parse_paddle_result(page_result)
+            all_texts.extend(t)
+            all_scores.extend(s)
         ocr_text = "\n".join(all_texts)
         avg_confidence = sum(all_scores) / len(all_scores) if all_scores else 0.0
         return ocr_text, avg_confidence
@@ -178,14 +205,12 @@ def _ocr_with_paddleocr(image_bytes, mime_type="image/jpeg"):
         img = Image.open(io.BytesIO(image_bytes))
         img_array = np.array(img.convert("RGB"))
 
-    result = ocr.predict(img_array)
+    if hasattr(ocr, 'predict'):
+        result = ocr.predict(img_array)
+    else:
+        result = ocr.ocr(img_array, cls=True)
 
-    if not result or not result[0]:
-        return "", 0.0
-
-    res = result[0]
-    texts = res.get("rec_texts", [])
-    scores = res.get("rec_scores", [])
+    texts, scores = _parse_paddle_result(result)
 
     if not texts:
         return "", 0.0
