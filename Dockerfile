@@ -22,6 +22,12 @@ COPY . .
 
 # 5. 設置環境變量 (讓 Python 打印日誌不緩存，方便查看)
 ENV PYTHONUNBUFFERED=1
+# PaddleOCR/OpenMP 線程限制（底線保護、防止吃滿 CPU）
+ENV OMP_NUM_THREADS=1
+ENV OPENBLAS_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
+ENV NUMEXPR_NUM_THREADS=1
+ENV PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
 
 # 6. 啟動命令
 CMD ["python", "main.py"]

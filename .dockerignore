@@ -11,6 +11,7 @@ SuperScaner.pem
 
 # --- Python cache / venv ---
 venv/
+venv311/
 .venv/
 __pycache__/
 *.pyc

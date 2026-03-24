@@ -25,6 +25,9 @@ REMOTE_APP_DIR="${REMOTE_APP_DIR:-/home/ubuntu/apps/super-scaner}"
 REMOTE_SECRETS_DIR="${REMOTE_SECRETS_DIR:-/home/ubuntu/super-scaner-secrets}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-super-scaner:prod}"
 DOCKER_CONTAINER="${DOCKER_CONTAINER:-scan-bot}"
+DOCKER_CPUS="${DOCKER_CPUS:-0.9}"
+DOCKER_MEMORY="${DOCKER_MEMORY:-768m}"
+DOCKER_MEMORY_SWAP="${DOCKER_MEMORY_SWAP:-4g}"
 
 LOCAL_ENV_FILE="${LOCAL_ENV_FILE:-${PROJECT_DIR}/.env}"
 LOCAL_SERVICE_ACCOUNT_FILE="${LOCAL_SERVICE_ACCOUNT_FILE:-${PROJECT_DIR}/service_account.json}"
@@ -85,7 +88,7 @@ log "Fixing secrets permissions and SERVICE_ACCOUNT_FILE"
 run_ssh "set -euo pipefail; chmod 600 \"${REMOTE_SECRETS_DIR}/.env\" \"${REMOTE_SECRETS_DIR}/service_account.json\"; if grep -q '^SERVICE_ACCOUNT_FILE=' \"${REMOTE_SECRETS_DIR}/.env\"; then sed -i 's|^SERVICE_ACCOUNT_FILE=.*|SERVICE_ACCOUNT_FILE=service_account.json|' \"${REMOTE_SECRETS_DIR}/.env\"; else echo 'SERVICE_ACCOUNT_FILE=service_account.json' >> \"${REMOTE_SECRETS_DIR}/.env\"; fi; grep '^SERVICE_ACCOUNT_FILE=' \"${REMOTE_SECRETS_DIR}/.env\""
 
 log "Building image and starting container"
-run_ssh "set -euo pipefail; cd \"${REMOTE_APP_DIR}\"; sudo docker build -t \"${DOCKER_IMAGE}\" .; sudo docker rm -f \"${DOCKER_CONTAINER}\" >/dev/null 2>&1 || true; sudo docker run -d --name \"${DOCKER_CONTAINER}\" --restart unless-stopped --env-file \"${REMOTE_SECRETS_DIR}/.env\" -v \"${REMOTE_SECRETS_DIR}/service_account.json:/app/service_account.json:ro\" \"${DOCKER_IMAGE}\""
+run_ssh "set -euo pipefail; cd \"${REMOTE_APP_DIR}\"; sudo docker build -t \"${DOCKER_IMAGE}\" .; sudo docker rm -f \"${DOCKER_CONTAINER}\" >/dev/null 2>&1 || true; sudo docker run -d --name \"${DOCKER_CONTAINER}\" --restart unless-stopped --cpus \"${DOCKER_CPUS}\" --memory \"${DOCKER_MEMORY}\" --memory-swap \"${DOCKER_MEMORY_SWAP}\" --env-file \"${REMOTE_SECRETS_DIR}/.env\" -v \"${REMOTE_SECRETS_DIR}/service_account.json:/app/service_account.json:ro\" \"${DOCKER_IMAGE}\""
 
 log "Validating container and logs"
 run_ssh "sudo docker ps --filter name=${DOCKER_CONTAINER}"

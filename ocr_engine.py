@@ -24,7 +24,8 @@ _paddle_ocr = None
 def _get_paddle_ocr():
     global _paddle_ocr
     if _paddle_ocr is None:
-        _paddle_ocr = PaddleOCR(lang='japan')
+        # cpu_threads: コード側の増強。Dockerfile の OMP_NUM_THREADS=1 が底線
+        _paddle_ocr = PaddleOCR(lang='japan', use_gpu=False, cpu_threads=1)
     return _paddle_ocr
 
 load_dotenv()
@@ -183,18 +184,22 @@ def _ocr_with_paddleocr(image_bytes, mime_type="image/jpeg"):
     ocr = _get_paddle_ocr()
 
     if mime_type == "application/pdf":
-        images = convert_from_bytes(image_bytes)
-        if not images:
-            return "", 0.0
+        # 逐ページ変換（DPI 150 でメモリ節約、OCR には十分）
+        from pypdf import PdfReader as _PR
+        page_count = len(_PR(io.BytesIO(image_bytes)).pages)
         all_texts = []
         all_scores = []
-        for img in images:
-            img_array = np.array(img)
-            # v2.x: ocr.ocr(), v3.x: ocr.predict()
+        for pg in range(1, page_count + 1):
+            images = convert_from_bytes(image_bytes, first_page=pg, last_page=pg, dpi=150)
+            if not images:
+                continue
+            img_array = np.array(images[0])
+            del images  # 即座に解放
             if hasattr(ocr, 'predict'):
                 page_result = ocr.predict(img_array)
             else:
                 page_result = ocr.ocr(img_array, cls=True)
+            del img_array
             t, s = _parse_paddle_result(page_result)
             all_texts.extend(t)
             all_scores.extend(s)
@@ -296,32 +301,33 @@ def _call_gemini(file_path, prompt):
 
 
 def _split_pdf_pages(file_path):
-    """PDF を 1ページずつの dict 配列に分割 (metadata 付き)"""
+    """PDF を 1ページずつ yield するジェネレータ（メモリ節約）"""
     if PdfReader is None or PdfWriter is None:
         print("⚠️ pypdf未導入のため、PDF分割解析をスキップします")
-        return None
+        return
 
     try:
         reader = PdfReader(file_path)
         if len(reader.pages) <= 1:
-            return None
+            return
 
+        total_pages = len(reader.pages)
         base_name = os.path.splitext(os.path.basename(file_path))[0]
-        page_payloads = []
         for i, page in enumerate(reader.pages, 1):
             writer = PdfWriter()
             writer.add_page(page)
             buf = io.BytesIO()
             writer.write(buf)
-            page_payloads.append({
+            yield {
                 "page_num": i,
+                "total_pages": total_pages,
                 "data": buf.getvalue(),
                 "filename": f"{base_name}_p{i}.pdf",
-            })
-        return page_payloads
+            }
+            # buf は yield 後に GC 対象になる
     except Exception as e:
         print(f"⚠️ PDFページ分割失敗: {e}")
-        return None
+        return
 
 
 # ============================================================
@@ -874,15 +880,20 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None):
         # 受領書PDFはページ分割で長文JSON切断を回避する
         mime_type = _get_mime_type(file_path)
         if doc_type == DocType.RECEIPT and mime_type == "application/pdf":
-            page_payloads = _split_pdf_pages(file_path)
-            if page_payloads:
-                print(f"📄 大型PDF対応: {len(page_payloads)}ページを分割解析します")
+            page_gen = _split_pdf_pages(file_path)
+            first_page = next(page_gen, None)
+            if first_page is not None:
+                total = first_page["total_pages"]
+                print(f"📄 大型PDF対応: {total}ページを分割解析します")
                 merged_results = []
                 failed_pages = 0
 
-                for idx, page_info in enumerate(page_payloads, 1):
+                # first_page を含めて全ページを逐次処理
+                import itertools
+                for page_info in itertools.chain([first_page], page_gen):
+                    idx = page_info["page_num"]
                     prefix = f"[p{idx}] "
-                    page_data = page_info["data"] if isinstance(page_info, dict) else page_info
+                    page_data = page_info["data"]
 
                     page_raw_data = _route_ocr_strategy(
                         page_data, "application/pdf", prompt, ocr_strategy, prefix=prefix
