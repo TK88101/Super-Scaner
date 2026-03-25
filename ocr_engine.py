@@ -340,6 +340,111 @@ def _split_pdf_pages(file_path):
 
 
 # ============================================================
+# OCR テキストからのフィールド抽出（Gemini に依存しない）
+# ============================================================
+
+def _extract_date_from_ocr(ocr_text):
+    """OCR テキストから日付を正規表現で抽出（Gemini より信頼性が高い）"""
+    if not ocr_text:
+        return None
+
+    # パターン1: 2026年1月27日, 2026年 1月27日（火）, 2026年01月10日
+    m = re.search(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', ocr_text)
+    if m:
+        return f"{m.group(1)}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
+
+    # パターン2: 26年 1月14日 (西暦下2桁)
+    m = re.search(r'(\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', ocr_text)
+    if m:
+        year = int(m.group(1))
+        if year <= 99:
+            year = 2000 + year
+        return f"{year}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
+
+    # パターン3: 2026/01/19, 2026-01-19
+    m = re.search(r'(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})', ocr_text)
+    if m:
+        return f"{m.group(1)}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
+
+    # パターン4: 26#01月13日 (テクノパーキング形式)
+    m = re.search(r'(\d{2})[#＃](\d{2})月(\d{1,2})日', ocr_text)
+    if m:
+        year = 2000 + int(m.group(1))
+        return f"{year}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
+
+    # パターン5: 令和N年M月D日
+    m = re.search(r'令和\s*(\d{1,2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', ocr_text)
+    if m:
+        year = 2018 + int(m.group(1))
+        return f"{year}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
+
+    return None
+
+
+def _extract_invoice_num_from_ocr(ocr_text):
+    """OCR テキストから T番号（適格請求書発行事業者登録番号）を抽出"""
+    if not ocr_text:
+        return None
+
+    # T + 13桁 (ハイフン・スペース含む可能性)
+    m = re.search(r'[TＴ][\s\-]*(\d[\s\-]*){13}', ocr_text)
+    if m:
+        # 数字のみ抽出
+        matched = m.group(0)
+        digits = re.sub(r'[^0-9]', '', matched)
+        if len(digits) == 13:
+            return f"T{digits}"
+
+    # 「登録番号」の近くにある T + 数字
+    m = re.search(r'登[録录]番号\s*[TＴ][\s\-]*([\d\s\-]{13,20})', ocr_text)
+    if m:
+        digits = re.sub(r'[^0-9]', '', m.group(1))[:13]
+        if len(digits) == 13:
+            return f"T{digits}"
+
+    return None
+
+
+def _apply_ocr_overrides(raw_data, ocr_text, prefix=""):
+    """OCR テキストから抽出した日付・T番号で Gemini の結果を上書きする。
+
+    Gemini は日付の年号解釈を間違えやすい（26年→2014年等）が、
+    PaddleOCR のテキストから正規表現で抽出すれば確実。
+    """
+    if not raw_data or not ocr_text:
+        return
+
+    ocr_date = _extract_date_from_ocr(ocr_text)
+    ocr_tnum = _extract_invoice_num_from_ocr(ocr_text)
+
+    # documents 配列がある場合（領収書新フォーマット）
+    if isinstance(raw_data, dict) and "documents" in raw_data:
+        for doc in raw_data.get("documents", []):
+            if ocr_date:
+                gemini_date = doc.get("date", "")
+                if gemini_date != ocr_date:
+                    print(f"{prefix}📅 日付上書: Gemini={gemini_date} → OCR={ocr_date}")
+                doc["date"] = ocr_date
+            if ocr_tnum:
+                gemini_tnum = doc.get("invoice_num", "")
+                if gemini_tnum != ocr_tnum:
+                    print(f"{prefix}🔢 T番号上書: Gemini={gemini_tnum} → OCR={ocr_tnum}")
+                doc["invoice_num"] = ocr_tnum
+    else:
+        # 旧フォーマット / 他の文書タイプ
+        if ocr_date:
+            gemini_date = raw_data.get("date", "")
+            if gemini_date != ocr_date:
+                print(f"{prefix}📅 日付上書: Gemini={gemini_date} → OCR={ocr_date}")
+            raw_data["date"] = ocr_date
+        if ocr_tnum:
+            gemini_tnum = raw_data.get("invoice_num", "")
+            if gemini_tnum != ocr_tnum:
+                print(f"{prefix}🔢 T番号上書: Gemini={gemini_tnum} → OCR={ocr_tnum}")
+            raw_data["invoice_num"] = ocr_tnum
+
+
+# ============================================================
 # プロンプト定義
 # ============================================================
 
@@ -836,9 +941,10 @@ def _normalize_receipt_results(raw_data, prefix=""):
 # ============================================================
 
 def _route_ocr_strategy(data_bytes, mime_type, prompt, ocr_strategy, prefix=""):
-    """OCR 戦略に基づいてルーティング"""
+    """OCR 戦略に基づいてルーティング。(raw_data, ocr_text) を返す。"""
     import config
     raw_data = None
+    ocr_text = ""
     try:
         ocr_text, ocr_conf = _ocr_with_paddleocr(data_bytes, mime_type)
         if ocr_text.strip():
@@ -855,7 +961,7 @@ def _route_ocr_strategy(data_bytes, mime_type, prompt, ocr_strategy, prefix=""):
                 raw_data = _call_gemini_cross_validate(ocr_text, data_bytes, mime_type, prompt)
     except Exception as ocr_err:
         print(f"{prefix}⚠️ PaddleOCR失敗: {ocr_err}")
-    return raw_data
+    return raw_data, ocr_text
 
 
 def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None):
@@ -908,7 +1014,7 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None):
                     prefix = f"[p{idx}] "
                     page_data = page_info["data"]
 
-                    page_raw_data = _route_ocr_strategy(
+                    page_raw_data, ocr_text = _route_ocr_strategy(
                         page_data, "application/pdf", prompt, ocr_strategy, prefix=prefix
                     )
 
@@ -920,6 +1026,9 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None):
                         failed_pages += 1
                         print(f"{prefix}⚠️ AIの応答がJSONではありませんでした")
                         continue
+
+                    # OCR テキストから日付・T番号を抽出し Gemini 結果を上書き
+                    _apply_ocr_overrides(page_raw_data, ocr_text, prefix)
 
                     page_results = _normalize_receipt_results(page_raw_data, prefix=prefix)
                     if not page_results:
@@ -1002,10 +1111,11 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None):
 
         # ── 単ページ PDF / 画像ファイル: 従来通り処理 ──
         raw_data = None
+        ocr_text = ""
         with open(file_path, "rb") as f:
             file_data = f.read()
 
-        raw_data = _route_ocr_strategy(file_data, mime_type, prompt, ocr_strategy)
+        raw_data, ocr_text = _route_ocr_strategy(file_data, mime_type, prompt, ocr_strategy)
         del file_data
         gc.collect()
 
@@ -1016,6 +1126,9 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None):
         if not raw_data:
             print("⚠️ AIの応答がJSONではありませんでした")
             return
+
+        # OCR テキストから日付・T番号を抽出し Gemini 結果を上書き
+        _apply_ocr_overrides(raw_data, ocr_text)
 
         # ── 領収書処理（単ページ PDF / 画像）──
         if doc_type == DocType.RECEIPT:
