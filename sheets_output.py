@@ -224,9 +224,11 @@ class SheetsOutputWriter:
             ]
             rows.append(row)
 
-            # 異常検出（マッピング後の科目名で判定）
+            # 異常検出（実際に書き込む値で判定）
+            actual_invoice = _sanitize_invoice_num(entry.get("debit_invoice", invoice_num))
             mapped_entry = {**entry, "debit_account": debit_account}
-            flags = detect_anomalies(mapped_entry, entries_data)
+            actual_parent = {**entries_data, "invoice_num": actual_invoice}
+            flags = detect_anomalies(mapped_entry, actual_parent)
             if flags:
                 anomaly_flags_list.append((len(rows) - 1, flags))
 
