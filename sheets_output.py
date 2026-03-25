@@ -162,11 +162,16 @@ class SheetsOutputWriter:
 
             now_jst = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
 
+            # 借方補助科目を自動決定（インボイス制度準拠）
+            debit_sub = self._determine_debit_sub_account(
+                debit_account, entry, invoice_num
+            )
+
             row = [
                 transaction_no,
                 entries_data.get("date", ""),
                 debit_account,
-                entry.get("debit_sub_account", ""),
+                debit_sub,
                 "",                                             # 借方部門
                 vendor_name,
                 entry.get("debit_tax_type", ""),
@@ -244,6 +249,32 @@ class SheetsOutputWriter:
                     time.sleep(wait)
                 else:
                     raise
+
+    @staticmethod
+    def _determine_debit_sub_account(debit_account, entry, invoice_num):
+        """借方補助科目をインボイス制度に基づいて自動決定"""
+        tax_type = entry.get("debit_tax_type", "")
+
+        # 接待交際費 → 飲食贈答等 / 軽減税率対象
+        if debit_account == "接待交際費":
+            if "8%" in tax_type or "軽" in tax_type:
+                return "軽減税率対象"
+            return "飲食贈答等"
+
+        # 福利厚生費 → 軽減税率対象 / 一般
+        if debit_account == "福利厚生費":
+            if "8%" in tax_type or "軽" in tax_type:
+                return "軽減税率対象"
+            return "一般"
+
+        # 旅費交通費 → 適格 / 非適格（T番号の有無で判定）
+        if debit_account == "旅費交通費":
+            sanitized = _sanitize_invoice_num(invoice_num)
+            if sanitized:
+                return "適格"
+            return "非適格"
+
+        return ""
 
     @staticmethod
     def _determine_credit_sub_account(doc_type, entry, vendor_name):

@@ -87,14 +87,22 @@ def detect_anomalies(entry, parent_data=None):
             "col": 5,  # 借方取引先 = F列
         })
 
-    # T番号がサニタイズで除去された
+    # T番号が空（適格請求書なし）
     raw_invoice = parent_data.get("invoice_num", "")
-    if raw_invoice and not _is_valid_t_number(raw_invoice):
+    if not raw_invoice or not raw_invoice.strip():
+        flags.append({
+            "type": "missing_invoice",
+            "message": "T番号が空です",
+            "severity": "low",
+            "col": 7,  # 借方インボイス = H列
+        })
+    elif not _is_valid_t_number(raw_invoice):
+        # T番号があるが形式不正（サニタイズで除去された）
         flags.append({
             "type": "invalid_t_number",
             "message": f"T番号が不正な形式のため除去: {raw_invoice}",
             "severity": "medium",
-            "col": 7,  # 借方インボイス = H列
+            "col": 7,
         })
 
     return flags
