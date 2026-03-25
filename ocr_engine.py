@@ -361,10 +361,12 @@ def _extract_date_from_ocr(ocr_text):
             year = 2000 + year
         return f"{year}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
 
-    # パターン3: 2026/01/19, 2026-01-19
-    m = re.search(r'(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})', ocr_text)
+    # パターン3: 2026/01/19, 2026-01-19（年は2020-2099に限定、電話番号誤検出防止）
+    m = re.search(r'(20[2-9]\d)[/\-](\d{1,2})[/\-](\d{1,2})', ocr_text)
     if m:
-        return f"{m.group(1)}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
+        month, day = int(m.group(2)), int(m.group(3))
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return f"{m.group(1)}/{month:02d}/{day:02d}"
 
     # パターン4: 26#01月13日 (テクノパーキング形式)
     m = re.search(r'(\d{2})[#＃](\d{2})月(\d{1,2})日', ocr_text)
