@@ -449,7 +449,9 @@ def _apply_ocr_overrides(raw_data, ocr_text, prefix=""):
     if not raw_data:
         return
 
-    ocr_date = _extract_date_from_ocr(ocr_text) if ocr_text else None
+    ocr_date_raw = _extract_date_from_ocr(ocr_text) if ocr_text else None
+    # OCR 抽出日付も検証する（2008年等の誤抽出を排除）
+    ocr_date = _validate_gemini_date(ocr_date_raw) if ocr_date_raw else None
     ocr_tnum = _extract_invoice_num_from_ocr(ocr_text) if ocr_text else None
 
     # documents 配列がある場合（領収書新フォーマット）
