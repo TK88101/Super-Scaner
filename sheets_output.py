@@ -203,17 +203,19 @@ class SheetsOutputWriter:
         transaction_no += 1
 
         if rows:
+            # 書き込み前の行数を取得（ハイライト位置計算用）
+            pre_write_count = len(ws.get_all_values())
+
             # 一括書き込み（リトライ付き）
             self._write_with_retry(ws, rows)
 
             # 取引No をメモリ更新（API 書き戻しは後でまとめて）
             self._next_txn_no = transaction_no
 
-            # 異常行のハイライト（バッチ処理）
+            # 異常行のハイライト（書き込み前の行数から位置を正確に算出）
             if anomaly_flags_list:
                 try:
-                    current_total = len(ws.get_all_values())
-                    start_row = current_total - len(rows) + 1
+                    start_row = pre_write_count + 1
                     for offset, flags in anomaly_flags_list:
                         actual_row = start_row + offset
                         self._apply_anomaly_highlight(ws, actual_row, flags)
