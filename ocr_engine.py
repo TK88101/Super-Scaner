@@ -28,7 +28,7 @@ def _get_paddle_ocr():
         # PaddleOCR 3.x は use_gpu 非対応 → try/except で v2/v3 両対応
         try:
             _paddle_ocr = PaddleOCR(lang='japan', use_gpu=False, cpu_threads=1)
-        except TypeError:
+        except (TypeError, ValueError):
             # PaddleOCR 3.x: use_gpu パラメータ廃止
             _paddle_ocr = PaddleOCR(lang='japan', cpu_threads=1)
     return _paddle_ocr
@@ -169,6 +169,11 @@ def _parse_paddle_result(result):
     for page in result:
         if not page:
             continue
+        # v3.x predict() format: OCRResult オブジェクト (dict-like, rec_texts/rec_scores キー)
+        if hasattr(page, 'keys') and 'rec_texts' in page:
+            texts.extend(page['rec_texts'])
+            scores.extend([float(s) for s in page['rec_scores']])
+            continue
         # v2.x format: [[box, (text, score)], ...]
         if isinstance(page, list) and len(page) > 0:
             for line in page:
@@ -178,7 +183,6 @@ def _parse_paddle_result(result):
                         texts.append(str(text_info[0]))
                         scores.append(float(text_info[1]))
                     elif isinstance(text_info, dict):
-                        # v3.x format
                         texts.extend(text_info.get("rec_texts", []))
                         scores.extend(text_info.get("rec_scores", []))
     return texts, scores
