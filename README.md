@@ -6,33 +6,38 @@
 
 ### 🌟 核心功能
 * 📂 **多文件夾監聽：** 按文書類型分別監控（領収書/請求書/給与明細）
-* 🔍 **雙引擎 OCR：** PaddleOCR (ローカル、無料) + Gemini AI クロスバリデーション（Strategy C、自動回退）
-* 📊 **Google Sheets 輸出：** 按員工分 Tab，異常單元格標色（紅/橙/黃）
-* 🗺️ **科目自動映射：** AI 通用名 → MoneyForward 正確科目名
+* 🔍 **雙引擎 OCR：** PaddleOCR (ローカル、無料) + Gemini AI（Strategy C、自動回退）
+* 🧠 **OCR 主導抽出：** 日期/T番號由 PaddleOCR 正規表現提取（Gemini 依存度降低），科目分類のみ Gemini
+* 📊 **Generator Pipeline：** 逐頁 OCR → 即時 Sheets 寫入 → GC → 下一頁（低メモリ動作）
+* 🗺️ **科目自動映射 + 補助科目：** AI 通用名 → MF 正確科目名、適格/非適格/飲食贈答等 自動決定
 * 🔗 **原票 URL 追蹤：** 每行數據關聯原始 PDF 鏈接 + 頁碼
 * 💾 **每日自動備份：** 22:00 JST 備份到獨立 Spreadsheet，90 天保留
-* 🛡️ **異常檢測：** 日期空/取引先空/T番號不正/高額 → 對應單元格標色
+* 🛡️ **異常檢測 + ハイライト凡例：** 日期空/取引先空/T番號空・不正/高額 → 對應單元格標色 + 凡例説明
 
 ---
 
 ## 🏗️ 系統架構
 
 ```
-員工上傳 PDF → Drive 文件夾 (領収書/請求書/給与明細)
-                    ↓ (3秒輪詢)
-              PaddleOCR (ローカル) → OCR テキスト + 原始圖片
-                    ↓
-              Gemini AI (クロスバリデーション) → 結構化 JSON
-                    ↓ (失敗時)
-              Gemini Vision (フォールバック)
-                    ↓
-              科目映射 + 異常檢測
-                    ↓
-              Google Sheets 寫入 (按員工分Tab + 異常標色)
-                    ↓
-              原文件歸檔 + Chatwork 通知
+PDF 上傳 → Drive 文件夾 (領収書/請求書/給与明細)
+         ↓ (3秒輪詢)
+    PDF 逐頁分割 (generator yield)
+         ↓
+    PaddleOCR → テキスト抽出
+         ↓
+    正規表現で日付・T番號抽出 (OCR主導)
+         ↓
+    Gemini AI → 科目分類・金額・vendor 構造化
+         ↓
+    OCR日付/T番號で Gemini 結果を上書き
+         ↓
+    科目映射 + 補助科目自動決定 + 異常檢測
+         ↓
+    即時 Google Sheets 寫入 → GC → 次頁
+         ↓
+    原文件歸檔 + Chatwork 通知
 
-              22:00 JST: 工作Sheet → 備份Sheet → 清空
+    22:00 JST: 工作Sheet → 備份Sheet → 清空
 ```
 
 ---
@@ -101,10 +106,10 @@ python benchmark_ocr.py               # 全 Strategy 比較テスト
 
 ```text
 Super Scaner/
-├── main.py                     # 主程序：Drive 監聽 + Sheets 寫入
-├── ocr_engine.py               # PaddleOCR + Gemini AI 雙引擎 (Strategy A/B/C)
-├── sheets_output.py            # Google Sheets 輸出（Tab管理/分割線/異常標色）
-├── anomaly_detector.py         # 異常檢測模組
+├── main.py                     # 主程序：Drive 監聽 + Generator消費 + 逐次Sheets寫入
+├── ocr_engine.py               # PaddleOCR + Gemini 雙引擎, Generator Pipeline, OCR主導日付/T番号抽出
+├── sheets_output.py            # Google Sheets 輸出（ハイライト凡例/補助科目自動/異常標色）
+├── anomaly_detector.py         # 異常檢測模組（T番号空/不正/高額/要確認科目）
 ├── config.py                   # 配置管理 + 科目映射 (ACCOUNT_MAP)
 ├── doc_types.py                # 文書類型定義 + Tab 後綴映射
 ├── notifier.py                 # Chatwork 通知
@@ -153,13 +158,17 @@ bash scripts/deploy_ec2.sh
 ### 欄位 (28列)
 MF 標準 27 列 + 原票URL (第28列)
 
-### 異常標色
+### ハイライト凡例 (A1-A3 に自動表示)
 | 異常 | 標色位置 | 顏色 |
 |------|---------|------|
 | 日期為空 | B列 | 🔴 紅色 |
 | 取引先為空 | F列 | 🟠 橙色 |
 | T番號不正 | H列 | 🟠 橙色 |
-| 金額 > 10萬 | I列 | 🟡 黃色 |
+| T番號為空 | H列 | 🟡 黃色 |
+| 地代家賃/保険料/雑収入 (全件) | I列 | 🟡 黃色 |
+| 修繕費 > 30萬 | I列 | 🟡 黃色 |
+| 備品・消耗品費 > 10萬 | I列 | 🟡 黃色 |
+| 租税公課 (宿泊税/軽油税) | I列 | 🟡 黃色 |
 
 ---
 
@@ -176,4 +185,4 @@ MF 標準 27 列 + 原票URL (第28列)
 
 ---
 
-*Generated for Project Super Scaner v2.1 — PaddleOCR Integration*
+*Generated for Project Super Scaner v2.3 — Generator Pipeline + OCR主導抽出*

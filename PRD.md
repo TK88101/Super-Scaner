@@ -1,8 +1,8 @@
 # 📄 Super Scaner — 產品需求文檔 (PRD)
 
-> **版本:** 2.1
-> **日期:** 2026-03-19
-> **狀態:** PaddleOCR 統合完了 (Strategy C)，Cloud Vision コメントアウト（クライアント確認待ち）
+> **版本:** 2.3
+> **日期:** 2026-03-25
+> **狀態:** Generator Pipeline + OCR主導フィールド抽出、借方補助科目自動決定、ハイライト凡例
 
 ---
 
@@ -38,7 +38,7 @@
 | **雲端存儲** | Google Drive API v3 |
 | **數據輸出** | Google Sheets API (gspread) |
 | **通知系統** | Chatwork API v2 |
-| **部署方式** | Docker 容器 (AWS EC2) |
+| **部署方式** | Docker 容器 (AWS EC2), 資源制限付き (--cpus 0.9 --memory 768m) |
 
 ### 2.2 模塊架構
 
