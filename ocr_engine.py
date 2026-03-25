@@ -390,16 +390,28 @@ def _extract_date_from_ocr(ocr_text):
     return None
 
 
-def _sanitize_date(date_str):
-    """無効な日付を修正（例: 2026/01/00 → 2026/01/01）"""
+def _validate_gemini_date(date_str):
+    """Gemini が返した日付を検証。怪しければ空文字を返す（高亮対象にする）。
+
+    OCR で抽出できなかった場合の最終チェック:
+    - /00 日 → 無効
+    - 年が 2024-2027 の範囲外 → 年号誤判定の可能性
+    - パースできない → 無効
+    """
     if not date_str:
-        return date_str
-    m = re.match(r'(\d{4})/(\d{2})/(\d{2})', str(date_str))
-    if m:
-        day = int(m.group(3))
-        if day == 0:
-            return f"{m.group(1)}/{m.group(2)}/01"
-    return date_str
+        return ""
+    s = str(date_str).strip()
+    m = re.match(r'(\d{4})/(\d{2})/(\d{2})', s)
+    if not m:
+        return ""  # パースできない → 空
+    year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if day == 0:
+        return ""  # /00 → 空
+    if year < 2020 or year > 2027:
+        return ""  # 2014年等 → Gemini の年号誤判定、空にする
+    if month < 1 or month > 12 or day > 31:
+        return ""
+    return s
 
 
 def _extract_invoice_num_from_ocr(ocr_text):
@@ -448,7 +460,10 @@ def _apply_ocr_overrides(raw_data, ocr_text, prefix=""):
                 doc["date"] = ocr_date
             else:
                 # OCR 抽出できなくても無効日付は修正
-                doc["date"] = _sanitize_date(doc.get("date", ""))
+                validated = _validate_gemini_date(doc.get("date", ""))
+                if not validated:
+                    print(f"{prefix}⚠️ 日付不明: Gemini={doc.get('date','')} → 空欄（要確認）")
+                doc["date"] = validated
             if ocr_tnum:
                 gemini_tnum = doc.get("invoice_num", "")
                 if gemini_tnum != ocr_tnum:
@@ -462,7 +477,10 @@ def _apply_ocr_overrides(raw_data, ocr_text, prefix=""):
                 print(f"{prefix}📅 日付上書: Gemini={gemini_date} → OCR={ocr_date}")
             raw_data["date"] = ocr_date
         else:
-            raw_data["date"] = _sanitize_date(raw_data.get("date", ""))
+            validated = _validate_gemini_date(raw_data.get("date", ""))
+            if not validated:
+                print(f"{prefix}⚠️ 日付不明: Gemini={raw_data.get('date','')} → 空欄（要確認）")
+            raw_data["date"] = validated
         if ocr_tnum:
             gemini_tnum = raw_data.get("invoice_num", "")
             if gemini_tnum != ocr_tnum:
