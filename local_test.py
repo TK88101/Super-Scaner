@@ -76,24 +76,17 @@ def process_local_file(file_info, sheets_writer, strategy=None):
     print(f"📋 文書タイプ: {type_label}")
     print(f"{'='*50}")
 
-    # Cloud Vision OCR + Gemini
-    result = process_pipeline(file_path, doc_type=doc_type, ocr_strategy=strategy)
+    # PaddleOCR + Gemini（ジェネレータ: 逐次処理）
+    count = 0
+    for page in process_pipeline(file_path, doc_type=doc_type, ocr_strategy=strategy):
+        r = page["result"]
+        page_num = page["page_num"]
+        total_pages = page["total_pages"]
+        count += 1
 
-    if not result:
-        print(f"❌ 解析失敗: {file_name}")
-        return False
+        if total_pages > 1:
+            print(f"\n  📄 文書 [{page_num}/{total_pages}]: {r.get('vendor', '不明')}")
 
-    # マルチドキュメント対応: list に正規化
-    if isinstance(result, list):
-        results = result
-    else:
-        results = [result]
-
-    for idx, r in enumerate(results):
-        if len(results) > 1:
-            print(f"\n  📄 文書 {idx+1}/{len(results)}: {r.get('vendor', '不明')}")
-
-        # 結果表示
         entries = r.get("entries", [])
         print(f"\n🎯 解析結果:")
         print(f"   📅 日付: {r.get('date')}")
@@ -105,7 +98,7 @@ def process_local_file(file_info, sheets_writer, strategy=None):
                   f"({entry.get('debit_tax_type')}) → "
                   f"貸方: {entry.get('credit_account')} ({entry.get('credit_tax_type')})")
 
-        # Google Sheets 書き込み
+        # 即座に Google Sheets 書き込み
         r["uploader"] = "LocalTest"
         sheets_writer.append_entries(
             employee_name="LocalTest",
@@ -113,6 +106,10 @@ def process_local_file(file_info, sheets_writer, strategy=None):
             entries_data=r,
             source_url="",
         )
+
+    if count == 0:
+        print(f"❌ 解析失敗: {file_name}")
+        return False
 
     # 処理済みフォルダへ移動
     dest = os.path.join(PROCESSED_DIR, file_name)

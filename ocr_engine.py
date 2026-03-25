@@ -2,6 +2,7 @@ import os
 import io
 import json
 import re
+import gc
 import google.generativeai as genai
 from google.cloud import vision
 from dotenv import load_dotenv
@@ -24,8 +25,12 @@ _paddle_ocr = None
 def _get_paddle_ocr():
     global _paddle_ocr
     if _paddle_ocr is None:
-        # cpu_threads: コード側の増強。Dockerfile の OMP_NUM_THREADS=1 が底線
-        _paddle_ocr = PaddleOCR(lang='japan', use_gpu=False, cpu_threads=1)
+        # PaddleOCR 3.x は use_gpu 非対応 → try/except で v2/v3 両対応
+        try:
+            _paddle_ocr = PaddleOCR(lang='japan', use_gpu=False, cpu_threads=1)
+        except TypeError:
+            # PaddleOCR 3.x: use_gpu パラメータ廃止
+            _paddle_ocr = PaddleOCR(lang='japan', cpu_threads=1)
     return _paddle_ocr
 
 load_dotenv()
@@ -851,18 +856,23 @@ def _route_ocr_strategy(data_bytes, mime_type, prompt, ocr_strategy, prefix=""):
 
 def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None):
     """
-    文書を分析し、統一された仕訳データを返す。
+    文書を分析し、仕訳データを逐次 yield するジェネレータ。
+
+    各 yield は dict: {"result": 仕訳dict, "page_num": int, "total_pages": int}
+
+    メモリ最適化: 1ページ処理→yield→GC→次ページ の流れで
+    EC2 t2.micro (768MB) でも安定動作する。
 
     Args:
         file_path: 文書ファイルのパス
         doc_type: 文書タイプ (DocType 定数)
         ocr_strategy: OCR 戦略 (A/B/C, None=config.OCR_STRATEGY)
 
-    Returns:
-        dict: 単一文書の場合（通常）
-        list[dict]: 複数文書検出時（領収書のみ）
-        None: 解析失敗時
+    Yields:
+        dict: {"result": dict, "page_num": int, "total_pages": int}
     """
+    import itertools
+
     filename = os.path.basename(file_path)
     type_label = DOC_TYPE_CONFIG.get(doc_type, {}).get("label", doc_type)
     print(f"🧠 PaddleOCR + Gemini で{type_label}を分析中: {filename} (戦略: {ocr_strategy}) ...")
@@ -871,25 +881,24 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None):
         prompt = PROMPTS.get(doc_type)
         if not prompt:
             print(f"⚠️ 未対応の文書タイプ: {doc_type}")
-            return None
+            return
 
         import config
         if ocr_strategy is None:
             ocr_strategy = config.OCR_STRATEGY
 
-        # 受領書PDFはページ分割で長文JSON切断を回避する
         mime_type = _get_mime_type(file_path)
+
+        # ── 領収書 PDF: 1ページずつ yield（各ページ独立）──
         if doc_type == DocType.RECEIPT and mime_type == "application/pdf":
             page_gen = _split_pdf_pages(file_path)
             first_page = next(page_gen, None)
             if first_page is not None:
                 total = first_page["total_pages"]
                 print(f"📄 大型PDF対応: {total}ページを分割解析します")
-                merged_results = []
+                yielded = 0
                 failed_pages = 0
 
-                # first_page を含めて全ページを逐次処理
-                import itertools
                 for page_info in itertools.chain([first_page], page_gen):
                     idx = page_info["page_num"]
                     prefix = f"[p{idx}] "
@@ -912,25 +921,89 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None):
                     if not page_results:
                         print(f"{prefix}⚠️ 有効な仕訳エントリが見つかりません")
                         continue
-                    merged_results.extend(page_results)
 
-                if merged_results:
+                    for entry in page_results:
+                        yield {
+                            "result": entry,
+                            "page_num": idx,
+                            "total_pages": total,
+                        }
+                        yielded += 1
+                    gc.collect()
+
+                if yielded > 0:
                     print(
-                        f"✅ PDF分割解析完了: {len(merged_results)}件抽出 "
+                        f"✅ PDF分割解析完了: {yielded}件抽出 "
                         f"(失敗ページ: {failed_pages})"
                     )
-                    if len(merged_results) == 1:
-                        return merged_results[0]
-                    return merged_results
+                else:
+                    print("⚠️ PDF分割解析でも有効結果を取得できませんでした")
+                return
 
-                print("⚠️ PDF分割解析でも有効結果を取得できませんでした")
-                return None
+        # ── 非領収書 PDF: 逐ページ OCR → 合併テキスト → 1回 Gemini ──
+        if mime_type == "application/pdf":
+            page_gen = _split_pdf_pages(file_path)
+            first_page = next(page_gen, None)
+            if first_page is not None:
+                total = first_page["total_pages"]
+                print(f"📄 多ページPDF: {total}ページを逐次OCR→統合解析します")
+                all_ocr_texts = []
+                for pg in itertools.chain([first_page], page_gen):
+                    prefix = f"[p{pg['page_num']}] "
+                    pg_text, _ = _ocr_with_paddleocr(pg["data"], "application/pdf")
+                    all_ocr_texts.append(pg_text)
+                    print(f"{prefix}OCR完了 ({len(pg_text)}文字)")
+                    gc.collect()
 
+                combined_ocr = "\n---PAGE BREAK---\n".join(all_ocr_texts)
+                del all_ocr_texts
+
+                with open(file_path, "rb") as f:
+                    file_data = f.read()
+                if ocr_strategy == "C":
+                    raw_data = _call_gemini_cross_validate(combined_ocr, file_data, mime_type, prompt)
+                elif ocr_strategy == "B":
+                    raw_data = _call_gemini_cross_validate(combined_ocr, file_data, mime_type, prompt)
+                else:
+                    raw_data = _call_gemini_text(combined_ocr, prompt)
+                del file_data
+                gc.collect()
+
+                if not raw_data:
+                    print("🔄 フォールバック: Gemini Vision で再試行")
+                    raw_data = _call_gemini(file_path, prompt)
+
+                if raw_data:
+                    builder = ENTRY_BUILDERS.get(doc_type)
+                    if builder:
+                        entries = builder(raw_data)
+                        vendor = raw_data.get("vendor", "")
+                        if doc_type == DocType.SALARY_SLIP:
+                            vendor = raw_data.get("employee_name", "")
+                        yield {
+                            "result": {
+                                "doc_type": doc_type,
+                                "date": raw_data.get("date"),
+                                "vendor": vendor,
+                                "invoice_num": raw_data.get("invoice_num", ""),
+                                "memo": raw_data.get("memo", ""),
+                                "entries": entries,
+                            },
+                            "page_num": 1,
+                            "total_pages": 1,
+                        }
+                else:
+                    print("⚠️ AIの応答がJSONではありませんでした")
+                return
+
+        # ── 単ページ PDF / 画像ファイル: 従来通り処理 ──
         raw_data = None
         with open(file_path, "rb") as f:
             file_data = f.read()
 
         raw_data = _route_ocr_strategy(file_data, mime_type, prompt, ocr_strategy)
+        del file_data
+        gc.collect()
 
         if not raw_data:
             print("🔄 フォールバック: Gemini Vision で再試行")
@@ -938,40 +1011,46 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None):
 
         if not raw_data:
             print("⚠️ AIの応答がJSONではありませんでした")
-            return None
+            return
 
-        # ── 領収書処理（新旧フォーマット両対応）──
+        # ── 領収書処理（単ページ PDF / 画像）──
         if doc_type == DocType.RECEIPT:
             results = _normalize_receipt_results(raw_data)
-            if len(results) == 0:
-                return None
-            elif len(results) == 1:
-                return results[0]       # 単一文書: dict を返す（後方互換）
-            else:
-                return results          # 複数文書: list を返す
+            if not results:
+                return
+            for entry in results:
+                yield {
+                    "result": entry,
+                    "page_num": 1,
+                    "total_pages": 1,
+                }
+            return
 
-        # ── 通常パス（他の文書タイプ）──
+        # ── 通常パス（他の文書タイプ、単ページ / 画像）──
         builder = ENTRY_BUILDERS.get(doc_type)
         if not builder:
             print(f"⚠️ エントリビルダーが未登録: {doc_type}")
-            return None
+            return
 
         entries = builder(raw_data)
 
-        # 給与明細は vendor の代わりに employee_name を使用
         vendor = raw_data.get("vendor", "")
         if doc_type == DocType.SALARY_SLIP:
             vendor = raw_data.get("employee_name", "")
 
-        return {
-            "doc_type": doc_type,
-            "date": raw_data.get("date"),
-            "vendor": vendor,
-            "invoice_num": raw_data.get("invoice_num", ""),
-            "memo": raw_data.get("memo", ""),
-            "entries": entries,
+        yield {
+            "result": {
+                "doc_type": doc_type,
+                "date": raw_data.get("date"),
+                "vendor": vendor,
+                "invoice_num": raw_data.get("invoice_num", ""),
+                "memo": raw_data.get("memo", ""),
+                "entries": entries,
+            },
+            "page_num": 1,
+            "total_pages": 1,
         }
 
     except Exception as e:
         print(f"❌ 解析失敗: {e}")
-        return None
+        return

@@ -130,67 +130,63 @@ def is_duplicate_file(service, md5_checksum):
 
 def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
                   doc_type=DocType.RECEIPT, drive_file_id=None):
-    """ファイルを処理し、Google Sheets に書き込み、通知を送信する"""
+    """ファイルを処理し、Google Sheets に逐次書き込み、通知を送信する。
+
+    process_pipeline がジェネレータなので、1ページ処理→即Sheets書き込み→
+    メモリ解放→次ページ の流れでメモリ使用量を最小化する。
+    """
     type_label = DOC_TYPE_CONFIG.get(doc_type, {}).get("label", doc_type)
     filename = os.path.basename(file_path)
     print(f"⚙️  処理開始: {filename} [{type_label}] (担当: {uploader_name})")
 
-    result = process_pipeline(file_path, doc_type=doc_type)
+    base_url = ""
+    if drive_file_id:
+        base_url = f"https://drive.google.com/file/d/{drive_file_id}/view"
 
-    if result:
-        # マルチドキュメント対応: list に正規化
-        if isinstance(result, list):
-            results = result
+    total_amount = 0
+    vendor_names = []
+    count = 0
+    total_entries = 0
+
+    for page in process_pipeline(file_path, doc_type=doc_type):
+        result = page["result"]
+        page_num = page["page_num"]
+        total_pages = page["total_pages"]
+        count += 1
+
+        entries = result.get('entries', [])
+        print(f"📄 [{page_num}/{total_pages}] 取引先: {result.get('vendor')} | "
+              f"仕訳: {len(entries)}行")
+
+        # 即座に Google Sheets へ書き込み
+        if total_pages > 1 and base_url:
+            source_url = f"{base_url}#page={page_num}"
         else:
-            results = [result]
-
-        print("\n" + "=" * 15 + " 🎯 解析結果 " + "=" * 15)
-        for idx, r in enumerate(results):
-            if len(results) > 1:
-                print(f"\n📄 文書 {idx+1}/{len(results)}:")
-            print(f"📅 日付: {r.get('date')}")
-            print(f"🏪 取引先: {r.get('vendor')}")
-            print(f"📋 文書タイプ: {type_label}")
-            entries = r.get('entries', [])
-            print(f"📊 仕訳行数: {len(entries)}")
-        print("=" * 40 + "\n")
-
-        # source_url: 元ファイルの Drive URL + ページ番号
-        # (SA storageQuotaExceeded のため単ページ PDF アップロードは不可)
-        base_url = ""
-        if drive_file_id:
-            base_url = f"https://drive.google.com/file/d/{drive_file_id}/view"
-
-        # Google Sheets に書き込み
-        for idx, r in enumerate(results):
-            r['uploader'] = uploader_name
-            # 多ページ PDF: URL に #page=N を付与
-            if len(results) > 1:
-                source_url = f"{base_url}#page={idx + 1}" if base_url else ""
-            else:
-                source_url = base_url
-            sheets_writer.append_entries(
-                employee_name=uploader_name,
-                doc_type=doc_type,
-                entries_data=r,
-                source_url=source_url,
-            )
-
-        # 金額集計（全文書合算）
-        total_amount = sum(
-            sum(int(e.get('amount', 0)) for e in r.get('entries', []))
-            for r in results
+            source_url = base_url
+        result['uploader'] = uploader_name
+        sheets_writer.append_entries(
+            employee_name=uploader_name,
+            doc_type=doc_type,
+            entries_data=result,
+            source_url=source_url,
         )
-        vendor_list = ", ".join(r.get('vendor', '') for r in results)
 
+        # 軽量サマリーのみ保持（フル結果は GC 対象）
+        page_amount = sum(int(e.get('amount', 0)) for e in entries)
+        total_amount += page_amount
+        vendor_names.append(result.get('vendor', ''))
+        total_entries += len(entries)
+
+    if count > 0:
+        vendor_list = ", ".join(v for v in vendor_names if v)
+        print(f"\n✅ 処理完了: {count}文書 / {total_entries}仕訳")
         send_notification(
             filename=filename,
             status="Success",
             uploader_name=uploader_name,
             chat_id=chat_id,
-            details=f"文書タイプ: {type_label}\n取引先: {vendor_list}\n合計金額: ¥{total_amount}\n文書数: {len(results)}"
+            details=f"文書タイプ: {type_label}\n取引先: {vendor_list}\n合計金額: ¥{total_amount}\n文書数: {count}"
         )
-
         return True
     else:
         send_notification(

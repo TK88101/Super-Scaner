@@ -103,16 +103,13 @@ def process_pdfs_with_strategy(pdf_paths, strategy):
                 tmp_f.write(page_bytes)
 
             print(f"\n--- Page {page_idx+1}/{len(reader.pages)} ---")
-            result = process_pipeline(tmp_path, doc_type=DocType.RECEIPT, ocr_strategy=strategy)
+            page_yielded = False
+            for page in process_pipeline(tmp_path, doc_type=DocType.RECEIPT, ocr_strategy=strategy):
+                all_results.append(page["result"])
+                page_yielded = True
 
-            if result is None:
+            if not page_yielded:
                 print(f"  ⚠️ Page {page_idx+1}: 解析失敗")
-                continue
-
-            if isinstance(result, list):
-                all_results.extend(result)
-            else:
-                all_results.append(result)
 
             # API レート制限対策
             time.sleep(0.5)
