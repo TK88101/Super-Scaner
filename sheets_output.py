@@ -81,10 +81,35 @@ class SheetsOutputWriter:
                 title=tab_name, rows=1000, cols=len(MF_HEADERS)
             )
             ws.append_row(MF_HEADERS, value_input_option='USER_ENTERED')
+            self._write_legend(ws)
             self._tab_has_data[tab_name] = False
 
         self._ws_cache[tab_name] = ws
         return ws
+
+    def _write_legend(self, ws):
+        """高亮凡例をシート上部に追加"""
+        try:
+            legend_rows = [
+                ["【高亮凡例】", "", "", "", "", "", "", "", "", ""],
+                ["🔴 赤系: 日付空欄（要手動入力）", "", "",
+                 "🟠 橙系: 取引先空欄 / T番号不正", "", "",
+                 "🟡 黄系: T番号空 / 要確認科目(地代家賃・保険料・雑収入) / 高額(修繕費>30万・備品>10万)", "", "", ""],
+            ]
+            ws.append_rows(legend_rows, value_input_option='USER_ENTERED')
+
+            row_count = len(ws.get_all_values())
+            legend_start = row_count - 1  # 凡例行
+
+            # 凡例行自体に色見本を適用
+            format_cell_range(ws, f"A{legend_start}:C{legend_start}",
+                              CellFormat(backgroundColor=Color(1, 0.8, 0.8)))  # 赤系
+            format_cell_range(ws, f"D{legend_start}:F{legend_start}",
+                              CellFormat(backgroundColor=Color(1, 0.9, 0.7)))  # 橙系
+            format_cell_range(ws, f"G{legend_start}:J{legend_start}",
+                              CellFormat(backgroundColor=Color(1, 1, 0.7)))    # 黄系
+        except Exception as e:
+            print(f"⚠️ 凡例書き込み失敗: {e}")
 
     def write_separator(self, worksheet, tab_name, label):
         """分割線を書き込む（摘要列にラベル、上部ボーダー）"""
