@@ -378,7 +378,28 @@ def _extract_date_from_ocr(ocr_text):
         year = 2018 + int(m.group(1))
         return f"{year}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
 
+    # パターン6: 令和N年M月分 / YYYY年M月分（納付書等、日なし→1日とする）
+    m = re.search(r'令和\s*(\d{1,2})\s*年\s*(\d{1,2})\s*月\s*分', ocr_text)
+    if m:
+        year = 2018 + int(m.group(1))
+        return f"{year}/{int(m.group(2)):02d}/01"
+    m = re.search(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*分', ocr_text)
+    if m:
+        return f"{m.group(1)}/{int(m.group(2)):02d}/01"
+
     return None
+
+
+def _sanitize_date(date_str):
+    """無効な日付を修正（例: 2026/01/00 → 2026/01/01）"""
+    if not date_str:
+        return date_str
+    m = re.match(r'(\d{4})/(\d{2})/(\d{2})', str(date_str))
+    if m:
+        day = int(m.group(3))
+        if day == 0:
+            return f"{m.group(1)}/{m.group(2)}/01"
+    return date_str
 
 
 def _extract_invoice_num_from_ocr(ocr_text):
@@ -411,11 +432,11 @@ def _apply_ocr_overrides(raw_data, ocr_text, prefix=""):
     Gemini は日付の年号解釈を間違えやすい（26年→2014年等）が、
     PaddleOCR のテキストから正規表現で抽出すれば確実。
     """
-    if not raw_data or not ocr_text:
+    if not raw_data:
         return
 
-    ocr_date = _extract_date_from_ocr(ocr_text)
-    ocr_tnum = _extract_invoice_num_from_ocr(ocr_text)
+    ocr_date = _extract_date_from_ocr(ocr_text) if ocr_text else None
+    ocr_tnum = _extract_invoice_num_from_ocr(ocr_text) if ocr_text else None
 
     # documents 配列がある場合（領収書新フォーマット）
     if isinstance(raw_data, dict) and "documents" in raw_data:
@@ -425,6 +446,9 @@ def _apply_ocr_overrides(raw_data, ocr_text, prefix=""):
                 if gemini_date != ocr_date:
                     print(f"{prefix}📅 日付上書: Gemini={gemini_date} → OCR={ocr_date}")
                 doc["date"] = ocr_date
+            else:
+                # OCR 抽出できなくても無効日付は修正
+                doc["date"] = _sanitize_date(doc.get("date", ""))
             if ocr_tnum:
                 gemini_tnum = doc.get("invoice_num", "")
                 if gemini_tnum != ocr_tnum:
@@ -437,6 +461,8 @@ def _apply_ocr_overrides(raw_data, ocr_text, prefix=""):
             if gemini_date != ocr_date:
                 print(f"{prefix}📅 日付上書: Gemini={gemini_date} → OCR={ocr_date}")
             raw_data["date"] = ocr_date
+        else:
+            raw_data["date"] = _sanitize_date(raw_data.get("date", ""))
         if ocr_tnum:
             gemini_tnum = raw_data.get("invoice_num", "")
             if gemini_tnum != ocr_tnum:
