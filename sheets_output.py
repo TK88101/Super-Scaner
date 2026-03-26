@@ -182,16 +182,11 @@ class SheetsOutputWriter:
 
             now_jst = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
 
-            # 借方補助科目を自動決定（インボイス制度準拠）
-            debit_sub = self._determine_debit_sub_account(
-                debit_account, entry, invoice_num
-            )
-
             row = [
                 transaction_no,
                 entries_data.get("date", ""),
                 debit_account,
-                debit_sub,
+                "",                                             # 借方補助科目（空白）
                 "",                                             # 借方部門
                 vendor_name,
                 entry.get("debit_tax_type", ""),
@@ -199,7 +194,7 @@ class SheetsOutputWriter:
                 int(amount),
                 entry.get("debit_tax_amount", ""),
                 credit_account,
-                self._determine_credit_sub_account(doc_type, entry, vendor_name),
+                "",                                             # 貸方補助科目（空白）
                 "",                                             # 貸方部門
                 entry.get("credit_vendor", ""),
                 entry.get("credit_tax_type", "対象外"),
