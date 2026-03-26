@@ -353,11 +353,15 @@ def _extract_date_from_ocr(ocr_text):
     if m:
         return f"{m.group(1)}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
 
-    # パターン2: 26年 1月14日 (西暦下2桁)
-    m = re.search(r'(\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', ocr_text)
+    # パターン2: 26年 1月14日 (西暦下2桁) or 8年 1月7日 (令和1桁)
+    m = re.search(r'(?<!\d)(\d{1,2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', ocr_text)
     if m:
         year = int(m.group(1))
-        if year <= 99:
+        if year <= 10:
+            # 1-10 → 令和N年（令和1年=2019, 令和8年=2026）
+            year = 2018 + year
+        elif year <= 99:
+            # 20-99 → 西暦下2桁（26→2026）
             year = 2000 + year
         return f"{year}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
 
