@@ -179,8 +179,6 @@ class SheetsOutputWriter:
             credit_account = ACCOUNT_MAP.get(credit_account, credit_account)
 
             description = f"{vendor_name} - {entry.get('description', '')}"
-            if uploader_name:
-                description += f" [担当: {uploader_name}]"
 
             now_jst = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
 
