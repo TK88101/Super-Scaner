@@ -348,6 +348,16 @@ def _extract_date_from_ocr(ocr_text):
     if not ocr_text:
         return None
 
+    # ★ パターン0 (最優先): X月分（納付書等、日なし→月のみ、高亮対象）
+    # 「納期限 令和8年2月10日」より先に「令和8年1月分」を検出するため最優先
+    m = re.search(r'令和\s*(\d{1,2})\s*年\s*(\d{1,2})\s*月\s*分', ocr_text)
+    if m:
+        year = 2018 + int(m.group(1))
+        return f"{year}/{int(m.group(2)):02d}"
+    m = re.search(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*分', ocr_text)
+    if m:
+        return f"{m.group(1)}/{int(m.group(2)):02d}"
+
     # パターン1: 2026年1月27日, 2026年 1月27日（火）, 2026年01月10日
     m = re.search(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', ocr_text)
     if m:
@@ -358,10 +368,8 @@ def _extract_date_from_ocr(ocr_text):
     if m:
         year = int(m.group(1))
         if year <= 10:
-            # 1-10 → 令和N年（令和1年=2019, 令和8年=2026）
             year = 2018 + year
         elif year <= 99:
-            # 20-99 → 西暦下2桁（26→2026）
             year = 2000 + year
         return f"{year}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
 
@@ -384,15 +392,6 @@ def _extract_date_from_ocr(ocr_text):
         year = 2018 + int(m.group(1))
         return f"{year}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
 
-    # パターン6: 令和N年M月分 / YYYY年M月分（納付書等、日なし→1日とする）
-    m = re.search(r'令和\s*(\d{1,2})\s*年\s*(\d{1,2})\s*月\s*分', ocr_text)
-    if m:
-        year = 2018 + int(m.group(1))
-        return f"{year}/{int(m.group(2)):02d}/01"
-    m = re.search(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*分', ocr_text)
-    if m:
-        return f"{m.group(1)}/{int(m.group(2)):02d}/01"
-
     return None
 
 
@@ -407,6 +406,9 @@ def _validate_gemini_date(date_str):
     if not date_str:
         return ""
     s = str(date_str).strip()
+    # YYYY/MM 形式（月のみ、納付書等）はそのまま通す
+    if re.match(r'^\d{4}/\d{2}$', s):
+        return s
     m = re.match(r'(\d{4})/(\d{2})/(\d{2})', s)
     if not m:
         return ""  # パースできない → 空
@@ -549,6 +551,7 @@ PROMPTS = {
 - ガソリンスタンド・駐車場・高速道路料金 → "旅費交通費"
 - レンタカー → "旅費交通費"
 - タクシー → "旅費交通費"
+- 物品購入（玩具・景品・日用品・電子部品・工具・消耗材等）→ "備品・消耗品費"（"未払金"にしないこと）
 
 【tax_rate の判定基準】
 最優先: レシートに税率(8%, 10%)や「※」「軽」マークが印字されていればそれに従う。

@@ -77,6 +77,15 @@ def detect_anomalies(entry, parent_data=None):
             "col": 1,  # 取引日 = B列
         })
 
+    # 日付が月のみ（YYYY/MM、日なし）→ 高亮で要確認
+    elif re.match(r'^\d{4}/\d{2}$', str(date_val)):
+        flags.append({
+            "type": "partial_date",
+            "message": f"日付に日が未記載です: {date_val}",
+            "severity": "low",
+            "col": 1,
+        })
+
     # 取引先が空
     vendor = parent_data.get("vendor", "")
     if not vendor:
