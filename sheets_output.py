@@ -24,24 +24,11 @@ class SheetsOutputWriter:
     def __init__(self, spreadsheet_id, credentials_file):
         gc = gspread.service_account(filename=credentials_file)
         self.spreadsheet = gc.open_by_key(spreadsheet_id)
-        self._ensure_config_tab()
         self._cleanup_default_sheet()
         # キャッシュ: tab 参照と取引No をメモリに保持し API 呼び出しを削減
         self._ws_cache = {}
         self._tab_has_data = {}
-
-    def _ensure_config_tab(self):
-        """隠し _config tab を確保し、全局取引No を管理"""
-        try:
-            self._config_ws = self.spreadsheet.worksheet("_config")
-        except gspread.exceptions.WorksheetNotFound:
-            self._config_ws = self.spreadsheet.add_worksheet(
-                title="_config", rows=10, cols=2
-            )
-            self._config_ws.update('A1:B1', [["key", "value"]])
-            self._config_ws.update('A2:B2', [["next_transaction_no", "1"]])
-        # 取引No をメモリにキャッシュ
-        self._next_txn_no = self._read_transaction_no()
+        self._tab_next_txn = {}  # タブごとの取引No
 
     def _cleanup_default_sheet(self):
         """デフォルトの空シート（シート1）を削除"""
@@ -53,19 +40,26 @@ class SheetsOutputWriter:
         except (gspread.exceptions.WorksheetNotFound, Exception):
             pass
 
-    def _read_transaction_no(self):
-        """_config tab から取引No を読み取る"""
-        cell = self._config_ws.find("next_transaction_no")
-        if not cell:
-            self._config_ws.update('A2:B2', [["next_transaction_no", "1"]])
-            return 1
-        return int(self._config_ws.cell(cell.row, cell.col + 1).value or "1")
-
-    def _save_transaction_no(self):
-        """メモリ上の取引No を _config tab に書き戻す"""
-        cell = self._config_ws.find("next_transaction_no")
-        if cell:
-            self._config_ws.update_cell(cell.row, cell.col + 1, self._next_txn_no)
+    def _get_next_txn_no(self, tab_name, ws):
+        """タブごとの次の取引No を取得（A列の最大値 + 1）"""
+        if tab_name in self._tab_next_txn:
+            return self._tab_next_txn[tab_name]
+        # シートのA列から最大取引Noを取得
+        try:
+            all_vals = ws.get_all_values()
+            max_no = 0
+            for row in all_vals:
+                if row and row[0]:
+                    try:
+                        n = int(row[0])
+                        if n > max_no:
+                            max_no = n
+                    except (ValueError, TypeError):
+                        pass
+            self._tab_next_txn[tab_name] = max_no + 1
+        except Exception:
+            self._tab_next_txn[tab_name] = 1
+        return self._tab_next_txn[tab_name]
 
     def _get_or_create_tab(self, tab_name):
         """タブを取得（キャッシュ付き）、なければ作成してヘッダーを書き込む"""
@@ -159,7 +153,7 @@ class SheetsOutputWriter:
         invoice_num = _sanitize_invoice_num(entries_data.get('invoice_num', ''))
         vendor_name = entries_data.get('vendor', '')
         memo = entries_data.get('memo', '')
-        transaction_no = self._next_txn_no
+        transaction_no = self._get_next_txn_no(tab_name, ws)
 
         rows = []
         anomaly_flags_list = []
@@ -231,8 +225,8 @@ class SheetsOutputWriter:
             # 一括書き込み（リトライ付き）
             self._write_with_retry(ws, rows)
 
-            # 取引No をメモリ更新（API 書き戻しは後でまとめて）
-            self._next_txn_no = transaction_no
+            # 取引No をタブごとにメモリ更新
+            self._tab_next_txn[tab_name] = transaction_no
 
             # 異常行のハイライト（書き込み前の行数から位置を正確に算出）
             if anomaly_flags_list:
@@ -247,11 +241,8 @@ class SheetsOutputWriter:
             print(f"💾 Sheets に {len(rows)} 行追加: {tab_name}")
 
     def flush(self):
-        """メモリ上の取引No を Sheets に書き戻す（処理完了時に呼ぶ）"""
-        try:
-            self._save_transaction_no()
-        except Exception as e:
-            print(f"⚠️ 取引No 保存失敗: {e}")
+        """互換性のため残す（タブごと管理なので書き戻し不要）"""
+        pass
 
     def _write_with_retry(self, worksheet, rows, max_retries=5):
         """レート制限対策付きの行書き込み"""
