@@ -88,14 +88,13 @@ class SheetsOutputWriter:
         return ws
 
     def _write_legend(self, ws):
-        """ハイライト凡例を A1-A3 に書き込む"""
+        """ハイライト凡例を A1-A4 に書き込む"""
         try:
             legend_rows = [
                 ["【ハイライト凡例】"],
                 ["🔴 赤系: 日付空欄（要手動入力）"],
-                ["🟠 橙系: 取引先空欄 / T番号不正",
-                 "",
-                 "🟡 黄系: T番号空 / 要確認科目(地代家賃・保険料・雑収入) / 高額(修繕費>30万・備品>10万)"],
+                ["🟠 橙系: 取引先空欄 / T番号不正"],
+                ["🟡 黄系: T番号空 / 要確認科目(地代家賃・保険料・雑収入) / 高額(修繕費>30万・備品>10万)"],
             ]
             ws.append_rows(legend_rows, value_input_option='USER_ENTERED')
 
@@ -104,7 +103,7 @@ class SheetsOutputWriter:
                               CellFormat(backgroundColor=Color(1, 0.8, 0.8)))   # 赤系
             format_cell_range(ws, "A3:A3",
                               CellFormat(backgroundColor=Color(1, 0.9, 0.7)))   # 橙系
-            format_cell_range(ws, "C3:C3",
+            format_cell_range(ws, "A4:A4",
                               CellFormat(backgroundColor=Color(1, 1, 0.7)))     # 黄系
         except Exception as e:
             print(f"⚠️ 凡例書き込み失敗: {e}")
