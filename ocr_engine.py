@@ -583,6 +583,7 @@ PROMPTS = {
 - テキストに1枚の書類しかなくても、必ず documents 配列で返してください
 - 金額は数値型(カンマなし)で返してください
 - 封筒（郵便封筒・切手のみの画像）は書類ではありません。封筒が検出された場合は documents を空配列 [] で返してください
+- items には個別の品目のみ含めてください。小計・合計・税込合計・「10%対象」等の集計行は含めないでください
 - 振込受取書では、vendor は振込依頼人（支払い元の会社名）を記載してください
 """,
 
@@ -689,6 +690,32 @@ def _determine_tax_types(doc_category, tax_rate):
         return "課対仕入10%", "対象外"
 
 
+def _is_subtotal_line(description, amount, all_items):
+    """小計・合計・税額集計行かどうかを判定"""
+    # キーワード検出
+    subtotal_keywords = [
+        "小計", "合計", "対象", "税込", "税抜", "内消費税", "消費税額",
+        "課税対象", "10%対象", "8%対象", "税額", "うち消費税",
+    ]
+    desc_lower = description.lower()
+    for kw in subtotal_keywords:
+        if kw in desc_lower:
+            return True
+
+    # 金額一致チェック: 他の品目の合計と一致する場合はスキップ
+    if len(all_items) > 2:
+        other_amounts = []
+        for item in all_items:
+            a = item.get("amount", 0)
+            d = str(item.get("description", ""))
+            if a and int(a) != 0 and int(a) != amount and d != description:
+                other_amounts.append(int(a))
+        if other_amounts and amount == sum(other_amounts):
+            return True
+
+    return False
+
+
 def _build_entries_for_single_doc(doc):
     """documents配列の1要素（単一書類）から仕訳エントリを生成"""
     entries = []
@@ -701,6 +728,11 @@ def _build_entries_for_single_doc(doc):
     for item in doc.get("items", []):
         amount = item.get("amount", 0)
         if not amount or int(amount) == 0:
+            continue
+
+        # 小計/合計行をスキップ（Gemini が集計行を品目として返す場合がある）
+        desc = str(item.get("description", "")).strip()
+        if _is_subtotal_line(desc, int(amount), doc.get("items", [])):
             continue
 
         tax_rate = item.get("tax_rate", 0.10)
