@@ -692,10 +692,11 @@ def _determine_tax_types(doc_category, tax_rate):
 
 def _is_subtotal_line(description, amount, all_items):
     """小計・合計・税額集計行かどうかを判定"""
-    # キーワード検出
+    # キーワード検出（品目名に含まれうる「対象」等は除外、集計行のみ）
     subtotal_keywords = [
-        "小計", "合計", "対象", "税込", "税抜", "内消費税", "消費税額",
-        "課税対象", "10%対象", "8%対象", "税額", "うち消費税",
+        "小計", "合計", "税込合計", "税抜合計", "内消費税", "消費税額",
+        "課税対象額", "10%対象額", "8%対象額", "税額合計", "うち消費税",
+        "10%対象計", "8%対象計",
     ]
     desc_lower = description.lower()
     for kw in subtotal_keywords:
