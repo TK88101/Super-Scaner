@@ -1,7 +1,13 @@
 import os
+import sys
 import time
 import io
 import random
+
+# Windows console encoding fix
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 from dotenv import load_dotenv
 from google.oauth2 import service_account
 from googleapiclient.discovery import build

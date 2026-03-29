@@ -14,8 +14,14 @@ Google Drive / Chatwork 不要。Gemini API のみで動作。
 """
 
 import os
+import sys
 import shutil
 from dotenv import load_dotenv
+
+# Windows console encoding fix
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 load_dotenv()
 
