@@ -4,7 +4,10 @@ import json
 import re
 import gc
 import google.generativeai as genai
-from google.cloud import vision
+try:
+    from google.cloud import vision
+except ImportError:
+    vision = None
 from dotenv import load_dotenv
 from doc_types import DocType, DOC_TYPE_CONFIG
 
