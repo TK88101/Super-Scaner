@@ -449,6 +449,74 @@ def _extract_invoice_num_from_ocr(ocr_text):
     return None
 
 
+# ── 封筒・非領収書ページ検出 ──
+_ENVELOPE_KEYWORDS = ["郵便", "切手", "〒", "封筒", "差出人", "親展", "書留", "速達", "配達証明"]
+
+def _is_envelope_page(ocr_text, raw_data):
+    """OCR テキストとGemini結果から封筒ページかどうかを判定する。
+    Gemini prompt だけでは不安定なので、コードレベルで強制フィルタする。
+    """
+    if not ocr_text:
+        return False
+
+    text_lower = ocr_text.replace(" ", "")
+
+    # 条件1: 封筒関連キーワードが含まれ、かつ「領収」「請求」等のキーワードがない
+    has_envelope_kw = any(kw in text_lower for kw in _ENVELOPE_KEYWORDS)
+    has_receipt_kw = any(kw in text_lower for kw in ["領収", "請求", "合計", "小計", "税込", "お買上"])
+
+    if has_envelope_kw and not has_receipt_kw:
+        return True
+
+    # 条件2: Gemini が documents=[] を返した場合
+    if isinstance(raw_data, dict):
+        docs = raw_data.get("documents", None)
+        if docs is not None and len(docs) == 0:
+            return True
+
+    # 条件3: OCR テキストが極端に短い（20文字未満）= ほぼ空白ページ
+    clean_text = re.sub(r'\s+', '', ocr_text)
+    if len(clean_text) < 20:
+        return True
+
+    return False
+
+
+# ── 取引先名に基づく科目兜底ルール ──
+_VENDOR_ACCOUNT_OVERRIDE = {
+    # スーパー・日用品店 → 備品・消耗品費
+    "フードウェイ": "備品・消耗品費",
+    "ダイソー": "備品・消耗品費",
+    "セブン-イレブン": "備品・消耗品費",
+    "セブンイレブン": "備品・消耗品費",
+    "ローソン": "備品・消耗品費",
+    "ファミリーマート": "備品・消耗品費",
+    "エディオン": "備品・消耗品費",
+    "MEGA": "備品・消耗品費",
+    # 駐車場 → 旅費交通費
+    "パーキング": "旅費交通費",
+    "タイムズ": "旅費交通費",
+    "コインパーク": "旅費交通費",
+    # 高速道路 → 旅費交通費
+    "NEXCO": "旅費交通費",
+    "高速道路": "旅費交通費",
+    # タクシー → 旅費交通費
+    "タクシー": "旅費交通費",
+    # 空港 → 旅費交通費
+    "空港": "旅費交通費",
+}
+
+def _override_account_by_vendor(vendor, gemini_account):
+    """取引先名に基づいて科目を強制上書きする。Gemini の分類揺れを防止。"""
+    if not vendor:
+        return gemini_account
+    for keyword, forced_account in _VENDOR_ACCOUNT_OVERRIDE.items():
+        if keyword in vendor:
+            if gemini_account != forced_account:
+                return forced_account
+    return gemini_account
+
+
 def _apply_ocr_overrides(raw_data, ocr_text, prefix=""):
     """OCR テキストから抽出した日付・T番号で Gemini の結果を上書きする。
 
@@ -741,6 +809,10 @@ def _build_entries_for_single_doc(doc):
 
         tax_rate = item.get("tax_rate", 0.10)
         debit_account = item.get("debit_account", "消耗品費")
+
+        # 取引先名に基づく科目兜底（Gemini 分類揺れ防止）
+        vendor = doc.get("vendor", "")
+        debit_account = _override_account_by_vendor(vendor, debit_account)
 
         # 税区分決定
         debit_tax_type, credit_tax_type = _determine_tax_types(
@@ -1117,6 +1189,11 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None):
                     if not page_raw_data:
                         failed_pages += 1
                         print(f"{prefix}⚠️ AIの応答がJSONではありませんでした")
+                        continue
+
+                    # ── 封筒・非領収書ページ検出（コードレベル強制フィルタ）──
+                    if _is_envelope_page(ocr_text, page_raw_data):
+                        print(f"{prefix}📨 封筒/非領収書ページを検出、スキップします")
                         continue
 
                     # OCR テキストから日付・T番号を抽出し Gemini 結果を上書き
