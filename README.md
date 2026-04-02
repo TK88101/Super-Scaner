@@ -11,7 +11,7 @@
 * 📊 **Generator Pipeline：** 逐頁 OCR → 即時 Sheets 寫入 → GC → 下一頁（低メモリ動作）
 * 🗺️ **科目自動映射 + 補助科目：** AI 通用名 → MF 正確科目名、適格/非適格/飲食贈答等 自動決定
 * 🔗 **原票 URL 追蹤：** 每行數據關聯原始 PDF 鏈接 + 頁碼
-* 💾 **每日自動備份：** 22:00 JST 備份到獨立 Spreadsheet，90 天保留
+* 💾 **每日自動備份 (GAS)：** 22:00 JST Google サーバー上で自動実行、全 tab 集約備份、30 天保留、PC 電源不要
 * 🛡️ **異常檢測 + ハイライト凡例：** 日期空/取引先空/T番號空・不正/高額 → 對應單元格標色 + 凡例説明
 
 ---
@@ -37,7 +37,7 @@ PDF 上傳 → Drive 文件夾 (領収書/請求書/給与明細)
          ↓
     原文件歸檔 + Chatwork 通知
 
-    22:00 JST: 工作Sheet → 備份Sheet → 清空
+    22:00 JST (GAS): 全tab → MF_Backup 集約備份 → 元tab削除
 ```
 
 ---
@@ -138,10 +138,14 @@ Super Scaner/
 ├── local_test.py               # 本地測試腳本 (--strategy A/B/C)
 ├── benchmark_ocr.py            # OCR ベンチマーク (Strategy 比較)
 │
+├── gas/
+│   ├── dashboard.gs            # 監控儀表板 (GAS Web App)
+│   └── daily_backup.gs         # 每日備份 (GAS, 22:00 JST, Google サーバー実行)
+│
 ├── scripts/
-│   ├── deploy_ec2.sh           # AWS EC2 一鍵部署
-│   ├── daily_backup.py         # 每日備份腳本 (22:00 JST cron)
-│   └── install_daily_cron.sh   # Cron 安裝腳本
+│   ├── deploy_ec2.sh           # AWS EC2 一鍵部署 (已棄用)
+│   ├── daily_backup.py         # 每日備份 (Python cron 版, 已被 GAS 版置換)
+│   └── install_daily_cron.sh   # Cron 安裝腳本 (已棄用)
 │
 ├── monitoring/                 # 監控子系統
 │   ├── metrics_pusher.py       # 指標推送
@@ -204,4 +208,4 @@ MF 標準 27 列 + 原票URL (第28列)
 
 ---
 
-*Generated for Project Super Scaner v2.5 — Windows Deploy + 封筒フィルタ + 科目兜底ルール*
+*Generated for Project Super Scaner v2.6 — 客戶本番稼働 + GAS 日次バックアップ*

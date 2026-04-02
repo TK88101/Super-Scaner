@@ -1,8 +1,18 @@
 # 📄 Super Scaner — 產品需求文檔 (PRD)
 
-> **版本:** 2.5
-> **日期:** 2026-03-29
-> **狀態:** Windows本番デプロイ完了、x86実機テスト済み、封筒フィルタ+科目兜底ルール追加
+> **版本:** 2.6
+> **日期:** 2026-04-02
+> **狀態:** 客戶本番稼働中、GAS備份自動化追加、feature/windows-deploy → main マージ完了
+>
+> ### v2.6 変更点 (2026-04-02)
+> - **客戶本番稼働**: mini PC にて2名の従業員が利用開始
+> - **feature/windows-deploy → main マージ完了**: Deploy スクリプトの $BRANCH を "main" に変更
+> - **GitHub Release v1.0.0**: Deploy 4ファイルを Release Assets として公開
+> - **GAS 日次バックアップ**: `gas/daily_backup.gs` — Google サーバー上で毎日 22:00 JST 自動実行
+>   - MF_Import_Data の全データ tab → MF_Backup に日付シートとして一括集約（tab名+太線で区切り）
+>   - バックアップ完了後、元の tab を削除（main.py が次回自動再作成）
+>   - 月次クリーンアップ: 30日超の古いバックアップを自動削除
+>   - Python cron 版 (scripts/daily_backup.py) を置換（PC 電源状態に依存しない）
 >
 > ### v2.5 変更点 (2026-03-29)
 > - **Windows本番デプロイ**: Setup.bat + AutoStart.bat 一鍵部署スクリプト（中/日/英 3言語対応）
@@ -107,8 +117,9 @@
 | `doc_types.py` | 文書類型枚舉、DOC_TYPE_TAB_SUFFIX | 修改 |
 | `notifier.py` | Chatwork 通知發送 | 不變 |
 | `csv_writer.py` | MoneyForward CSV 生成（**已廢止**，參考保留）| 廢止 |
-| `scripts/daily_backup.py` | 每日 22:00 JST 備份+清空工作 Sheet | **新建** |
-| `scripts/install_daily_cron.sh` | EC2 cron 安裝腳本 | **新建** |
+| `scripts/daily_backup.py` | 每日備份（Python cron 版、已被 GAS 版置換）| 廢止 |
+| `scripts/install_daily_cron.sh` | EC2 cron 安裝腳本 | 廢止 |
+| `gas/daily_backup.gs` | GAS 日次バックアップ（Google サーバー実行、22:00 JST）| **新建** |
 
 ---
 
@@ -193,12 +204,14 @@ AI 輸出的通用科目名自動轉換為 MF 正確名稱:
 | T番號不正 | H列 (借方インボイス) | 橙色 |
 | 金額 > 10萬 | I列 (借方金額) | 黃色 |
 
-#### F6: 每日備份
+#### F6: 每日備份 (GAS)
 
-- 時間: 22:00 JST (cron)
-- 工作 Sheet → 備份 Sheet (日期+tab名)
-- 清空工作 Sheet (保留表頭)
-- 備份保留: 90 天自動清理
+- 實現: `gas/daily_backup.gs` — Google Apps Script (Google サーバー実行)
+- 時間: 22:00 JST (GAS time-driven trigger)
+- 工作 Sheet 全 tab → 備份 Sheet 的一個日付シートに集約（tab名+太線で区切り）
+- バックアップ完了後、元 tab を削除（main.py が次回自動再作成）
+- 備份保留: 30 天自動清理 (每月1日 23:00 JST)
+- PC 電源状態に依存しない（旧 Python cron 版を置換）
 
 ### 4.2 輔助功能 (P1)
 
@@ -255,6 +268,8 @@ AI 輸出的通用科目名自動轉換為 MF 正確名稱:
 | **v2.0 Phase 4** | **main.py CSV→Sheets 完全替換** | ✅ 完成 |
 | **v2.0 Phase 5** | **每日備份 + 部署更新** | ✅ 完成 |
 | **v2.1** | **PaddleOCR 統合 (Strategy C)、Cloud Vision 置換、ACCOUNT_MAP 拡張** | ✅ 完成 |
+| **v2.5** | **Windows本番デプロイ、封筒フィルタ、科目兜底ルール** | ✅ 完成 |
+| **v2.6** | **客戶本番稼働、GAS日次バックアップ、main マージ** | ✅ 完成 |
 
 ### v2.1 ベンチマーク結果 (294 ページ / 305 取引)
 
@@ -270,4 +285,4 @@ AI 輸出的通用科目名自動轉換為 MF 正確名稱:
 
 ---
 
-*本文檔反映 Super Scaner v2.1 PaddleOCR 統合狀態 (feature/restructure-sheets-ocr 分支)，截至 2026-03-19。*
+*本文檔反映 Super Scaner v2.6 客戶本番稼働狀態 (main 分支)，截至 2026-04-02。*
