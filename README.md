@@ -42,7 +42,28 @@ PDF 上傳 → Drive 文件夾 (領収書/請求書/給与明細)
 
 ---
 
-## 🛠️ 本地開發環境搭建
+## 🖥️ Windows 客戶端部署（本番環境）
+
+### 一鍵部署
+1. 將 `SuperScaner Deploy/` 資料夾交給客戶
+2. 雙擊 `SuperScaner_Setup.bat` → 自動安裝 Git、Python、PaddleOCR v3、所有依賴
+3. 雙擊 `SuperScaner_AutoStart.bat` → 註冊開機自啟動
+4. 完成。開機後自動後台運行，監控 Google Drive
+
+### 部署文件
+| 文件 | 用途 |
+|------|------|
+| `SuperScaner_Setup.bat` + `.ps1` | 環境安裝（一次性） |
+| `SuperScaner_AutoStart.bat` + `.ps1` | 註冊開機自啟（一次性） |
+
+### 系統需求
+- Windows 10/11 x64
+- 網路連線（Google Drive / Gemini API）
+- 其餘由 Setup 腳本自動安裝
+
+---
+
+## 🛠️ 本地開發環境搭建（Mac）
 
 ### 1. 安裝依賴
 
@@ -135,16 +156,14 @@ Super Scaner/
 
 ---
 
-## ☁️ AWS EC2 部署
+## ☁️ AWS EC2 部署（已棄用）
+
+> EC2 t2.micro 只能運行 PaddleOCR v2.x，OCR 精度顯著降低。已改為 Windows 本機部署方案。
 
 ```bash
-# 一鍵部署
-EC2_HOST=13.112.35.6 EC2_USER=ubuntu \
-SSH_KEY="SuperScaner.pem" \
-bash scripts/deploy_ec2.sh
+# 舊版部署命令（僅供參考）
+EC2_HOST=<IP> EC2_USER=ubuntu SSH_KEY="SuperScaner.pem" bash scripts/deploy_ec2.sh
 ```
-
-部署腳本會自動：上傳 secrets → 拉取代碼 → Docker build → 啟動容器 → 安裝備份 cron
 
 ---
 
@@ -185,4 +204,4 @@ MF 標準 27 列 + 原票URL (第28列)
 
 ---
 
-*Generated for Project Super Scaner v2.3 — Generator Pipeline + OCR主導抽出*
+*Generated for Project Super Scaner v2.5 — Windows Deploy + 封筒フィルタ + 科目兜底ルール*

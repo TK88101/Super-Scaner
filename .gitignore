@@ -16,3 +16,4 @@ venv/
 # --- 本地生成的臨時文件 ---
 temp_downloads/
 MF_Import_Data.csv
+benchmark_results*.txt

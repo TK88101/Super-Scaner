@@ -1,8 +1,30 @@
 # 📄 Super Scaner — 產品需求文檔 (PRD)
 
-> **版本:** 2.3
-> **日期:** 2026-03-25
-> **狀態:** Generator Pipeline + OCR主導フィールド抽出、借方補助科目自動決定、ハイライト凡例
+> **版本:** 2.5
+> **日期:** 2026-03-29
+> **狀態:** Windows本番デプロイ完了、x86実機テスト済み、封筒フィルタ+科目兜底ルール追加
+>
+> ### v2.5 変更点 (2026-03-29)
+> - **Windows本番デプロイ**: Setup.bat + AutoStart.bat 一鍵部署スクリプト（中/日/英 3言語対応）
+> - **封筒ページ強制フィルタ**: _is_envelope_page() コードレベル検出（Gemini prompt依存を排除）
+> - **取引先科目兜底ルール**: _VENDOR_ACCOUNT_OVERRIDE でGemini分類ドリフト防止
+> - **Windows console encoding**: sys.stdout.reconfigure + PYTHONUTF8=1 環境変数
+> - **VC++ Redistributable**: PaddlePaddle DLL依存、Setup自動インストール
+> - **google-cloud-vision条件import**: Strategy Cでは不要、ImportError時はNone
+> - **Config自動生成**: .env + service_account.json をSetupスクリプト内蔵（BOMなし出力）
+> - **タスクスケジューラ自動登録**: ログイン時自動起動、クラッシュ1分後再起動
+> - **Azure VM x86 実機テスト完了**: PaddlePaddle 3.0 + PaddleOCR 3.4 動作確認
+>
+> ### v2.4 変更点 (2026-03-26)
+> - OCR主導フィールド抽出、PaddleOCR v2/v3完全互換、小計フィルター、納付書日付
+> - 車両費→旅費交通費統一、ハイライト凡例、取引Noタブ独立管理
+>
+> ### テスト結果 (80頁現金領収書PDF)
+> | 環境 | 日付充填率 | T番号充填率 | No.1-59一致率 | 処理時間 |
+> |------|----------|----------|------------|---------|
+> | **Mac (M-series, v3)** | **100%** | **87.2%** | **基準** | **11分** |
+> | **Azure VM (D2s_v3, v3)** | **100%** | **86.6%** | **95.9%** | **1h42m** |
+> | EC2 (t2.micro, v2) | 低下 | 低下 | — | 5時間+ |
 
 ---
 
