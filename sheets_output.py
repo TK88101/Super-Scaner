@@ -74,22 +74,21 @@ class SheetsOutputWriter:
             ws = self.spreadsheet.add_worksheet(
                 title=tab_name, rows=1000, cols=len(MF_HEADERS)
             )
-            self._write_legend(ws)  # A1-A5: 凡例（5行）
-            ws.append_row(MF_HEADERS, value_input_option='USER_ENTERED')  # Row 6: ヘッダー
+            self._write_legend(ws)  # A1-A4: 凡例（4行）
+            ws.append_row(MF_HEADERS, value_input_option='USER_ENTERED')  # Row 5: ヘッダー
             self._tab_has_data[tab_name] = False
 
         self._ws_cache[tab_name] = ws
         return ws
 
     def _write_legend(self, ws):
-        """ハイライト凡例を A1-A6 に書き込む"""
+        """ハイライト凡例を A1-A5 に書き込む"""
         try:
             legend_rows = [
                 ["【ハイライト凡例】"],
                 ["🔴 赤系: 日付空欄 / 認識不能ページ（一行丸ごと）"],
                 ["🟠 橙系: 取引先空欄 / T番号不正"],
                 ["🟡 黄系: T番号空 / 要確認科目(地代家賃・保険料・雑収入) / 高額(修繕費>30万・備品>10万)"],
-                ["🟣 紫系: 重複疑い（同日付・同金額・同取引先・同摘要）"],
             ]
             ws.append_rows(legend_rows, value_input_option='USER_ENTERED')
 
@@ -100,8 +99,6 @@ class SheetsOutputWriter:
                               CellFormat(backgroundColor=Color(1, 0.9, 0.7)))   # 橙系
             format_cell_range(ws, "A4:A4",
                               CellFormat(backgroundColor=Color(1, 1, 0.7)))     # 黄系
-            format_cell_range(ws, "A5:A5",
-                              CellFormat(backgroundColor=Color(0.85, 0.8, 1)))  # 紫系
         except Exception as e:
             print(f"⚠️ 凡例書き込み失敗: {e}")
 
@@ -115,7 +112,7 @@ class SheetsOutputWriter:
         # 既存データがあれば太黒線で分割
         try:
             row_count = len(ws.get_all_values())
-            if row_count > 7:  # legend(5) + header(1) + 1data row以上
+            if row_count > 6:  # legend(4) + header(1) + 1data row以上
                 separator_row = [""] * len(MF_HEADERS)
                 separator_row[18] = f"──── {filename} ────"
                 ws.append_row(separator_row, value_input_option='USER_ENTERED')
@@ -250,9 +247,6 @@ class SheetsOutputWriter:
                         self._apply_anomaly_highlight(ws, actual_row, flags)
                 except Exception as e:
                     print(f"⚠️ 異常ハイライト適用失敗: {e}")
-
-            # 重複疑い検出（同日付+同金額）
-            self._detect_and_highlight_duplicates(ws, existing_data, rows, pre_write_count)
 
             print(f"💾 Sheets に {len(rows)} 行追加: {tab_name}")
 

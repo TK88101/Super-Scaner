@@ -10,7 +10,7 @@ const TOTAL_COLUMNS = 28;
 const RETENTION_DAYS = 30;
 const TIMEZONE = 'Asia/Tokyo';
 const SKIP_TABS = ['_config'];
-const HEADER_ROWS = 6;
+const HEADER_ROWS = 5;
 
 
 /**
