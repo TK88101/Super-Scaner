@@ -105,22 +105,32 @@ class SheetsOutputWriter:
         except Exception as e:
             print(f"⚠️ 凡例書き込み失敗: {e}")
 
-    def write_separator(self, worksheet, tab_name, label):
-        """分割線を書き込む（摘要列にラベル、上部ボーダー）"""
-        separator_row = [""] * len(MF_HEADERS)
-        separator_row[18] = f"── {label} ──"  # 摘要列 (index 18)
-        worksheet.append_row(separator_row, value_input_option='USER_ENTERED')
+    def start_new_file(self, employee_name, doc_type, filename=""):
+        """新しいPDFファイルの処理開始を通知。分割線+取引No リセット。"""
+        from doc_types import DOC_TYPE_TAB_SUFFIX
+        tab_suffix = DOC_TYPE_TAB_SUFFIX.get(doc_type, "領収書")
+        tab_name = f"{employee_name}_{tab_suffix}"
+        ws = self._get_or_create_tab(tab_name)
 
+        # 既存データがあれば太黒線で分割
         try:
-            row_count = len(worksheet.get_all_values())
-            border_fmt = CellFormat(
-                borders=Borders(
-                    top=Border("SOLID_MEDIUM", Color(0.3, 0.3, 0.3))
+            row_count = len(ws.get_all_values())
+            if row_count > 7:  # legend(5) + header(1) + 1data row以上
+                separator_row = [""] * len(MF_HEADERS)
+                separator_row[18] = f"──── {filename} ────"
+                ws.append_row(separator_row, value_input_option='USER_ENTERED')
+                new_row = len(ws.get_all_values())
+                border_fmt = CellFormat(
+                    borders=Borders(
+                        top=Border("SOLID_THICK", Color(0, 0, 0))
+                    )
                 )
-            )
-            format_cell_range(worksheet, f"A{row_count}:AB{row_count}", border_fmt)
-        except Exception:
-            pass  # ボーダー適用失敗は無視
+                format_cell_range(ws, f"A{new_row}:AB{new_row}", border_fmt)
+        except Exception as e:
+            print(f"⚠️ 分割線書き込み失敗: {e}")
+
+        # 取引No を 1 にリセット
+        self._tab_next_txn[tab_name] = 1
 
     def append_entries(self, employee_name, doc_type, entries_data, source_url=""):
         """
@@ -139,13 +149,6 @@ class SheetsOutputWriter:
         tab_suffix = DOC_TYPE_TAB_SUFFIX.get(doc_type, "領収書")
         tab_name = f"{employee_name}_{tab_suffix}"
         ws = self._get_or_create_tab(tab_name)
-
-        # 既存データがあれば分割線（同一 tab への初回書き込み時のみ）
-        if self._tab_has_data.get(tab_name, False):
-            now_jst = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
-            label = f"{entries_data.get('vendor', '不明')} ({now_jst})"
-            self.write_separator(ws, tab_name, label)
-            self._tab_has_data[tab_name] = False  # 以降の書き込みでは分割線不要
 
         entries = entries_data.get("entries", [])
         if not entries:

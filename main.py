@@ -268,6 +268,9 @@ def main():
                     # 4. 下載與處理
                     local_path = download_file(service, file_id, file_name)
 
+                    # PDF 間分割線 + 取引No リセット
+                    sheets_writer.start_new_file(uploader_name, doc_type, file_name)
+
                     success = process_file(
                         service, sheets_writer, local_path,
                         uploader_name, chat_id,

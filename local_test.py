@@ -104,7 +104,9 @@ def process_local_file(file_info, sheets_writer, strategy=None):
                   f"({entry.get('debit_tax_type')}) → "
                   f"貸方: {entry.get('credit_account')} ({entry.get('credit_tax_type')})")
 
-        # 即座に Google Sheets 書き込み
+        # 即座に Google Sheets 書き込み（初回のみ分割線+No リセット）
+        if count == 1:
+            sheets_writer.start_new_file("LocalTest", doc_type, file_name)
         r["uploader"] = "LocalTest"
         sheets_writer.append_entries(
             employee_name="LocalTest",
