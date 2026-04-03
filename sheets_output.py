@@ -74,21 +74,22 @@ class SheetsOutputWriter:
             ws = self.spreadsheet.add_worksheet(
                 title=tab_name, rows=1000, cols=len(MF_HEADERS)
             )
-            self._write_legend(ws)  # A1-A3: 凡例
-            ws.append_row(MF_HEADERS, value_input_option='USER_ENTERED')  # Row 4: ヘッダー
+            self._write_legend(ws)  # A1-A5: 凡例（5行）
+            ws.append_row(MF_HEADERS, value_input_option='USER_ENTERED')  # Row 6: ヘッダー
             self._tab_has_data[tab_name] = False
 
         self._ws_cache[tab_name] = ws
         return ws
 
     def _write_legend(self, ws):
-        """ハイライト凡例を A1-A4 に書き込む"""
+        """ハイライト凡例を A1-A6 に書き込む"""
         try:
             legend_rows = [
                 ["【ハイライト凡例】"],
-                ["🔴 赤系: 日付空欄（要手動入力）"],
+                ["🔴 赤系: 日付空欄 / 認識不能ページ（一行丸ごと）"],
                 ["🟠 橙系: 取引先空欄 / T番号不正"],
                 ["🟡 黄系: T番号空 / 要確認科目(地代家賃・保険料・雑収入) / 高額(修繕費>30万・備品>10万)"],
+                ["🟣 紫系: 重複疑い（同日付・同金額）"],
             ]
             ws.append_rows(legend_rows, value_input_option='USER_ENTERED')
 
@@ -99,6 +100,8 @@ class SheetsOutputWriter:
                               CellFormat(backgroundColor=Color(1, 0.9, 0.7)))   # 橙系
             format_cell_range(ws, "A4:A4",
                               CellFormat(backgroundColor=Color(1, 1, 0.7)))     # 黄系
+            format_cell_range(ws, "A5:A5",
+                              CellFormat(backgroundColor=Color(0.85, 0.8, 1)))  # 紫系
         except Exception as e:
             print(f"⚠️ 凡例書き込み失敗: {e}")
 
@@ -130,7 +133,7 @@ class SheetsOutputWriter:
             source_url: 原票 PDF の webViewLink
         """
         from doc_types import DOC_TYPE_TAB_SUFFIX
-        from config import ACCOUNT_MAP, UNKNOWN_ACCOUNT, CREDIT_SUB_ACCOUNT_RECEIPT
+        from config import ACCOUNT_MAP, UNKNOWN_ACCOUNT, CREDIT_SUB_ACCOUNT_RECEIPT, CREDIT_ONLY_ACCOUNTS
         from anomaly_detector import detect_anomalies
 
         tab_suffix = DOC_TYPE_TAB_SUFFIX.get(doc_type, "領収書")
@@ -146,7 +149,10 @@ class SheetsOutputWriter:
 
         entries = entries_data.get("entries", [])
         if not entries:
-            print("⚠️ 書き込み対象の仕訳がありません")
+            if entries_data.get("_unrecognized"):
+                self._write_unrecognized_row(ws, tab_name, entries_data, source_url)
+            else:
+                print("⚠️ 書き込み対象の仕訳がありません")
             return
 
         uploader_name = entries_data.get('uploader', employee_name)
@@ -167,6 +173,9 @@ class SheetsOutputWriter:
             debit_account = entry.get("debit_account", "")
             debit_account = ACCOUNT_MAP.get(debit_account, debit_account)
             if not debit_account:
+                debit_account = UNKNOWN_ACCOUNT
+            # 貸方専用科目が借方に出現した場合は未確定勘定に置換
+            if debit_account in CREDIT_ONLY_ACCOUNTS:
                 debit_account = UNKNOWN_ACCOUNT
 
             credit_account = entry.get("credit_account", "")
@@ -219,8 +228,9 @@ class SheetsOutputWriter:
         transaction_no += 1
 
         if rows:
-            # 書き込み前の行数を取得（ハイライト位置計算用）
-            pre_write_count = len(ws.get_all_values())
+            # 書き込み前のデータを取得（ハイライト位置計算+重複検出用）
+            existing_data = ws.get_all_values()
+            pre_write_count = len(existing_data)
 
             # 一括書き込み（リトライ付き）
             self._write_with_retry(ws, rows)
@@ -237,6 +247,9 @@ class SheetsOutputWriter:
                         self._apply_anomaly_highlight(ws, actual_row, flags)
                 except Exception as e:
                     print(f"⚠️ 異常ハイライト適用失敗: {e}")
+
+            # 重複疑い検出（同日付+同金額）
+            self._detect_and_highlight_duplicates(ws, existing_data, rows, pre_write_count)
 
             print(f"💾 Sheets に {len(rows)} 行追加: {tab_name}")
 
@@ -316,6 +329,103 @@ class SheetsOutputWriter:
                 cell_ref = f"{col_letter}{row_num}"
                 fmt = CellFormat(backgroundColor=color)
                 format_cell_range(worksheet, cell_ref, fmt)
+
+
+    def _write_unrecognized_row(self, ws, tab_name, entries_data, source_url):
+        """認識不能/部分認識ページの占位行を書き込み、ハイライト適用"""
+        date = entries_data.get("date", "") or ""
+        vendor = entries_data.get("vendor", "") or ""
+        has_partial = bool(date or vendor)
+
+        now_jst = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
+        txn_no = self._get_next_txn_no(tab_name, ws)
+
+        row = [""] * len(MF_HEADERS)
+        row[0] = txn_no              # 取引No
+        row[1] = date                # 取引日
+        row[5] = vendor              # 借方取引先
+        if has_partial:
+            row[18] = "⚠ 部分認識（金額なし）"
+        else:
+            row[18] = "⚠ 認識不能ページ"
+        row[23] = now_jst            # 作成日時
+        row[25] = now_jst            # 最終更新日時
+        row[27] = source_url         # 原票URL
+
+        pre_write = len(ws.get_all_values())
+        self._write_with_retry(ws, [row])
+        self._tab_next_txn[tab_name] = txn_no + 1
+
+        actual_row = pre_write + 1
+
+        try:
+            fmt_red = CellFormat(backgroundColor=Color(1, 0.8, 0.8))
+            if has_partial:
+                format_cell_range(ws, f"I{actual_row}", fmt_red)
+                if not date:
+                    format_cell_range(ws, f"B{actual_row}", fmt_red)
+                if not vendor:
+                    format_cell_range(ws, f"F{actual_row}", fmt_red)
+            else:
+                format_cell_range(ws, f"A{actual_row}:AB{actual_row}", fmt_red)
+        except Exception as e:
+            print(f"⚠️ 認識不能ハイライト適用失敗: {e}")
+
+        label = "部分認識" if has_partial else "認識不能"
+        print(f"⚠️ {label}ページを記録: {tab_name} (Row {actual_row})")
+
+    @staticmethod
+    def _normalize_amount(val):
+        """金額文字列を正規化（カンマ・小数点を除去して int 比較可能にする）"""
+        try:
+            return int(str(val).replace(",", "").replace(".", "").strip())
+        except (ValueError, TypeError):
+            return None
+
+    def _detect_and_highlight_duplicates(self, ws, existing_data, new_rows, pre_write_count):
+        """重複疑い検出: 同じ日付+金額の行をハイライト"""
+        try:
+            all_data = existing_data + new_rows
+
+            # Build (date, amount) -> [row_numbers] map
+            pair_map = {}
+            for i, row in enumerate(all_data):
+                txn = row[0] if row else ""
+                try:
+                    int(txn)
+                except (ValueError, TypeError):
+                    continue
+
+                date = row[1] if len(row) > 1 else ""
+                raw_amount = row[8] if len(row) > 8 else ""
+                amount = self._normalize_amount(raw_amount)
+                if not date or amount is None:
+                    continue
+                key = (date, amount)
+                if key not in pair_map:
+                    pair_map[key] = []
+                pair_map[key].append(i + 1)  # 1-based row number
+
+            start_new = pre_write_count + 1
+            end_new = pre_write_count + len(new_rows)
+            dup_fmt = CellFormat(backgroundColor=Color(0.85, 0.8, 1))
+            highlighted = 0
+
+            for key, row_nums in pair_map.items():
+                if len(row_nums) < 2:
+                    continue
+                has_new = any(start_new <= r <= end_new for r in row_nums)
+                if not has_new:
+                    continue
+                for r in row_nums:
+                    format_cell_range(ws, f"B{r}", dup_fmt)
+                    format_cell_range(ws, f"I{r}", dup_fmt)
+                    highlighted += 1
+
+            if highlighted > 0:
+                print(f"🔄 重複疑い検出: {highlighted}行をハイライトしました")
+        except Exception as e:
+            print(f"⚠️ 重複検出処理失敗: {e}")
 
 
 def _sanitize_invoice_num(raw):

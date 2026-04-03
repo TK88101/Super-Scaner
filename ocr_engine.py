@@ -449,37 +449,58 @@ def _extract_invoice_num_from_ocr(ocr_text):
     return None
 
 
-# ── 封筒・非領収書ページ検出 ──
+# ── 不要ページ検出（封筒・送付状・裏面メモ・挨拶状）──
 _ENVELOPE_KEYWORDS = ["郵便", "切手", "〒", "封筒", "差出人", "親展", "書留", "速達", "配達証明"]
+_COVER_LETTER_KEYWORDS = ["送付状", "送り状", "ご査収", "同封", "送付いたします", "お届けいたします"]
+_GREETING_KEYWORDS = ["よろしくお願い", "お世話になっております", "ご挨拶", "拝啓", "敬具", "謹啓"]
+_FINANCIAL_KEYWORDS = ["領収", "請求", "合計", "小計", "税込", "お買上", "￥", "¥", "円"]
+
 
 def _is_envelope_page(ocr_text, raw_data):
-    """OCR テキストとGemini結果から封筒ページかどうかを判定する。
-    Gemini prompt だけでは不安定なので、コードレベルで強制フィルタする。
+    """不要ページ（封筒・送付状・裏面メモ・挨拶状）を検出する。
+    NOTE: 空白ページや documents=[] は認識不能として扱い、ここでは除外しない。
     """
     if not ocr_text:
         return False
 
     text_lower = ocr_text.replace(" ", "")
+    has_financial_kw = any(kw in text_lower for kw in _FINANCIAL_KEYWORDS)
 
-    # 条件1: 封筒関連キーワードが含まれ、かつ「領収」「請求」等のキーワードがない
-    has_envelope_kw = any(kw in text_lower for kw in _ENVELOPE_KEYWORDS)
-    has_receipt_kw = any(kw in text_lower for kw in ["領収", "請求", "合計", "小計", "税込", "お買上"])
-
-    if has_envelope_kw and not has_receipt_kw:
+    # 封筒: 封筒キーワードあり + 金額関連なし
+    if any(kw in text_lower for kw in _ENVELOPE_KEYWORDS) and not has_financial_kw:
         return True
 
-    # 条件2: Gemini が documents=[] を返した場合
-    if isinstance(raw_data, dict):
-        docs = raw_data.get("documents", None)
-        if docs is not None and len(docs) == 0:
-            return True
+    # 送付状: 送付状キーワードあり + 金額関連なし
+    if any(kw in text_lower for kw in _COVER_LETTER_KEYWORDS) and not has_financial_kw:
+        return True
 
-    # 条件3: OCR テキストが極端に短い（20文字未満）= ほぼ空白ページ
+    # 挨拶状: 挨拶キーワードあり + 金額関連なし
+    if any(kw in text_lower for kw in _GREETING_KEYWORDS) and not has_financial_kw:
+        return True
+
+    # 裏面メモ: 短いテキスト（30文字未満）+ 金額関連なし + 数字金額パターンなし
     clean_text = re.sub(r'\s+', '', ocr_text)
-    if len(clean_text) < 20:
+    has_numeric_amount = bool(re.search(r'\d{3,}', clean_text))
+    if len(clean_text) < 30 and not has_financial_kw and not has_numeric_amount:
         return True
 
     return False
+
+
+def _extract_partial_data(raw_data):
+    """認識不能ページから部分データ（日付・取引先）を抽出"""
+    date = ""
+    vendor = ""
+    if isinstance(raw_data, dict):
+        docs = raw_data.get("documents", [])
+        if docs:
+            date = docs[0].get("date", "") or ""
+            vendor = docs[0].get("vendor", "") or ""
+        if not date:
+            date = raw_data.get("date", "") or ""
+        if not vendor:
+            vendor = raw_data.get("vendor", "") or ""
+    return date, vendor
 
 
 # ── 取引先名に基づく科目兜底ルール ──
@@ -797,14 +818,18 @@ def _build_entries_for_single_doc(doc):
     pay_method = str(doc.get("payment_method", "現金"))
     credit_account = _determine_credit_account(pay_method, doc_category)
 
+    # 有効金額の品目数を事前カウント（領収証の単一合計行を誤フィルタ防止）
+    valid_items = [it for it in doc.get("items", [])
+                   if it.get("amount") and int(it.get("amount", 0)) != 0]
+
     for item in doc.get("items", []):
         amount = item.get("amount", 0)
         if not amount or int(amount) == 0:
             continue
 
-        # 小計/合計行をスキップ（Gemini が集計行を品目として返す場合がある）
+        # 小計/合計行をスキップ（ただし有効品目が1件のみの場合はスキップしない）
         desc = str(item.get("description", "")).strip()
-        if _is_subtotal_line(desc, int(amount), doc.get("items", [])):
+        if len(valid_items) > 1 and _is_subtotal_line(desc, int(amount), doc.get("items", [])):
             continue
 
         tax_rate = item.get("tax_rate", 0.10)
@@ -1201,7 +1226,22 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None):
 
                     page_results = _normalize_receipt_results(page_raw_data, prefix=prefix)
                     if not page_results:
-                        print(f"{prefix}⚠️ 有効な仕訳エントリが見つかりません")
+                        print(f"{prefix}⚠️ 有効な仕訳エントリが見つかりません → 認識不能として記録")
+                        p_date, p_vendor = _extract_partial_data(page_raw_data)
+                        yield {
+                            "result": {
+                                "date": p_date,
+                                "vendor": p_vendor,
+                                "invoice_num": "",
+                                "memo": "",
+                                "entries": [],
+                                "_unrecognized": True,
+                            },
+                            "page_num": idx,
+                            "total_pages": total,
+                        }
+                        yielded += 1
+                        gc.collect()
                         continue
 
                     for entry in page_results:
@@ -1303,6 +1343,19 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None):
         if doc_type == DocType.RECEIPT:
             results = _normalize_receipt_results(raw_data)
             if not results:
+                p_date, p_vendor = _extract_partial_data(raw_data)
+                yield {
+                    "result": {
+                        "date": p_date,
+                        "vendor": p_vendor,
+                        "invoice_num": "",
+                        "memo": "",
+                        "entries": [],
+                        "_unrecognized": True,
+                    },
+                    "page_num": 1,
+                    "total_pages": 1,
+                }
                 return
             for entry in results:
                 yield {
