@@ -2,7 +2,7 @@
 import re
 import time
 import gspread
-from gspread_formatting import CellFormat, Color, format_cell_range, Border, Borders
+from gspread_formatting import CellFormat, Color, format_cell_range, format_cell_ranges, Border, Borders
 from datetime import datetime, timezone, timedelta
 
 JST = timezone(timedelta(hours=9))
@@ -410,7 +410,7 @@ class SheetsOutputWriter:
             start_new = pre_write_count + 1
             end_new = pre_write_count + len(new_rows)
             dup_fmt = CellFormat(backgroundColor=Color(0.85, 0.8, 1))
-            highlighted = 0
+            batch_ranges = []
 
             for key, row_nums in pair_map.items():
                 if len(row_nums) < 2:
@@ -419,12 +419,12 @@ class SheetsOutputWriter:
                 if not has_new:
                     continue
                 for r in row_nums:
-                    format_cell_range(ws, f"B{r}", dup_fmt)
-                    format_cell_range(ws, f"I{r}", dup_fmt)
-                    highlighted += 1
+                    batch_ranges.append((f"B{r}", dup_fmt))
+                    batch_ranges.append((f"I{r}", dup_fmt))
 
-            if highlighted > 0:
-                print(f"🔄 重複疑い検出: {highlighted}行をハイライトしました")
+            if batch_ranges:
+                format_cell_ranges(ws, batch_ranges)
+                print(f"🔄 重複疑い検出: {len(batch_ranges) // 2}行をハイライトしました")
         except Exception as e:
             print(f"⚠️ 重複検出処理失敗: {e}")
 
