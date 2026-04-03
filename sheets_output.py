@@ -422,6 +422,14 @@ class SheetsOutputWriter:
                 has_new = any(start_new <= r <= end_new for r in row_nums)
                 if not has_new:
                     continue
+                # 同一取引No 内の重複はスキップ（同一レシートの複数品目は重複ではない）
+                # 異なる取引No で完全一致した場合のみ重複疑い
+                txn_nos = set()
+                for r in row_nums:
+                    row_data = all_data[r - 1]
+                    txn_nos.add(str(row_data[0]) if row_data else "")
+                if len(txn_nos) <= 1:
+                    continue  # 全て同一レシート → 重複ではない
                 for r in row_nums:
                     batch_ranges.append((f"B{r}", dup_fmt))
                     batch_ranges.append((f"I{r}", dup_fmt))
