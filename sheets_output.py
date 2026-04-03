@@ -89,7 +89,7 @@ class SheetsOutputWriter:
                 ["🔴 赤系: 日付空欄 / 認識不能ページ（一行丸ごと）"],
                 ["🟠 橙系: 取引先空欄 / T番号不正"],
                 ["🟡 黄系: T番号空 / 要確認科目(地代家賃・保険料・雑収入) / 高額(修繕費>30万・備品>10万)"],
-                ["🟣 紫系: 重複疑い（同日付・同金額・同取引先）"],
+                ["🟣 紫系: 重複疑い（同日付・同金額・同取引先・同摘要）"],
             ]
             ws.append_rows(legend_rows, value_input_option='USER_ENTERED')
 
@@ -383,11 +383,11 @@ class SheetsOutputWriter:
             return None
 
     def _detect_and_highlight_duplicates(self, ws, existing_data, new_rows, pre_write_count):
-        """重複疑い検出: 同日付+同金額+同取引先の行をハイライト"""
+        """重複疑い検出: 同日付+同金額+同取引先+同摘要の行をハイライト"""
         try:
             all_data = existing_data + new_rows
 
-            # Build (date, amount, vendor) -> [row_numbers] map
+            # Build (date, amount, vendor, description) -> [row_numbers] map
             pair_map = {}
             for i, row in enumerate(all_data):
                 txn = row[0] if row else ""
@@ -399,10 +399,11 @@ class SheetsOutputWriter:
                 date = row[1] if len(row) > 1 else ""
                 vendor = row[5] if len(row) > 5 else ""
                 raw_amount = row[8] if len(row) > 8 else ""
+                desc = row[18] if len(row) > 18 else ""
                 amount = self._normalize_amount(raw_amount)
                 if not date or amount is None:
                     continue
-                key = (date, amount, vendor)
+                key = (date, amount, vendor, desc)
                 if key not in pair_map:
                     pair_map[key] = []
                 pair_map[key].append(i + 1)  # 1-based row number
