@@ -404,6 +404,16 @@ def _extract_date_from_ocr(ocr_text):
         year = 2018 + int(m.group(1))
         return f"{year}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
 
+    # パターン6: YY-MM-DD (ATM明細の令和年号: 07-04-30 = 令和7年4月30日)
+    # 「ご利用年月日」等のATMキーワード近くにある場合のみ
+    if any(kw in ocr_text for kw in ["ご利用年月日", "キャッシュサービス", "ATM", "お取引"]):
+        m = re.search(r'(?<!\d)(0[4-9]|1\d)-(\d{2})-(\d{2})(?!\d)', ocr_text)
+        if m:
+            year = 2018 + int(m.group(1))
+            month, day = int(m.group(2)), int(m.group(3))
+            if 1 <= month <= 12 and 1 <= day <= 31:
+                return f"{year}/{month:02d}/{day:02d}"
+
     return None
 
 
@@ -462,11 +472,14 @@ def _extract_invoice_num_from_ocr(ocr_text):
 _ENVELOPE_KEYWORDS = ["郵便", "切手", "〒", "封筒", "差出人", "親展", "書留", "速達", "配達証明"]
 _COVER_LETTER_KEYWORDS = ["送付状", "送り状", "ご査収", "同封", "送付いたします", "お届けいたします"]
 _GREETING_KEYWORDS = ["よろしくお願い", "お世話になっております", "ご挨拶", "拝啓", "敬具", "謹啓"]
-_FINANCIAL_KEYWORDS = ["領収", "請求", "合計", "小計", "税込", "お買上", "￥", "¥", "円"]
+_FINANCIAL_KEYWORDS = ["領収", "請求", "合計", "小計", "税込", "お買上", "￥", "¥", "円",
+                       "金額", "振込", "納付", "支払"]
+_PAMPHLET_KEYWORDS = ["制度", "仕組み", "チャート", "についてのご案内", "とは？", "処分の流れ",
+                      "についての留意", "についてのお知らせ"]
 
 
 def _is_envelope_page(ocr_text, raw_data):
-    """不要ページ（封筒・送付状・裏面メモ・挨拶状）を検出する。
+    """不要ページ（封筒・送付状・裏面メモ・挨拶状・説明書）を検出する。
     NOTE: 空白ページや documents=[] は認識不能として扱い、ここでは除外しない。
     """
     if not ocr_text:
@@ -487,7 +500,11 @@ def _is_envelope_page(ocr_text, raw_data):
     if any(kw in text_lower for kw in _GREETING_KEYWORDS) and not has_financial_kw:
         return True
 
-    # 裏面メモ: 短いテキスト（30文字未満）+ 金額関連なし + 数字金額パターンなし
+    # 説明書・パンフレット: 説明キーワードあり + 金額関連なし
+    if any(kw in text_lower for kw in _PAMPHLET_KEYWORDS) and not has_financial_kw:
+        return True
+
+    # 裏面メモ/カード控え裏面: 短いテキスト（30文字未満）+ 金額関連なし + 数字金額パターンなし
     clean_text = re.sub(r'\s+', '', ocr_text)
     has_numeric_amount = bool(re.search(r'\d{3,}', clean_text))
     if len(clean_text) < 30 and not has_financial_kw and not has_numeric_amount:
@@ -595,10 +612,16 @@ def _apply_ocr_overrides(raw_data, ocr_text, prefix=""):
 
     # documents 配列がある場合（領収書新フォーマット）
     if isinstance(raw_data, dict) and "documents" in raw_data:
-        for doc in raw_data.get("documents", []):
+        docs = raw_data.get("documents", [])
+        is_multi_doc = len(docs) > 1
+        for doc in docs:
             if ocr_date:
                 gemini_date = doc.get("date", "")
-                if _should_override_date(gemini_date, ocr_date):
+                # 複数書類ページ: Gemini が有効な日付を持つ場合は上書きしない
+                # （OCR はページ全体から1つの日付しか抽出できず、書類ごとの日付を区別できない）
+                if is_multi_doc and gemini_date and _validate_gemini_date(gemini_date):
+                    pass  # Gemini の書類ごとの日付を維持
+                elif _should_override_date(gemini_date, ocr_date):
                     if gemini_date != ocr_date:
                         print(f"{prefix}📅 日付上書: Gemini={gemini_date} → OCR={ocr_date}")
                     doc["date"] = ocr_date
@@ -610,7 +633,8 @@ def _apply_ocr_overrides(raw_data, ocr_text, prefix=""):
                 if not validated:
                     print(f"{prefix}⚠️ 日付不明: Gemini={doc.get('date','')} → 空欄（要確認）")
                 doc["date"] = validated
-            if ocr_tnum:
+            if ocr_tnum and not is_multi_doc:
+                # T番号も複数書類ページでは上書きしない（書類ごとにT番号が異なるため）
                 gemini_tnum = doc.get("invoice_num", "")
                 if gemini_tnum != ocr_tnum:
                     print(f"{prefix}🔢 T番号上書: Gemini={gemini_tnum} → OCR={ocr_tnum}")
@@ -686,6 +710,7 @@ PROMPTS = {
 - 飲食店・レストラン・居酒屋・カフェ・バー・ドーナツ店・弁当店・ベーカリー等での飲食代 → "接待交際費"
 - デパ地下・百貨店催事場での食品購入 → "接待交際費"
 - 美容院・サロン・エステ・整体・鍼灸等の施術代 → "接待交際費"
+- ホテル・施設のフロントサービス・スタジオ利用・イートイン飲食 → "接待交際費"（"地代家賃"にしないこと）
 - ガソリンスタンド・駐車場・高速道路料金 → "旅費交通費"
 - レンタカー → "旅費交通費"
 - タクシー → "旅費交通費"
@@ -724,6 +749,7 @@ PROMPTS = {
 - 金額は数値型(カンマなし)で返してください
 - 封筒（郵便封筒・切手のみの画像）は書類ではありません。封筒が検出された場合は documents を空配列 [] で返してください
 - items には個別の品目のみ含めてください。小計・合計・税込合計・「10%対象」等の集計行は含めないでください
+- 乗車券・切符・交通チケット等は、金額が記載されていれば items に含めてください（debit_account: "旅費交通費"）
 - 振込受取書では、vendor は振込依頼人（支払い元の会社名）を記載してください
 """,
 
