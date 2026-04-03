@@ -363,10 +363,11 @@ def _extract_date_from_ocr(ocr_text):
 
     # パターン1: 2026年1月27日, 2026年 1月27日（火）, 2026年01月10日
     # 宣伝文（終了/有効期限/まで/開始）の日付を除外し、取引日を優先
-    _promo_keywords = ["終了", "有効期限", "まで", "開始", "お知らせ", "変更"]
+    _promo_keywords = ["終了", "有効期限", "まで", "開始", "お知らせ", "変更",
+                       "ご利用ください", "ポイント", "カード", "キャンペーン"]
     matches_p1 = list(re.finditer(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', ocr_text))
     for m in matches_p1:
-        ctx = ocr_text[max(0, m.start()-30):min(len(ocr_text), m.end()+30)]
+        ctx = ocr_text[max(0, m.start()-50):min(len(ocr_text), m.end()+50)]
         if any(kw in ctx for kw in _promo_keywords):
             continue
         return f"{m.group(1)}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
@@ -558,11 +559,31 @@ def _override_account_by_vendor(vendor, gemini_account):
     return gemini_account
 
 
+def _should_override_date(gemini_date, ocr_date):
+    """OCR 日付で Gemini 日付を上書きすべきか判定する。
+    Gemini が近年の有効日付を持ち、OCR がそれより未来の年を返した場合は
+    OCR が宣伝日付を誤抽出した可能性が高いため上書きしない。
+    """
+    if not gemini_date or not ocr_date:
+        return bool(ocr_date)
+    try:
+        g_year = int(gemini_date.split("/")[0])
+        o_year = int(ocr_date.split("/")[0])
+        # Gemini が近年の日付（>= 2024）で OCR が未来の年 → 宣伝日付の可能性大
+        if g_year >= 2024 and o_year > g_year:
+            return False
+    except (ValueError, IndexError):
+        pass
+    return True
+
+
 def _apply_ocr_overrides(raw_data, ocr_text, prefix=""):
     """OCR テキストから抽出した日付・T番号で Gemini の結果を上書きする。
 
     Gemini は日付の年号解釈を間違えやすい（26年→2014年等）が、
     PaddleOCR のテキストから正規表現で抽出すれば確実。
+    ただし Gemini が有効な日付を持つ場合、OCR が宣伝日付を誤抽出した可能性があるため
+    年が大きく異なる場合は上書きしない。
     """
     if not raw_data:
         return
@@ -577,9 +598,12 @@ def _apply_ocr_overrides(raw_data, ocr_text, prefix=""):
         for doc in raw_data.get("documents", []):
             if ocr_date:
                 gemini_date = doc.get("date", "")
-                if gemini_date != ocr_date:
-                    print(f"{prefix}📅 日付上書: Gemini={gemini_date} → OCR={ocr_date}")
-                doc["date"] = ocr_date
+                if _should_override_date(gemini_date, ocr_date):
+                    if gemini_date != ocr_date:
+                        print(f"{prefix}📅 日付上書: Gemini={gemini_date} → OCR={ocr_date}")
+                    doc["date"] = ocr_date
+                else:
+                    print(f"{prefix}📅 OCR日付を無視（Gemini={gemini_date}, OCR={ocr_date}）")
             else:
                 # OCR 抽出できなくても無効日付は修正
                 validated = _validate_gemini_date(doc.get("date", ""))
