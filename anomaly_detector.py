@@ -54,7 +54,7 @@ def detect_anomalies(entry, parent_data=None):
                     "type": "tax_review",
                     "message": f"租税公課に{keyword}が含まれています（¥{amount:,}）",
                     "severity": "low",
-                    "col": 8,
+                    "full_row": True,
                 })
                 break
 

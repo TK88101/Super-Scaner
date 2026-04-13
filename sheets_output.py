@@ -309,7 +309,7 @@ class SheetsOutputWriter:
         return entry.get("credit_sub_account", "")
 
     def _apply_anomaly_highlight(self, worksheet, row_num, flags):
-        """異常セルにハイライトを適用（該当セルのみ）"""
+        """異常セルにハイライトを適用（該当セルのみ or 全行）"""
         for flag in flags:
             severity = flag.get("severity", "low")
             if severity == "high":
@@ -319,13 +319,17 @@ class SheetsOutputWriter:
             else:
                 color = Color(1, 1, 0.7)       # 薄い黄色
 
-            col_index = flag.get("col")
-            if col_index is not None:
-                # 該当セルのみハイライト (0始まり → A=1)
-                col_letter = chr(ord('A') + col_index)
-                cell_ref = f"{col_letter}{row_num}"
-                fmt = CellFormat(backgroundColor=color)
+            fmt = CellFormat(backgroundColor=color)
+
+            if flag.get("full_row"):
+                cell_ref = f"A{row_num}:AB{row_num}"
                 format_cell_range(worksheet, cell_ref, fmt)
+            else:
+                col_index = flag.get("col")
+                if col_index is not None:
+                    col_letter = chr(ord('A') + col_index)
+                    cell_ref = f"{col_letter}{row_num}"
+                    format_cell_range(worksheet, cell_ref, fmt)
 
 
     def _write_unrecognized_row(self, ws, tab_name, entries_data, source_url):
