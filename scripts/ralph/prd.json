@@ -1,0 +1,36 @@
+{
+  "project": "Super Scaner",
+  "branchName": "ralph/full-row-highlight",
+  "description": "Full-row highlight for tax (rental/diesel tax under 租税公課) and undetermined account (未確定勘定) entries in Google Sheets output",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Full-row highlight for 租税公課 entries containing 宿泊税 or 軽油税",
+      "description": "As an accountant, I want the entire row highlighted in yellow when debit account is 租税公課 and the description contains 宿泊税 or 軽油税, so I can spot these tax entries at a glance.",
+      "acceptanceCriteria": [
+        "In anomaly_detector.py, modify the existing tax_review rule (debit_account == '租税公課' block): add 'full_row': true to the flag dict and remove 'col': 8",
+        "In sheets_output.py, modify _apply_anomaly_highlight: when flag.get('full_row') is truthy, apply highlight to range A{row}:AB{row} instead of a single cell; otherwise keep existing single-cell logic unchanged",
+        "Color remains yellow (severity 'low', Color(1, 1, 0.7)) for the full row",
+        "Existing cell-level highlights for other anomaly types (date-empty, vendor-empty, high-amount, etc.) are unaffected",
+        "Tests pass: mock entry {'debit_account': '租税公課', 'description': '宿泊税', 'amount': 200} produces a flag with full_row=true and no col field"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-002",
+      "title": "Full-row highlight for 未確定勘定 entries",
+      "description": "As an accountant, I want the entire row highlighted in orange when the debit account is 未確定勘定, so I can immediately see which entries need manual classification.",
+      "acceptanceCriteria": [
+        "In anomaly_detector.py, add new rule: when debit_account == UNKNOWN_ACCOUNT (import from config.py, value '未確定勘定'), append flag with type 'undetermined_account', severity 'medium', full_row true, and no col field",
+        "The _apply_anomaly_highlight method (already updated in US-001) applies orange highlight Color(1, 0.9, 0.7) to A{row}:AB{row} for this flag",
+        "Triggers for both paths that produce 未確定勘定: empty debit account fallback AND CREDIT_ONLY_ACCOUNTS replacement (both resolved in sheets_output.py before detect_anomalies is called)",
+        "Tests pass: mock entry {'debit_account': '未確定勘定', 'amount': 5000} produces a flag with type 'undetermined_account', severity 'medium', full_row true"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    }
+  ]
+}

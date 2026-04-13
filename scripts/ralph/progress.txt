@@ -1,0 +1,32 @@
+# Ralph Progress Log
+Started: Mon Apr 13 17:47:19 JST 2026
+---
+
+## Codebase Patterns
+- anomaly_detector.py flags use `col` (0-based index) for single-cell highlighting and `full_row: True` for full-row highlighting
+- sheets_output.py `_apply_anomaly_highlight` dispatches on `flag.get("full_row")` vs `flag.get("col")`
+- Color mapping: high=red(1,0.8,0.8), medium=orange(1,0.9,0.7), low=yellow(1,1,0.7)
+- Full-row range uses A{row}:AB{row} (28 columns)
+- UNKNOWN_ACCOUNT constant is defined in config.py as "未確定勘定"
+
+## 2026-04-13 17:48 JST - US-001
+- Modified tax_review rule in anomaly_detector.py: replaced `col: 8` with `full_row: True`
+- Updated _apply_anomaly_highlight in sheets_output.py: added full_row branch that formats A{row}:AB{row} range; existing col-based logic preserved in else branch
+- Files changed: anomaly_detector.py, sheets_output.py
+- **Learnings for future iterations:**
+  - The anomaly flag schema is a simple dict with optional keys (type, message, severity, col, full_row)
+  - `col` and `full_row` are mutually exclusive — a flag should have one or the other
+  - format_cell_range from gspread_formatting accepts range strings like "A5:AB5"
+  - Existing tests for other anomaly types (account_review, missing_date, etc.) are unaffected since they retain `col`
+---
+
+## 2026-04-13 17:49 JST - US-002
+- Added `from config import UNKNOWN_ACCOUNT` to anomaly_detector.py
+- Added new undetermined_account detection rule: when debit_account == UNKNOWN_ACCOUNT, appends flag with type='undetermined_account', severity='medium', full_row=True
+- No changes needed in sheets_output.py — the full_row + medium severity logic from US-001 already handles orange A:AB range formatting
+- Files changed: anomaly_detector.py
+- **Learnings for future iterations:**
+  - UNKNOWN_ACCOUNT is imported from config.py (value: '未確定勘定') — do not hardcode the string
+  - The undetermined_account rule fires for both empty-debit-fallback and CREDIT_ONLY_ACCOUNTS replacement paths, since both resolve in sheets_output.py before detect_anomalies is called
+  - sheets_output.py already imports UNKNOWN_ACCOUNT for its own logic — anomaly_detector.py now also imports it
+---
