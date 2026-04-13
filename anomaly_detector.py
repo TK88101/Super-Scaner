@@ -1,5 +1,6 @@
 # anomaly_detector.py — 異常検出モジュール
 import re
+from config import UNKNOWN_ACCOUNT
 
 
 def detect_anomalies(entry, parent_data=None):
@@ -57,6 +58,15 @@ def detect_anomalies(entry, parent_data=None):
                     "full_row": True,
                 })
                 break
+
+    # 未確定勘定: debit_account fallback or CREDIT_ONLY_ACCOUNTS replacement
+    if debit_account == UNKNOWN_ACCOUNT:
+        flags.append({
+            "type": "undetermined_account",
+            "message": f"未確定勘定です（¥{amount:,}）— 手動で科目を確定してください",
+            "severity": "medium",
+            "full_row": True,
+        })
 
     # 備品・消耗品費 > 10万
     if debit_account == "備品・消耗品費" and amount > 100000:
