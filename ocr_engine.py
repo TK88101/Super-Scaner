@@ -3,7 +3,10 @@ import io
 import json
 import re
 import gc
+import time
+import http.client
 import google.generativeai as genai
+from google.api_core import exceptions as google_exceptions
 try:
     from google.cloud import vision
 except ImportError:
@@ -43,7 +46,42 @@ if not api_key:
     raise ValueError("⚠️ 重大エラー: GEMINI_API_KEYが見つかりません")
 
 genai.configure(api_key=api_key)
-model = genai.GenerativeModel('gemini-2.0-flash')
+model = genai.GenerativeModel('gemini-2.5-flash')
+
+_GEMINI_RETRY_EXCEPTIONS = (
+    http.client.RemoteDisconnected,
+    ConnectionError,
+    ConnectionResetError,
+    TimeoutError,
+    google_exceptions.ServiceUnavailable,
+    google_exceptions.DeadlineExceeded,
+    google_exceptions.InternalServerError,
+    google_exceptions.ResourceExhausted,
+    google_exceptions.Aborted,
+    google_exceptions.GatewayTimeout,
+)
+
+_GEMINI_RETRY_DELAYS = [1, 4, 10, 30]
+
+
+def _generate_content_with_retry(contents):
+    last_err = None
+    for attempt, delay in enumerate([0] + _GEMINI_RETRY_DELAYS):
+        if delay:
+            print(f"⏳ Gemini 接続エラー、{delay}s 後に再試行 (attempt {attempt}/{len(_GEMINI_RETRY_DELAYS)})")
+            time.sleep(delay)
+        try:
+            return model.generate_content(
+                contents,
+                generation_config=GEMINI_GENERATION_CONFIG,
+            )
+        except _GEMINI_RETRY_EXCEPTIONS as e:
+            last_err = e
+            err_msg = str(e)[:120]
+            print(f"⚠️ Gemini 一時エラー ({type(e).__name__}): {err_msg}")
+            continue
+    raise last_err
+
 
 GEMINI_GENERATION_CONFIG = {
     "temperature": 0,
@@ -241,10 +279,7 @@ def _ocr_with_paddleocr(image_bytes, mime_type="image/jpeg"):
 def _call_gemini_text(ocr_text, prompt):
     """OCR テキストを Gemini に送って構造化データを抽出"""
     full_prompt = f"{prompt}\n\n--- OCRテキスト ---\n{ocr_text}"
-    response = model.generate_content(
-        [full_prompt],
-        generation_config=GEMINI_GENERATION_CONFIG,
-    )
+    response = _generate_content_with_retry([full_prompt])
     text = (getattr(response, "text", "") or "").strip()
     parsed = extract_json(text)
     if parsed is None:
@@ -258,12 +293,11 @@ def _call_gemini_text(ocr_text, prompt):
 
 def _call_gemini_bytes(file_data, mime_type, prompt):
     """Gemini API を呼び出して JSON を返す (フォールバック用)"""
-    response = model.generate_content(
+    response = _generate_content_with_retry(
         [
             {"mime_type": mime_type, "data": file_data},
-            prompt
-        ],
-        generation_config=GEMINI_GENERATION_CONFIG,
+            prompt,
+        ]
     )
 
     text = (getattr(response, "text", "") or "").strip()
@@ -287,12 +321,11 @@ def _call_gemini_cross_validate(ocr_text, file_data, mime_type, prompt):
         f"上記のOCRテキストは参考情報です。画像の内容を直接確認し、"
         f"OCRテキストに誤りがあれば画像を優先してください。"
     )
-    response = model.generate_content(
+    response = _generate_content_with_retry(
         [
             {"mime_type": mime_type, "data": file_data},
             cross_prompt,
-        ],
-        generation_config=GEMINI_GENERATION_CONFIG,
+        ]
     )
     text = (getattr(response, "text", "") or "").strip()
     parsed = extract_json(text)
@@ -1249,7 +1282,7 @@ def _route_ocr_strategy(data_bytes, mime_type, prompt, ocr_strategy, prefix=""):
     return raw_data, ocr_text
 
 
-def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None):
+def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, start_page=1):
     """
     文書を分析し、仕訳データを逐次 yield するジェネレータ。
 
@@ -1262,6 +1295,7 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None):
         file_path: 文書ファイルのパス
         doc_type: 文書タイプ (DocType 定数)
         ocr_strategy: OCR 戦略 (A/B/C, None=config.OCR_STRATEGY)
+        start_page: 再開用、このページ未満はスキップ（1 始まり）
 
     Yields:
         dict: {"result": dict, "page_num": int, "total_pages": int}
@@ -1299,13 +1333,34 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None):
                     prefix = f"[p{idx}] "
                     page_data = page_info["data"]
 
-                    page_raw_data, ocr_text = _route_ocr_strategy(
-                        page_data, "application/pdf", prompt, ocr_strategy, prefix=prefix
-                    )
+                    if idx < start_page:
+                        continue
 
-                    if not page_raw_data:
-                        print(f"{prefix}🔄 フォールバック: Gemini Vision で再試行")
-                        page_raw_data = _call_gemini_bytes(page_data, "application/pdf", prompt)
+                    try:
+                        page_raw_data, ocr_text = _route_ocr_strategy(
+                            page_data, "application/pdf", prompt, ocr_strategy, prefix=prefix
+                        )
+
+                        if not page_raw_data:
+                            print(f"{prefix}🔄 フォールバック: Gemini Vision で再試行")
+                            page_raw_data = _call_gemini_bytes(page_data, "application/pdf", prompt)
+                    except Exception as page_err:
+                        failed_pages += 1
+                        print(f"{prefix}❌ ページ処理エラーのためスキップ: {type(page_err).__name__}: {str(page_err)[:120]}")
+                        yield {
+                            "result": {
+                                "date": "",
+                                "vendor": "",
+                                "invoice_num": "",
+                                "memo": f"ページ処理エラー: {type(page_err).__name__}",
+                                "entries": [],
+                                "_unrecognized": True,
+                            },
+                            "page_num": idx,
+                            "total_pages": total,
+                        }
+                        gc.collect()
+                        continue
 
                     if not page_raw_data:
                         failed_pages += 1

@@ -70,7 +70,7 @@ def scan_local_files():
     return files
 
 
-def process_local_file(file_info, sheets_writer, strategy=None):
+def process_local_file(file_info, sheets_writer, strategy=None, start_page=1):
     """1ファイルを処理: OCR → Google Sheets 書き込み"""
     file_path = file_info["path"]
     doc_type = file_info["doc_type"]
@@ -84,7 +84,7 @@ def process_local_file(file_info, sheets_writer, strategy=None):
 
     # PaddleOCR + Gemini（ジェネレータ: 逐次処理）
     count = 0
-    for page in process_pipeline(file_path, doc_type=doc_type, ocr_strategy=strategy):
+    for page in process_pipeline(file_path, doc_type=doc_type, ocr_strategy=strategy, start_page=start_page):
         r = page["result"]
         page_num = page["page_num"]
         total_pages = page["total_pages"]
@@ -136,6 +136,10 @@ def main():
     parser = argparse.ArgumentParser(description="Super Scaner Local Test")
     parser.add_argument("--strategy", choices=["A", "B", "C"], default=None,
                         help="OCR strategy override (default: config.OCR_STRATEGY)")
+    parser.add_argument("--start-page", type=int, default=1,
+                        help="Resume from this page (1-indexed). Applied to all scanned files.")
+    parser.add_argument("--only-file", type=str, default=None,
+                        help="Only process files whose name contains this substring.")
     args = parser.parse_args()
 
     print(f"📂 テストフォルダ: {os.path.abspath(TEST_DIR)}")
@@ -158,6 +162,8 @@ def main():
 
     # ファイル収集
     files = scan_local_files()
+    if args.only_file:
+        files = [f for f in files if args.only_file in f["name"]]
 
     if not files:
         print("\n⚠️  テストファイルが見つかりません。")
@@ -178,7 +184,7 @@ def main():
 
     for file_info in files:
         try:
-            if process_local_file(file_info, sheets_writer, strategy=args.strategy):
+            if process_local_file(file_info, sheets_writer, strategy=args.strategy, start_page=args.start_page):
                 success_count += 1
             else:
                 fail_count += 1
