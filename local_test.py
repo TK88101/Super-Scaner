@@ -91,8 +91,12 @@ def process_local_file(file_info, sheets_writer, strategy=None, start_page=1):
         page_num = page["page_num"]
         total_pages = page["total_pages"]
         count += 1
+        # 再試可能なページエラーは Sheets へ書き込まない
+        # （全頁失敗時は Failed を返しファイルを保持するため、
+        #  次回再試行で同じページの占位行が重複生成されるのを防ぐ）
         if r.get("_page_error"):
             error_pages += 1
+            continue
 
         if total_pages > 1:
             print(f"\n  📄 文書 [{page_num}/{total_pages}]: {r.get('vendor', '不明')}")

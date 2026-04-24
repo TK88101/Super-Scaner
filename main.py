@@ -160,8 +160,12 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
         page_num = page["page_num"]
         total_pages = page["total_pages"]
         count += 1
+        # 再試可能なページエラーは Sheets へ書き込まない
+        # （全頁失敗時は Failed を返しファイルを保持するため、
+        #  次回再試行で同じページの占位行が重複生成されるのを防ぐ）
         if result.get("_page_error"):
             error_pages += 1
+            continue
 
         entries = result.get('entries', [])
         print(f"📄 [{page_num}/{total_pages}] 取引先: {result.get('vendor')} | "
