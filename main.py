@@ -154,6 +154,7 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
     count = 0
     total_entries = 0
     error_pages = 0
+    failed_page_nums = []
 
     for page in process_pipeline(file_path, doc_type=doc_type):
         result = page["result"]
@@ -165,6 +166,7 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
         #  次回再試行で同じページの占位行が重複生成されるのを防ぐ）
         if result.get("_page_error"):
             error_pages += 1
+            failed_page_nums.append(page_num)
             continue
 
         entries = result.get('entries', [])
@@ -202,15 +204,50 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
         print(f"⚠️ 全ページ処理エラー: {error_pages}/{count} → Failed（ファイル保持）")
         return False
 
+    # 部分ページエラー: 成功頁は既に書き込み済み、失敗頁は占位行で可視化
+    # ファイルは歸檔（重試による重複行を防ぐため）、人手で失敗頁を再スキャン要
+    partial_error = error_pages > 0 and total_entries > 0
+    if partial_error:
+        failed_pages_str = ",".join(f"p{n}" for n in failed_page_nums)
+        try:
+            sheets_writer.append_entries(
+                employee_name=uploader_name,
+                doc_type=doc_type,
+                entries_data={
+                    "entries": [],
+                    "_unrecognized": True,
+                    "memo": f"⚠ ページ処理エラー {error_pages}/{count}頁 [{failed_pages_str}] 手動再スキャン要",
+                    "date": "",
+                    "vendor": filename,
+                    "uploader": uploader_name,
+                },
+                source_url=base_url,
+            )
+        except Exception as e:
+            print(f"⚠️ 部分エラー占位行の書き込み失敗: {e}")
+
     if count > 0:
         vendor_list = ", ".join(v for v in vendor_names if v)
         print(f"\n✅ 処理完了: {count}文書 / {total_entries}仕訳")
+        if partial_error:
+            failed_pages_str = ",".join(f"p{n}" for n in failed_page_nums)
+            print(f"⚠️ 部分ページエラー: {error_pages}/{count}頁失敗 [{failed_pages_str}]")
+            details = (
+                f"⚠ 部分ページ処理エラー {error_pages}/{count}頁\n"
+                f"失敗頁: {failed_pages_str}\n"
+                f"該当頁を手動で再スキャンしてください（該当頁以外は成功）\n"
+                f"---\n"
+                f"文書タイプ: {type_label}\n取引先: {vendor_list}\n"
+                f"合計金額: ¥{total_amount}\n文書数: {count}"
+            )
+        else:
+            details = f"文書タイプ: {type_label}\n取引先: {vendor_list}\n合計金額: ¥{total_amount}\n文書数: {count}"
         send_notification(
             filename=filename,
             status="Success",
             uploader_name=uploader_name,
             chat_id=chat_id,
-            details=f"文書タイプ: {type_label}\n取引先: {vendor_list}\n合計金額: ¥{total_amount}\n文書数: {count}"
+            details=details,
         )
         return True
     else:

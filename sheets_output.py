@@ -351,6 +351,7 @@ class SheetsOutputWriter:
         """認識不能/部分認識ページの占位行を書き込み、ハイライト適用"""
         date = entries_data.get("date", "") or ""
         vendor = entries_data.get("vendor", "") or ""
+        memo_override = entries_data.get("memo") or ""
         has_partial = bool(date or vendor)
 
         now_jst = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
@@ -360,7 +361,9 @@ class SheetsOutputWriter:
         row[0] = txn_no              # 取引No
         row[1] = date                # 取引日
         row[5] = vendor              # 借方取引先
-        if has_partial:
+        if memo_override:
+            row[18] = memo_override
+        elif has_partial:
             row[18] = "⚠ 部分認識（金額なし）"
         else:
             row[18] = "⚠ 認識不能ページ"

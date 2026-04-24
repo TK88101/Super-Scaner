@@ -86,6 +86,7 @@ def process_local_file(file_info, sheets_writer, strategy=None, start_page=1):
     count = 0
     total_entries = 0
     error_pages = 0
+    failed_page_nums = []
     first_write_done = False
     for page in process_pipeline(file_path, doc_type=doc_type, ocr_strategy=strategy, start_page=start_page):
         r = page["result"]
@@ -97,6 +98,7 @@ def process_local_file(file_info, sheets_writer, strategy=None, start_page=1):
         #  次回再試行で同じページの占位行が重複生成されるのを防ぐ）
         if r.get("_page_error"):
             error_pages += 1
+            failed_page_nums.append(page_num)
             continue
 
         if total_pages > 1:
@@ -136,6 +138,27 @@ def process_local_file(file_info, sheets_writer, strategy=None, start_page=1):
     if total_entries == 0 and error_pages > 0:
         print(f"⚠️ 全ページ処理エラー: {error_pages}/{count} → Failed（ファイル保持）")
         return False
+
+    # 部分ページエラー: 占位行を書き込んで可視化、ファイル自体は歸檔
+    if error_pages > 0 and total_entries > 0:
+        failed_pages_str = ",".join(f"p{n}" for n in failed_page_nums)
+        try:
+            sheets_writer.append_entries(
+                employee_name="LocalTest",
+                doc_type=doc_type,
+                entries_data={
+                    "entries": [],
+                    "_unrecognized": True,
+                    "memo": f"⚠ ページ処理エラー {error_pages}/{count}頁 [{failed_pages_str}] 手動再スキャン要",
+                    "date": "",
+                    "vendor": file_name,
+                    "uploader": "LocalTest",
+                },
+                source_url="",
+            )
+        except Exception as e:
+            print(f"⚠️ 部分エラー占位行の書き込み失敗: {e}")
+        print(f"⚠️ 部分ページエラー: {error_pages}/{count}頁失敗 [{failed_pages_str}]（ファイルは歸檔、失敗頁は手動再スキャン要）")
 
     # 処理済みフォルダへ移動
     dest = os.path.join(PROCESSED_DIR, file_name)
