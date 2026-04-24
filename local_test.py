@@ -84,16 +84,21 @@ def process_local_file(file_info, sheets_writer, strategy=None, start_page=1):
 
     # PaddleOCR + Gemini（ジェネレータ: 逐次処理）
     count = 0
+    total_entries = 0
+    error_pages = 0
     for page in process_pipeline(file_path, doc_type=doc_type, ocr_strategy=strategy, start_page=start_page):
         r = page["result"]
         page_num = page["page_num"]
         total_pages = page["total_pages"]
         count += 1
+        if r.get("_page_error"):
+            error_pages += 1
 
         if total_pages > 1:
             print(f"\n  📄 文書 [{page_num}/{total_pages}]: {r.get('vendor', '不明')}")
 
         entries = r.get("entries", [])
+        total_entries += len(entries)
         print(f"\n🎯 解析結果:")
         print(f"   📅 日付: {r.get('date')}")
         print(f"   🏪 取引先: {r.get('vendor')}")
@@ -117,6 +122,11 @@ def process_local_file(file_info, sheets_writer, strategy=None, start_page=1):
 
     if count == 0:
         print(f"❌ 解析失敗: {file_name}")
+        return False
+
+    # 全ページがエラーで仕訳ゼロ → 上流障害とみなし Failed（ファイル保持）
+    if total_entries == 0 and error_pages > 0:
+        print(f"⚠️ 全ページ処理エラー: {error_pages}/{count} → Failed（ファイル保持）")
         return False
 
     # 処理済みフォルダへ移動

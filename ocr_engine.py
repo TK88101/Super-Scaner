@@ -1365,6 +1365,7 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                                 "memo": f"ページ処理エラー: {type(page_err).__name__}",
                                 "entries": [],
                                 "_unrecognized": True,
+                                "_page_error": True,
                             },
                             "page_num": idx,
                             "total_pages": total,

@@ -153,12 +153,15 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
     vendor_names = []
     count = 0
     total_entries = 0
+    error_pages = 0
 
     for page in process_pipeline(file_path, doc_type=doc_type):
         result = page["result"]
         page_num = page["page_num"]
         total_pages = page["total_pages"]
         count += 1
+        if result.get("_page_error"):
+            error_pages += 1
 
         entries = result.get('entries', [])
         print(f"📄 [{page_num}/{total_pages}] 取引先: {result.get('vendor')} | "
@@ -182,6 +185,18 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
         total_amount += page_amount
         vendor_names.append(result.get('vendor', ''))
         total_entries += len(entries)
+
+    # 全ページがエラーで仕訳ゼロ → 上流障害とみなし Failed（再試行対象として残す）
+    if total_entries == 0 and error_pages > 0:
+        send_notification(
+            filename=filename,
+            status="Failed",
+            uploader_name=uploader_name,
+            chat_id=chat_id,
+            details=f"全ページ処理エラー（{error_pages}/{count}頁）。API障害または認証エラーの可能性。ファイルは保持されます。"
+        )
+        print(f"⚠️ 全ページ処理エラー: {error_pages}/{count} → Failed（ファイル保持）")
+        return False
 
     if count > 0:
         vendor_list = ", ".join(v for v in vendor_names if v)
