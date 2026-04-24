@@ -192,8 +192,12 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
         vendor_names.append(result.get('vendor', ''))
         total_entries += len(entries)
 
-    # 全ページがエラーで仕訳ゼロ → 上流障害とみなし Failed（再試行対象として残す）
-    if total_entries == 0 and error_pages > 0:
+    # 全ページがエラー → 上流障害とみなし Failed（再試行対象として残す）
+    # count == error_pages で判定（total_entries ではない）:
+    # _unrecognized ページ（封筒・パンフレット等）も entries=0 を生むため、
+    # total_entries==0 だけで判定すると「正常な _unrecognized + 1頁エラー」の
+    # 混合ケースが無限再試行ループに入り、毎回占位行が重複増殖する。
+    if count > 0 and error_pages == count:
         send_notification(
             filename=filename,
             status="Failed",
@@ -206,7 +210,7 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
 
     # 部分ページエラー: 成功頁は既に書き込み済み、失敗頁は占位行で可視化
     # ファイルは歸檔（重試による重複行を防ぐため）、人手で失敗頁を再スキャン要
-    partial_error = error_pages > 0 and total_entries > 0
+    partial_error = error_pages > 0 and error_pages < count
     if partial_error:
         failed_pages_str = ",".join(f"p{n}" for n in failed_page_nums)
         try:
