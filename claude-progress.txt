@@ -33,3 +33,33 @@
   - 借方/贷方科目、税区分全部正确
 
 当前进度: 12/12 features passing
+
+=== Session 3 (2026-04-24) — v2.9 OCR v3 移行 + 障害耐性強化 ===
+状态: 本地模式完整跑通、关键 bug 修复完成
+
+完成:
+- PaddleOCR 2.10.0 → 3.5.0、PaddlePaddle 2.6.2 → 3.3.1 (Mac ARM64 稳定化)
+  - Apple Silicon 上 v2 在 sgemm 推论中触发 SIGSEGV → FailureSignalHandler 无限循环的崩溃，v3 下消失
+  - PP-OCRv5_server モデル採用、requirements.txt 版本上限撤廃
+- 生成 AI モデル gemini-2.0-flash → gemini-2.5-flash (429 Resource exhausted 回避)
+- Gemini API 接続リトライ (指数バックオフ 1s/4s/10s/30s、4 回)
+  - RemoteDisconnected / ConnectionError / ServiceUnavailable / DeadlineExceeded / ResourceExhausted 捕捉
+- ページ単位例外捕捉 (1 ページ失敗で PDF 全体中断していたのを修正)
+- local_test.py に --start-page / --only-file CLI 追加（レジューム対応）
+- Google Sheets 書式伝播バグ修正 (append_row が前行書式を継承、1 行の異常色が下方全行に伝播)
+  - 新規行 A:AB を白リセット → 異常色を被せる方式へ変更
+  - 既存汚染データ (B1024:B1160 138 行 + 45 セル) をクリーンアップ
+
+テスト結果:
+- 2025年領収書.pdf (25 頁): 25/25 頁処理成功、89 行書き込み
+- 2023年領収書.pdf (478 頁): 481 件抽出、失敗 2 頁、正常にアーカイブ
+- 2024年領収書.pdf (280 頁): p231 で Gemini 切断 → 途中中断 (修正前の挙動)
+- 合計: 1,897 行書き込み、LocalTest_領収書 Tab に累計
+
+修正ファイル:
+- ocr_engine.py (リトライ層、start_page、ページ try/except)
+- local_test.py (CLI 引数、start_page 伝達)
+- sheets_output.py (白リセット 2 箇所)
+- requirements.txt (Paddle v3)
+- .gitignore (venv311/)
+- PRD.md (v2.9 変更履歴)

@@ -70,7 +70,7 @@ def scan_local_files():
     return files
 
 
-def process_local_file(file_info, sheets_writer, strategy=None):
+def process_local_file(file_info, sheets_writer, strategy=None, start_page=1):
     """1ファイルを処理: OCR → Google Sheets 書き込み"""
     file_path = file_info["path"]
     doc_type = file_info["doc_type"]
@@ -84,16 +84,28 @@ def process_local_file(file_info, sheets_writer, strategy=None):
 
     # PaddleOCR + Gemini（ジェネレータ: 逐次処理）
     count = 0
-    for page in process_pipeline(file_path, doc_type=doc_type, ocr_strategy=strategy):
+    total_entries = 0
+    error_pages = 0
+    failed_page_nums = []
+    first_write_done = False
+    for page in process_pipeline(file_path, doc_type=doc_type, ocr_strategy=strategy, start_page=start_page):
         r = page["result"]
         page_num = page["page_num"]
         total_pages = page["total_pages"]
         count += 1
+        # 再試可能なページエラーは Sheets へ書き込まない
+        # （全頁失敗時は Failed を返しファイルを保持するため、
+        #  次回再試行で同じページの占位行が重複生成されるのを防ぐ）
+        if r.get("_page_error"):
+            error_pages += 1
+            failed_page_nums.append(page_num)
+            continue
 
         if total_pages > 1:
             print(f"\n  📄 文書 [{page_num}/{total_pages}]: {r.get('vendor', '不明')}")
 
         entries = r.get("entries", [])
+        total_entries += len(entries)
         print(f"\n🎯 解析結果:")
         print(f"   📅 日付: {r.get('date')}")
         print(f"   🏪 取引先: {r.get('vendor')}")
@@ -105,8 +117,11 @@ def process_local_file(file_info, sheets_writer, strategy=None):
                   f"貸方: {entry.get('credit_account')} ({entry.get('credit_tax_type')})")
 
         # 即座に Google Sheets 書き込み（初回のみ分割線+No リセット）
-        if count == 1:
+        # count ではなく first_write_done で判定。先頭ページが _page_error で
+        # スキップされた場合でも、最初の実書き込み時に必ず separator が入る。
+        if not first_write_done:
             sheets_writer.start_new_file("LocalTest", doc_type, file_name)
+            first_write_done = True
         r["uploader"] = "LocalTest"
         sheets_writer.append_entries(
             employee_name="LocalTest",
@@ -118,6 +133,32 @@ def process_local_file(file_info, sheets_writer, strategy=None):
     if count == 0:
         print(f"❌ 解析失敗: {file_name}")
         return False
+
+    # 全ページがエラーで仕訳ゼロ → 上流障害とみなし Failed（ファイル保持）
+    if total_entries == 0 and error_pages > 0:
+        print(f"⚠️ 全ページ処理エラー: {error_pages}/{count} → Failed（ファイル保持）")
+        return False
+
+    # 部分ページエラー: 占位行を書き込んで可視化、ファイル自体は歸檔
+    if error_pages > 0 and total_entries > 0:
+        failed_pages_str = ",".join(f"p{n}" for n in failed_page_nums)
+        try:
+            sheets_writer.append_entries(
+                employee_name="LocalTest",
+                doc_type=doc_type,
+                entries_data={
+                    "entries": [],
+                    "_unrecognized": True,
+                    "memo": f"⚠ ページ処理エラー {error_pages}/{count}頁 [{failed_pages_str}] 手動再スキャン要",
+                    "date": "",
+                    "vendor": file_name,
+                    "uploader": "LocalTest",
+                },
+                source_url="",
+            )
+        except Exception as e:
+            print(f"⚠️ 部分エラー占位行の書き込み失敗: {e}")
+        print(f"⚠️ 部分ページエラー: {error_pages}/{count}頁失敗 [{failed_pages_str}]（ファイルは歸檔、失敗頁は手動再スキャン要）")
 
     # 処理済みフォルダへ移動
     dest = os.path.join(PROCESSED_DIR, file_name)
@@ -136,6 +177,10 @@ def main():
     parser = argparse.ArgumentParser(description="Super Scaner Local Test")
     parser.add_argument("--strategy", choices=["A", "B", "C"], default=None,
                         help="OCR strategy override (default: config.OCR_STRATEGY)")
+    parser.add_argument("--start-page", type=int, default=1,
+                        help="Resume from this page (1-indexed). Applied to all scanned files.")
+    parser.add_argument("--only-file", type=str, default=None,
+                        help="Only process files whose name contains this substring.")
     args = parser.parse_args()
 
     print(f"📂 テストフォルダ: {os.path.abspath(TEST_DIR)}")
@@ -158,6 +203,8 @@ def main():
 
     # ファイル収集
     files = scan_local_files()
+    if args.only_file:
+        files = [f for f in files if args.only_file in f["name"]]
 
     if not files:
         print("\n⚠️  テストファイルが見つかりません。")
@@ -178,7 +225,7 @@ def main():
 
     for file_info in files:
         try:
-            if process_local_file(file_info, sheets_writer, strategy=args.strategy):
+            if process_local_file(file_info, sheets_writer, strategy=args.strategy, start_page=args.start_page):
                 success_count += 1
             else:
                 fail_count += 1

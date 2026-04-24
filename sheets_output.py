@@ -117,6 +117,11 @@ class SheetsOutputWriter:
                 separator_row[18] = f"──── {filename} ────"
                 ws.append_row(separator_row, value_input_option='USER_ENTERED')
                 new_row = len(ws.get_all_values())
+                # append_row は直前行の背景色を継承する。
+                # 前ファイル最終行の異常ハイライト（H列黄色等）が separator 行に残らないよう、
+                # 背景を白にリセットしてから上罫線を適用する。
+                fmt_white = CellFormat(backgroundColor=Color(1, 1, 1))
+                format_cell_range(ws, f"A{new_row}:AB{new_row}", fmt_white)
                 border_fmt = CellFormat(
                     borders=Borders(
                         top=Border("SOLID_THICK", Color(0, 0, 0))
@@ -238,10 +243,20 @@ class SheetsOutputWriter:
             # 取引No をタブごとにメモリ更新
             self._tab_next_txn[tab_name] = transaction_no
 
+            start_row = pre_write_count + 1
+            end_row = start_row + len(rows) - 1
+
+            # Sheets の append は直前行の書式を継承する。
+            # 異常ハイライトが下の行に波及しないよう、新規行を白にリセットしてから異常色を被せる。
+            try:
+                fmt_white = CellFormat(backgroundColor=Color(1, 1, 1))
+                format_cell_range(ws, f"A{start_row}:AB{end_row}", fmt_white)
+            except Exception as e:
+                print(f"⚠️ 新規行の背景リセット失敗: {e}")
+
             # 異常行のハイライト（書き込み前の行数から位置を正確に算出）
             if anomaly_flags_list:
                 try:
-                    start_row = pre_write_count + 1
                     for offset, flags in anomaly_flags_list:
                         actual_row = start_row + offset
                         self._apply_anomaly_highlight(ws, actual_row, flags)
@@ -336,6 +351,7 @@ class SheetsOutputWriter:
         """認識不能/部分認識ページの占位行を書き込み、ハイライト適用"""
         date = entries_data.get("date", "") or ""
         vendor = entries_data.get("vendor", "") or ""
+        memo_override = entries_data.get("memo") or ""
         has_partial = bool(date or vendor)
 
         now_jst = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
@@ -345,7 +361,9 @@ class SheetsOutputWriter:
         row[0] = txn_no              # 取引No
         row[1] = date                # 取引日
         row[5] = vendor              # 借方取引先
-        if has_partial:
+        if memo_override:
+            row[18] = memo_override
+        elif has_partial:
             row[18] = "⚠ 部分認識（金額なし）"
         else:
             row[18] = "⚠ 認識不能ページ"
@@ -358,6 +376,12 @@ class SheetsOutputWriter:
         self._tab_next_txn[tab_name] = txn_no + 1
 
         actual_row = pre_write + 1
+
+        try:
+            fmt_white = CellFormat(backgroundColor=Color(1, 1, 1))
+            format_cell_range(ws, f"A{actual_row}:AB{actual_row}", fmt_white)
+        except Exception as e:
+            print(f"⚠️ 認識不能行の背景リセット失敗: {e}")
 
         try:
             fmt_red = CellFormat(backgroundColor=Color(1, 0.8, 0.8))
