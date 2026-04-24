@@ -134,13 +134,17 @@ def process_local_file(file_info, sheets_writer, strategy=None, start_page=1):
         print(f"❌ 解析失敗: {file_name}")
         return False
 
-    # 全ページがエラーで仕訳ゼロ → 上流障害とみなし Failed（ファイル保持）
-    if total_entries == 0 and error_pages > 0:
+    # 全ページがエラー → 上流障害とみなし Failed（ファイル保持）
+    # count == error_pages で判定（total_entries ではない）:
+    # _unrecognized ページ（封筒・パンフレット等）も entries=0 を生むため、
+    # total_entries==0 だけで判定すると「正常な _unrecognized + 1頁エラー」の
+    # 混合ケースが無限再試行ループに入り、毎回占位行が重複増殖する。
+    if count > 0 and error_pages == count:
         print(f"⚠️ 全ページ処理エラー: {error_pages}/{count} → Failed（ファイル保持）")
         return False
 
     # 部分ページエラー: 占位行を書き込んで可視化、ファイル自体は歸檔
-    if error_pages > 0 and total_entries > 0:
+    if error_pages > 0 and error_pages < count:
         failed_pages_str = ",".join(f"p{n}" for n in failed_page_nums)
         try:
             sheets_writer.append_entries(
