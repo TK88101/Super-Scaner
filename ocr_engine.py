@@ -1433,6 +1433,9 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                 print(f"📄 多ページPDF: {total}ページを逐次OCR→統合解析します")
                 all_ocr_texts = []
                 for pg in itertools.chain([first_page], page_gen):
+                    # 再開指定時、対象ページ未満はスキップ
+                    if pg["page_num"] < start_page:
+                        continue
                     prefix = f"[p{pg['page_num']}] "
                     pg_text, _ = _ocr_with_paddleocr(pg["data"], "application/pdf")
                     all_ocr_texts.append(pg_text)

@@ -86,6 +86,7 @@ def process_local_file(file_info, sheets_writer, strategy=None, start_page=1):
     count = 0
     total_entries = 0
     error_pages = 0
+    first_write_done = False
     for page in process_pipeline(file_path, doc_type=doc_type, ocr_strategy=strategy, start_page=start_page):
         r = page["result"]
         page_num = page["page_num"]
@@ -114,8 +115,11 @@ def process_local_file(file_info, sheets_writer, strategy=None, start_page=1):
                   f"貸方: {entry.get('credit_account')} ({entry.get('credit_tax_type')})")
 
         # 即座に Google Sheets 書き込み（初回のみ分割線+No リセット）
-        if count == 1:
+        # count ではなく first_write_done で判定。先頭ページが _page_error で
+        # スキップされた場合でも、最初の実書き込み時に必ず separator が入る。
+        if not first_write_done:
             sheets_writer.start_new_file("LocalTest", doc_type, file_name)
+            first_write_done = True
         r["uploader"] = "LocalTest"
         sheets_writer.append_entries(
             employee_name="LocalTest",
