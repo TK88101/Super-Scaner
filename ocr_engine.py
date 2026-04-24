@@ -464,20 +464,28 @@ def _extract_date_from_ocr(ocr_text):
 
 
 def _validate_gemini_date(date_str):
-    """Gemini が返した日付を検証。怪しければ空文字を返す（高亮対象にする）。
+    """Gemini が返した日付を検証し、ゼロパディング形式に正規化する。
 
     OCR で抽出できなかった場合の最終チェック:
     - /00 日 → 無効
-    - 年が 2024-2027 の範囲外 → 年号誤判定の可能性
+    - 年が 2020-2027 の範囲外 → 年号誤判定の可能性
     - パースできない → 無効
+
+    正規化:
+    - `2024/2/24` → `2024/02/24`
+    - `2024/2` → `2024/02`（月のみ、納付書等）
     """
     if not date_str:
         return ""
     s = str(date_str).strip()
-    # YYYY/MM 形式（月のみ、納付書等）はそのまま通す
-    if re.match(r'^\d{4}/\d{2}$', s):
-        return s
-    m = re.match(r'(\d{4})/(\d{2})/(\d{2})', s)
+    # YYYY/M or YYYY/MM 形式（月のみ、納付書等）
+    m = re.match(r'^(\d{4})/(\d{1,2})$', s)
+    if m:
+        year, month = int(m.group(1)), int(m.group(2))
+        if year < 2020 or year > 2027 or month < 1 or month > 12:
+            return ""
+        return f"{year}/{month:02d}"
+    m = re.match(r'^(\d{4})/(\d{1,2})/(\d{1,2})$', s)
     if not m:
         return ""  # パースできない → 空
     year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
@@ -487,7 +495,7 @@ def _validate_gemini_date(date_str):
         return ""  # 2014年等 → Gemini の年号誤判定、空にする
     if month < 1 or month > 12 or day > 31:
         return ""
-    return s
+    return f"{year}/{month:02d}/{day:02d}"
 
 
 def _extract_invoice_num_from_ocr(ocr_text):
@@ -672,16 +680,18 @@ def _apply_ocr_overrides(raw_data, ocr_text, prefix=""):
         for doc in docs:
             if ocr_date:
                 gemini_date = doc.get("date", "")
+                gemini_normalized = _validate_gemini_date(gemini_date)
                 # 複数書類ページ: Gemini が有効な日付を持つ場合は上書きしない
                 # （OCR はページ全体から1つの日付しか抽出できず、書類ごとの日付を区別できない）
-                if is_multi_doc and gemini_date and _validate_gemini_date(gemini_date):
-                    pass  # Gemini の書類ごとの日付を維持
+                if is_multi_doc and gemini_normalized:
+                    doc["date"] = gemini_normalized
                 elif _should_override_date(gemini_date, ocr_date):
                     if gemini_date != ocr_date:
                         print(f"{prefix}📅 日付上書: Gemini={gemini_date} → OCR={ocr_date}")
                     doc["date"] = ocr_date
                 else:
                     print(f"{prefix}📅 OCR日付を無視（Gemini={gemini_date}, OCR={ocr_date}）")
+                    doc["date"] = gemini_normalized or gemini_date
             else:
                 # OCR 抽出できなくても無効日付は修正
                 validated = _validate_gemini_date(doc.get("date", ""))

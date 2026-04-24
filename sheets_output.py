@@ -117,6 +117,11 @@ class SheetsOutputWriter:
                 separator_row[18] = f"──── {filename} ────"
                 ws.append_row(separator_row, value_input_option='USER_ENTERED')
                 new_row = len(ws.get_all_values())
+                # append_row は直前行の背景色を継承する。
+                # 前ファイル最終行の異常ハイライト（H列黄色等）が separator 行に残らないよう、
+                # 背景を白にリセットしてから上罫線を適用する。
+                fmt_white = CellFormat(backgroundColor=Color(1, 1, 1))
+                format_cell_range(ws, f"A{new_row}:AB{new_row}", fmt_white)
                 border_fmt = CellFormat(
                     borders=Borders(
                         top=Border("SOLID_THICK", Color(0, 0, 0))
