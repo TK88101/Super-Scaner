@@ -13,6 +13,7 @@ except ImportError:
     vision = None
 from dotenv import load_dotenv
 from doc_types import DocType, DOC_TYPE_CONFIG
+from receipt_aggregation import aggregate_entries_by_tax_rate, coerce_tax_rate
 
 try:
     from pypdf import PdfReader, PdfWriter
@@ -971,7 +972,8 @@ def _build_entries_for_single_doc(doc):
         if len(valid_items) > 1 and _is_subtotal_line(desc, int(amount), doc.get("items", [])):
             continue
 
-        tax_rate = item.get("tax_rate", 0.10)
+        # tax_rate を float に正規化（null/文字列対策）。税区分と集約を整合させる
+        tax_rate = coerce_tax_rate(item.get("tax_rate"))
         debit_account = item.get("debit_account", "消耗品費")
 
         # 取引先名に基づく科目兜底（Gemini 分類揺れ防止）
@@ -990,9 +992,12 @@ def _build_entries_for_single_doc(doc):
             "credit_tax_type": credit_tax_type,
             "amount": int(amount),
             "description": item.get("description", ""),
+            "tax_rate": tax_rate,  # 税率別集計用（集計後は破棄）
         })
 
-    return entries
+    # 仕様変更(5/25): 明細は逐行出力せず、税率(8%/10%)別の合計に集約する
+    # 摘要の店名は sheets_output 側で前置されるため、ここでは渡さない
+    return aggregate_entries_by_tax_rate(entries)
 
 
 def _build_entries_from_receipt(raw_data):
