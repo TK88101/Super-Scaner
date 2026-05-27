@@ -63,3 +63,37 @@
 - requirements.txt (Paddle v3)
 - .gitignore (venv311/)
 - PRD.md (v2.9 変更履歴)
+
+=== Session 4 (2026-05-27) — v3.0 領収書 税率別集約（顧客確認待ちで保留中）===
+状態: コア実装済み・顧客フィードバック待ちのサスペンド状態
+ブランチ: feat/receipt-tax-rate-aggregation（main 未マージ）
+
+実装済み（commit 320bdf8 / 6493996）:
+- 領収書(レシート/發票)を明細逐行出力から税率別(8%/10%)合計1行へ集約
+- 純ロジックを receipt_aggregation.py に分離（aggregate_entries_by_tax_rate + coerce_tax_rate）
+- ocr_engine.py::_build_entries_for_single_doc 末尾で呼び出し、DocType.RECEIPT のみ対象
+- 単体テスト test_receipt_aggregation.py（zero 依存、python3 -m unittest で全緑）
+- PRD.md を v3.0 に更新
+
+5/27 進展:
+- 担当者から Google Sheet「自動仕訳ツール 税区分」（id 11ugj5...kbZI）受領
+  - 赤枠付き実票サンプル5枚 + 期待出力。金額は正解と自洽を確認
+    ① 8%+10% 内税(GooDay 124+1531=1655) ② 10%のみ 内税(とんかつ 2400)
+    ③ 8%のみ 外税(千鳥饅頭 対象1620+税130=1750) ④ 8%+10%+非課税 内税(ゴルフ系 13440+650+非課税500=14590)
+    ⑤ 10%+非課税 内税(秋月CC 6000+ゴルフ場利用税200=6200)
+  - 税区分グルーピング規格は確定。ただし借方勘定科目・摘要の両列は空欄
+- サンプルが新たに露呈した未対応2点:
+  ・非課税(宿泊税・ゴルフ場利用税=租税公課)を独立1行(税区分「対象外」)で集約 → 借方科目要特判
+  ・内税/外税(税込/税抜)の区別 → 現コードは amount 単純合算のみ
+- Chatwork GASチーム(room 416290400)に @チョウギョウエイ で4点確認を送信(message_id 2111399299425505280)
+  【1】集約行の借方勘定科目（最大金額品目 vs 「備品・消耗品費」固定）
+  【2】摘要の表記（店名+税率 / 税率のみ / 店名のみ）
+  【3】非課税行の借方科目（「租税公課」固定でよいか）
+  【4】外税レシートの借方金額（税込 / 税抜）
+
+次アクション（回答受領後）:
+1. 回答どおり receipt_aggregation.py を改修（非課税特判・必要なら内税/外税処理）
+2. test_receipt_aggregation.py を上記5サンプルの金額で更新
+3. python3 -m unittest 全緑
+4. PR で feat/receipt-tax-rate-aggregation → main マージ
+5. 顧客は git pull origin main で取得
