@@ -381,6 +381,105 @@ class RealSamplePatternTest(unittest.TestCase):
         self.assertEqual(result[0]["amount"], 2400)
 
 
+class BuildRowsFromTaxSummaryTest(unittest.TestCase):
+    """票面の税率別内訳から直接行を起こす（内訳優先）。6サンプルで検証。"""
+
+    def _rows(self, summary, account="備品・消耗品費", doc_category="receipt"):
+        return agg.build_rows_from_tax_summary(summary, account, doc_category)
+
+    def test_p1_gooday_8_and_10_uchizei(self):
+        # 票面: 8%内税対象額124 / 10%内税対象額1531
+        rows = self._rows([
+            {"tax_rate": 0.08, "tax_included": True, "base_amount": 124, "tax_amount": 9},
+            {"tax_rate": 0.10, "tax_included": True, "base_amount": 1531, "tax_amount": 139},
+        ])
+        self.assertEqual([(r["description"], r["amount"]) for r in rows],
+                         [("8%対象", 124), ("10%対象", 1531)])
+        self.assertEqual(rows[0]["debit_tax_type"], "課対仕入8% (軽)")
+        self.assertEqual(rows[1]["debit_tax_type"], "課対仕入10%")
+
+    def test_p3_chidori_8_sotozei_to_taxincluded(self):
+        # 外税: 対象額1620 + 外税額130 → 税込1750
+        rows = self._rows([
+            {"tax_rate": 0.08, "tax_included": False, "base_amount": 1620, "tax_amount": 130},
+        ], account="接待交際費")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["amount"], 1750)
+        self.assertEqual(rows[0]["debit_account"], "接待交際費")
+
+    def test_p3_sotozei_fallback_rounding(self):
+        # 外税で票面税額が無い → 1620×8%=129.6→130、税込1750
+        rows = self._rows([
+            {"tax_rate": 0.08, "tax_included": False, "base_amount": 1620, "tax_amount": 0},
+        ])
+        self.assertEqual(rows[0]["amount"], 1750)
+
+    def test_p4_golf_three_rates_incl_taxfree(self):
+        # 10%13440 / 8%650 / 非課税500、合計14590
+        rows = self._rows([
+            {"tax_rate": 0.10, "tax_included": True, "base_amount": 13440, "tax_amount": 1221},
+            {"tax_rate": 0.08, "tax_included": True, "base_amount": 650, "tax_amount": 48},
+            {"tax_rate": 0, "tax_included": True, "base_amount": 500, "tax_amount": 0},
+        ], account="接待交際費")
+        self.assertEqual([(r["description"], r["amount"]) for r in rows],
+                         [("10%対象", 13440), ("8%対象", 650), ("対象外", 500)])
+        # 非課税行も票全体の代表科目（接待交際費）を共有する
+        self.assertTrue(all(r["debit_account"] == "接待交際費" for r in rows))
+        self.assertEqual(rows[2]["debit_tax_type"], "対象外")
+        self.assertEqual(sum(r["amount"] for r in rows), 14590)
+
+    def test_p6_trial_uchizei_sotozei_mixed_not_merged(self):
+        # 同じ10%でも外税組(税込1245)と内税組(5)は別行
+        rows = self._rows([
+            {"tax_rate": 0.10, "tax_included": False, "base_amount": 1132, "tax_amount": 113},
+            {"tax_rate": 0.10, "tax_included": True, "base_amount": 5, "tax_amount": 0},
+        ])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["amount"], 1245)
+        self.assertEqual(rows[1]["amount"], 5)
+        self.assertTrue(all(r["debit_tax_type"] == "課対仕入10%" for r in rows))
+
+    def test_zero_amount_division_skipped(self):
+        rows = self._rows([
+            {"tax_rate": 0.10, "tax_included": True, "base_amount": 0, "tax_amount": 0},
+            {"tax_rate": 0.08, "tax_included": True, "base_amount": 100, "tax_amount": 7},
+        ])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["amount"], 100)
+
+    def test_fullwidth_base_amount_normalized(self):
+        # Gemini が全角/カンマ文字列で返しても正しく解釈
+        rows = self._rows([
+            {"tax_rate": 0.10, "tax_included": True, "base_amount": "１，２００", "tax_amount": 0},
+        ])
+        self.assertEqual(rows[0]["amount"], 1200)
+
+
+class DetermineTaxTypesTest(unittest.TestCase):
+    def test_standard_rate(self):
+        self.assertEqual(agg.determine_tax_types("receipt", 0.10),
+                         ("課対仕入10%", "対象外"))
+
+    def test_reduced_rate(self):
+        self.assertEqual(agg.determine_tax_types("receipt", 0.08),
+                         ("課対仕入8% (軽)", "対象外"))
+
+    def test_zero_rate_is_taxfree(self):
+        self.assertEqual(agg.determine_tax_types("receipt", 0),
+                         ("対象外", "対象外"))
+
+    def test_bank_transfer_is_taxfree(self):
+        self.assertEqual(agg.determine_tax_types("bank_transfer", 0.10),
+                         ("対象外", "対象外"))
+
+
+class SelectAggregatedDebitAccountTest(unittest.TestCase):
+    def test_empty_returns_fixed(self):
+        # 空グループ（内訳優先で品目が全て小計だった場合）は固定科目に退避
+        self.assertEqual(agg.select_aggregated_debit_account([]),
+                         agg.AGGREGATED_DEBIT_ACCOUNT_FIXED)
+
+
 class CoerceTaxIncludedTest(unittest.TestCase):
     def test_none_defaults_to_included(self):
         # 日本のレシートは税込表示が大半のため既定は内税

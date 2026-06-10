@@ -13,7 +13,13 @@ except ImportError:
     vision = None
 from dotenv import load_dotenv
 from doc_types import DocType, DOC_TYPE_CONFIG
-from receipt_aggregation import aggregate_entries_by_tax_rate, coerce_tax_rate
+from receipt_aggregation import (
+    aggregate_entries_by_tax_rate,
+    build_rows_from_tax_summary,
+    coerce_tax_rate,
+    determine_tax_types,
+    select_aggregated_debit_account,
+)
 
 try:
     from pypdf import PdfReader, PdfWriter
@@ -753,6 +759,14 @@ PROMPTS = {
                     "tax_amount": 消費税額(数値, なければ0),
                     "debit_account": "費用の勘定科目を推定"
                 }
+            ],
+            "tax_summary": [
+                {
+                    "tax_rate": 0.08 or 0.10 or 0,
+                    "tax_included": true or false,
+                    "base_amount": その税率区分の対象額(数値),
+                    "tax_amount": その税率区分の消費税額(数値, なければ0)
+                }
             ]
         }
     ]
@@ -805,6 +819,20 @@ PROMPTS = {
   いずれか1品目の tax_amount に付与し、他の品目は 0 とする
 - 同一レシート内で内税と外税が混在する場合（例: 外税の商品+税込のレジ袋）は、
   品目ごとに正しく true/false を付けること
+
+【tax_summary（税率別内訳）の抽出 — 最重要】
+レシートに税率別の内訳が印字されている場合は、それを必ず tax_summary に
+そのまま転記してください（印字値を再計算しない）。
+- 1つの税率区分（税率 × 内税/外税）につき1要素。
+- base_amount = その区分の「対象額」:
+  ・内税表示（"8%内税対象額 ¥124"、"(10%対象 ¥2,400 消費税等 ¥218)"）→ tax_included=true、
+    base_amount=税込対象額（124 / 2400）、tax_amount=その消費税額
+  ・外税表示（"(8%外税対象額) ¥1,620 / 8%外税額 ¥130"、"10%外税 タイショウ ¥1,132 / 10%外税 ¥113"）
+    → tax_included=false、base_amount=税抜対象額（1620 / 1132）、tax_amount=外税額（130 / 113）
+  ・非課税/対象外（"非課税金額 ¥500"、"ゴルフ場利用税 ¥200"）→ tax_rate=0、tax_included=true、
+    base_amount=その金額、tax_amount=0
+- 税率別内訳が印字されていないレシート（単純な品目羅列のみ）は tax_summary=[] とする。
+  内訳行を品目(items)に混ぜないこと。
 
 【payment_method の判定基準】
 - コンビニ（FamilyMart, セブンイレブン等）での支払い → "現金"
@@ -928,16 +956,6 @@ def _determine_credit_account(pay_method, doc_category="receipt"):
     return "未払金"
 
 
-def _determine_tax_types(doc_category, tax_rate):
-    """ドキュメントカテゴリと税率から借方・貸方税区分を決定"""
-    if doc_category == "bank_transfer" or tax_rate == 0:
-        return "対象外", "対象外"
-    elif tax_rate == 0.08:
-        return "課対仕入8% (軽)", "対象外"
-    else:  # 0.10
-        return "課対仕入10%", "対象外"
-
-
 def _is_subtotal_line(description, amount, all_items):
     """小計・合計・税額集計行かどうかを判定"""
     # キーワード検出（品目名に含まれうる「対象」等は除外、集計行のみ）
@@ -1013,7 +1031,7 @@ def _build_entries_for_single_doc(doc):
         debit_account = _override_account_by_vendor(vendor, debit_account)
 
         # 税区分決定
-        debit_tax_type, credit_tax_type = _determine_tax_types(
+        debit_tax_type, credit_tax_type = determine_tax_types(
             doc_category, tax_rate
         )
 
@@ -1031,7 +1049,21 @@ def _build_entries_for_single_doc(doc):
             "tax_amount": item.get("tax_amount"),
         })
 
-    # 仕様変更(5/25): 明細は逐行出力せず、税率(8%/10%)別の合計に集約する
+    # 内訳優先(6/10): レシートに税率別内訳（○%対象額・消費税額）が印字
+    # されていれば、それを正解として直接行を起こす。Gemini の逐品目集計
+    # （割引の二重控除・税率誤判定・内外税混在の取りこぼし）を回避する。
+    # 借方科目は票全体の代表科目を全行へ適用（高ゴルフ票=接待交際費等、
+    # 顧客サンプルの「同票同科目」に一致）。
+    tax_summary = doc.get("tax_summary") or []
+    if tax_summary:
+        repr_account = select_aggregated_debit_account(entries)
+        rows = build_rows_from_tax_summary(
+            tax_summary, repr_account, doc_category, credit_account
+        )
+        if rows:
+            return rows
+
+    # 仕様変更(5/25): 内訳が無い場合は明細を税率(8%/10%)別の合計に集約する
     # 摘要の店名は sheets_output 側で前置されるため、ここでは渡さない
     return aggregate_entries_by_tax_rate(entries)
 

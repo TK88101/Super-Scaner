@@ -37,7 +37,7 @@ def coerce_tax_rate(value):
 
     OCR/Gemini は数値(0.08/0.10/0)を返す想定だが、実際には null や
     文字列("0.08") を返すことがある。None・bool・変換不能な値は既定税率(10%)に
-    寄せ、_determine_tax_types の fallback(=10%) と整合させる。
+    寄せ、determine_tax_types の fallback(=10%) と整合させる。
     取得元で正規化しておくことで、税区分(debit_tax_type)と集約グループの
     税率が食い違わないようにする。
     """
@@ -100,15 +100,78 @@ def _to_tax_inclusive_total(base_amount, tax_amount, tax_rate):
     return base_amount + int(computed)
 
 
-def _select_aggregated_debit_account(group_entries):
+def select_aggregated_debit_account(group_entries):
     """税率グループの代表借方科目を決定する。"""
-    if AGGREGATED_DEBIT_ACCOUNT_STRATEGY == "fixed":
+    if AGGREGATED_DEBIT_ACCOUNT_STRATEGY == "fixed" or not group_entries:
         return AGGREGATED_DEBIT_ACCOUNT_FIXED
     # 既定: グループ内で金額最大の品目の科目を採用
     # NOTE: 値引行(負額)が混在しても正額の主要品目が勝つ前提。全品目が負の
     # グループ（純返品）では最も0に近い品目になるが、実務上ほぼ発生しない
     largest = max(group_entries, key=lambda e: e.get("amount", 0))
     return largest.get("debit_account", AGGREGATED_DEBIT_ACCOUNT_FIXED)
+
+
+def determine_tax_types(doc_category, tax_rate):
+    """ドキュメントカテゴリと税率から借方・貸方税区分を決定する。
+
+    純ロジックのため本モジュールに置き、逐品目集約と内訳優先
+    （build_rows_from_tax_summary）の双方から再利用する。
+    """
+    rate = coerce_tax_rate(tax_rate)
+    if doc_category == "bank_transfer" or not rate:
+        return "対象外", "対象外"
+    if rate == 0.08:
+        return "課対仕入8% (軽)", "対象外"
+    return "課対仕入10%", "対象外"
+
+
+def build_rows_from_tax_summary(tax_summary, debit_account, doc_category="receipt",
+                                credit_account=DEFAULT_CREDIT_ACCOUNT):
+    """レシート印字の税率別内訳から、税率別の仕訳行を直接生成する（内訳優先）。
+
+    Gemini の逐品目集計（割引の二重控除・税率誤判定・内外税混在の取りこぼし）
+    を避けるため、票面に税率別内訳（○%対象額・消費税額）が印字されている
+    場合はそれを正解として採用する。1区分=1行で集約はしない（同じ10%でも
+    内税分と外税分は別行のまま）。
+
+    Args:
+        tax_summary: 各 dict が tax_rate / tax_included / base_amount /
+            tax_amount を持つ list。base_amount は対象額（内税=税込、
+            外税=税抜、非課税=その額）。
+        debit_account: 票全体の代表借方科目（全行共通）。
+        doc_category: 税区分判定用。
+        credit_account: 貸方科目。
+
+    Returns:
+        税率別の仕訳行 list。金額0の区分は出力しない。
+    """
+    rows = []
+    for item in tax_summary:
+        rate = coerce_tax_rate(item.get("tax_rate"))
+        included = coerce_tax_included(item.get("tax_included"))
+        # 非課税(rate=0)は内税/外税の区別が無意味
+        if not rate:
+            included = True
+        # base_amount も money-string 正規化を流用（全角/カンマ/¥ 対応）
+        base = coerce_tax_amount(item.get("base_amount"))
+        if included:
+            amount = base
+        else:
+            amount = _to_tax_inclusive_total(
+                base, coerce_tax_amount(item.get("tax_amount")), rate
+            )
+        if amount == 0:
+            continue
+        debit_tax_type, credit_tax_type = determine_tax_types(doc_category, rate)
+        rows.append({
+            "debit_account": debit_account,
+            "debit_tax_type": debit_tax_type,
+            "credit_account": credit_account,
+            "credit_tax_type": credit_tax_type,
+            "amount": amount,
+            "description": _format_tax_label(rate),
+        })
+    return rows
 
 
 def _format_tax_label(tax_rate):
@@ -167,7 +230,7 @@ def aggregate_entries_by_tax_rate(entries):
         # 税区分・貸方科目はグループ内で一致するため先頭から採用
         head = group[0]
         aggregated.append({
-            "debit_account": _select_aggregated_debit_account(group),
+            "debit_account": select_aggregated_debit_account(group),
             "debit_tax_type": head.get("debit_tax_type", ""),
             "credit_account": head.get("credit_account", DEFAULT_CREDIT_ACCOUNT),
             "credit_tax_type": head.get("credit_tax_type", DEFAULT_CREDIT_TAX_TYPE),

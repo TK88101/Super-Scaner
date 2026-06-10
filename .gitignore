@@ -18,3 +18,4 @@ venv311/
 temp_downloads/
 MF_Import_Data.csv
 benchmark_results*.txt
+.playwright-mcp/
