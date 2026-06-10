@@ -147,30 +147,16 @@ Super Scaner/
 │   └── daily_backup.gs         # 每日備份 (GAS, 22:00 JST, Google サーバー実行)
 │
 ├── scripts/
-│   ├── deploy_ec2.sh           # AWS EC2 一鍵部署 (已棄用)
-│   ├── daily_backup.py         # 每日備份 (Python cron 版, 已被 GAS 版置換)
-│   └── install_daily_cron.sh   # Cron 安裝腳本 (已棄用)
+│   └── daily_backup.py         # 每日備份 (Python cron 版, 已被 GAS 版置換)
 │
 ├── monitoring/                 # 監控子系統
 │   ├── metrics_pusher.py       # 指標推送
 │   ├── cleanup.py              # 數據清理
 │   └── ...
 │
-├── Dockerfile                  # Docker 部署
 ├── requirements.txt            # Python 依賴
 ├── PRD.md                      # 產品需求文檔
 └── README.md                   # 本文件
-```
-
----
-
-## ☁️ AWS EC2 部署（已棄用）
-
-> EC2 t2.micro 只能運行 PaddleOCR v2.x，OCR 精度顯著降低。已改為 Windows 本機部署方案。
-
-```bash
-# 舊版部署命令（僅供參考）
-EC2_HOST=<IP> EC2_USER=ubuntu SSH_KEY="SuperScaner.pem" bash scripts/deploy_ec2.sh
 ```
 
 ---

@@ -76,8 +76,8 @@
 > | 環境 | 日付充填率 | T番号充填率 | No.1-59一致率 | 処理時間 |
 > |------|----------|----------|------------|---------|
 > | **Mac (M-series, v3)** | **100%** | **87.2%** | **基準** | **11分** |
-> | **Azure VM (D2s_v3, v3)** | **100%** | **86.6%** | **95.9%** | **1h42m** |
-> | EC2 (t2.micro, v2) | 低下 | 低下 | — | 5時間+ |
+>
+> ※ 雲端 VM（EC2/Azure）方案因算力不足（OOM・処理時間過長）已全面廢棄，現行為公司主機本地運行。
 
 ---
 
@@ -113,7 +113,7 @@
 | **雲端存儲** | Google Drive API v3 |
 | **數據輸出** | Google Sheets API (gspread) |
 | **通知系統** | Chatwork API v2 |
-| **部署方式** | Docker 容器 (AWS EC2), 資源制限付き (--cpus 0.9 --memory 768m) |
+| **部署方式** | 公司主機本地運行（`python main.py` 常駐輪詢；雲端僅為 Drive/Sheets/Gemini API 端點）|
 
 ### 2.2 模塊架構
 
@@ -161,7 +161,6 @@
 | `notifier.py` | Chatwork 通知發送 | 不變 |
 | `csv_writer.py` | MoneyForward CSV 生成（**已廢止**，參考保留）| 廢止 |
 | `scripts/daily_backup.py` | 每日備份（Python cron 版、已被 GAS 版置換）| 廢止 |
-| `scripts/install_daily_cron.sh` | EC2 cron 安裝腳本 | 廢止 |
 | `gas/daily_backup.gs` | GAS 日次バックアップ（Google サーバー実行、22:00 JST）| **新建** |
 
 ---
