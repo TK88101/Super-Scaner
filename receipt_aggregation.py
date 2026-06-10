@@ -17,6 +17,7 @@
 
 外部依存（gemini/paddleocr 等）を持たない純粋ロジックとして切り出し、単体テスト可能にする。
 """
+import unicodedata
 from decimal import ROUND_HALF_UP, Decimal
 
 # 集約後の借方勘定科目の決定戦略
@@ -67,25 +68,32 @@ def coerce_tax_included(value):
 
 
 def coerce_tax_amount(value):
-    """tax_amount を int に正規化する。欠損・変換不能な値は 0 に寄せる。"""
+    """tax_amount を int に正規化する。欠損・変換不能な値は 0 に寄せる。
+
+    Gemini は "1,300" "¥130" "￥１８" のような文字列を返すことがあるため、
+    NFKC 正規化で全角（￥／，／全角数字）を半角に揃えてからカンマ・通貨記号を
+    除去して変換する（sheets_output._normalize_amount と同方針。除去しないと
+    解析可能な票面税額まで 0 に落ち、計算兜底に化けて POS の丸めとずれる）。
+    """
     if value is None or isinstance(value, bool):
         return 0
+    if isinstance(value, str):
+        value = unicodedata.normalize("NFKC", value)
+        value = value.replace(",", "").replace("¥", "").replace("円", "").strip()
     try:
         return int(float(value))
     except (TypeError, ValueError):
         return 0
 
 
-def _tax_exclusive_total(base_amount, tax_amount, tax_rate):
-    """外税グループの税込金額を算出する。
+def _to_tax_inclusive_total(base_amount, tax_amount, tax_rate):
+    """外税グループの税抜合計を税込金額に換算する。
 
     票面の消費税額があればそれを優先（POS の丸め方式と一致させるため）。
     無ければ Σ票面金額 × 税率 を四捨五入して加算する。
     """
     if tax_amount:
         return base_amount + tax_amount
-    if not tax_rate:
-        return base_amount
     computed = (Decimal(base_amount) * Decimal(str(tax_rate))).quantize(
         Decimal("1"), rounding=ROUND_HALF_UP
     )
@@ -150,7 +158,7 @@ def aggregate_entries_by_tax_rate(entries):
         else:
             # 外税: 税抜の票面金額に消費税を加算して税込に正規化
             group_tax = sum(coerce_tax_amount(e.get("tax_amount")) for e in group)
-            total_amount = _tax_exclusive_total(base_amount, group_tax, rate)
+            total_amount = _to_tax_inclusive_total(base_amount, group_tax, rate)
         if total_amount == 0:
             continue
         # NOTE: 負の合計（返品・値引のみのグループ）は意図的にそのまま出力する。

@@ -404,6 +404,16 @@ class CoerceTaxAmountTest(unittest.TestCase):
     def test_string_number_parsed(self):
         self.assertEqual(agg.coerce_tax_amount("130"), 130)
 
+    def test_comma_and_currency_stripped(self):
+        self.assertEqual(agg.coerce_tax_amount("1,300"), 1300)
+        self.assertEqual(agg.coerce_tax_amount("¥130"), 130)
+        self.assertEqual(agg.coerce_tax_amount("130円"), 130)
+
+    def test_fullwidth_string_normalized(self):
+        # Gemini が全角で返しても票面税額を 0 に落とさない（NFKC 正規化）
+        self.assertEqual(agg.coerce_tax_amount("￥１８"), 18)
+        self.assertEqual(agg.coerce_tax_amount("1，300"), 1300)
+
     def test_invalid_is_zero(self):
         self.assertEqual(agg.coerce_tax_amount("abc"), 0)
 

@@ -13,12 +13,7 @@ except ImportError:
     vision = None
 from dotenv import load_dotenv
 from doc_types import DocType, DOC_TYPE_CONFIG
-from receipt_aggregation import (
-    aggregate_entries_by_tax_rate,
-    coerce_tax_amount,
-    coerce_tax_included,
-    coerce_tax_rate,
-)
+from receipt_aggregation import aggregate_entries_by_tax_rate, coerce_tax_rate
 
 try:
     from pypdf import PdfReader, PdfWriter
@@ -752,7 +747,7 @@ PROMPTS = {
             "items": [
                 {
                     "description": "品目・内容",
-                    "amount": 品目の票面金額(数値。内税レシートは税込額、外税レシートは税抜の印字額のまま),
+                    "amount": 品目の票面金額(数値。内税/外税での扱いは下記判定基準参照),
                     "tax_rate": 0.08 or 0.10 or 0,
                     "tax_included": true or false (内税=true / 外税=false。下記判定基準参照),
                     "tax_amount": 消費税額(数値, なければ0),
@@ -810,7 +805,6 @@ PROMPTS = {
   いずれか1品目の tax_amount に付与し、他の品目は 0 とする
 - 同一レシート内で内税と外税が混在する場合（例: 外税の商品+税込のレジ袋）は、
   品目ごとに正しく true/false を付けること
-- tax_rate=0（非課税・対象外）の品目は true とする
 
 【payment_method の判定基準】
 - コンビニ（FamilyMart, セブンイレブン等）での支払い → "現金"
@@ -947,18 +941,31 @@ def _determine_tax_types(doc_category, tax_rate):
 def _is_subtotal_line(description, amount, all_items):
     """小計・合計・税額集計行かどうかを判定"""
     # キーワード検出（品目名に含まれうる「対象」等は除外、集計行のみ）
+    # 部分一致は税語を含まない集計語のみ。消費税/外税/内税の語を部分一致にすると
+    # 「ゴルフ場利用税（消費税等対象外）」のような注記付き品目まで落として
+    # 対象外行が欠落するため、税語の行は下の全体一致パターンでのみ除外する
     subtotal_keywords = [
-        "小計", "合計", "税込合計", "税抜合計", "内消費税", "消費税額",
-        "課税対象額", "10%対象額", "8%対象額", "税額合計", "うち消費税",
+        "小計", "合計",
+        "課税対象額", "10%対象額", "8%対象額",
         "10%対象計", "8%対象計",
-        # 外税/内税レシートの税率別内訳行（例: "8%外税額", "(8%外税対象額)",
-        # "10%内税対象額", "内税計"）。品目と誤認して重複計上しないようにする
-        "外税額", "外税対象額", "内税額", "内税対象額", "内税計",
     ]
     desc_lower = description.lower()
     for kw in subtotal_keywords:
         if kw in desc_lower:
             return True
+
+    # 税率別内訳行・独立税額行（例: "消費税", "内消費税等 ¥218", "消費税額等(10%)",
+    # "8%外税額", "(8%外税対象額)", "10%外税 タイショウ", "内税計"）。
+    # 行全体が「税語＋税率＋金額」だけの場合のみ除外する（注記付き品目を誤って
+    # 落とさないため全体一致）。裸の税額行が品目として流れると二重計上になる
+    if re.fullmatch(
+        r"\s*[\(（]?\s*(?:[0-9０-９]+\s*[%％])?\s*"
+        r"(?:(?:内|うち)?消費税(?:対象)?(?:額|等)*|(?:内税|外税)\s*(?:対象|タイショウ)?\s*(?:額|計)?)"
+        r"\s*(?:[\(（]?\s*[0-9０-９]+\s*[%％]\s*[\)）]?)?"
+        r"\s*(?:[¥￥]?\s*[0-9０-９][0-9０-９,，]*\s*円?)?\s*[\)）]?\s*",
+        description,
+    ):
+        return True
 
     # 金額一致チェック: 他の品目の合計と一致する場合はスキップ
     if len(all_items) > 2:
@@ -1017,10 +1024,11 @@ def _build_entries_for_single_doc(doc):
             "credit_tax_type": credit_tax_type,
             "amount": int(amount),
             "description": item.get("description", ""),
-            # 以下3つは税率別集計用（集計後は破棄）。外税は集約時に税込へ正規化
+            # 以下3つは税率別集計用（集計後は破棄）。tax_included/tax_amount の
+            # 正規化は唯一の消費者 aggregate_entries_by_tax_rate 側で一元的に行う
             "tax_rate": tax_rate,
-            "tax_included": coerce_tax_included(item.get("tax_included")),
-            "tax_amount": coerce_tax_amount(item.get("tax_amount")),
+            "tax_included": item.get("tax_included"),
+            "tax_amount": item.get("tax_amount"),
         })
 
     # 仕様変更(5/25): 明細は逐行出力せず、税率(8%/10%)別の合計に集約する
