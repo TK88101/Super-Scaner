@@ -13,7 +13,12 @@ except ImportError:
     vision = None
 from dotenv import load_dotenv
 from doc_types import DocType, DOC_TYPE_CONFIG
-from receipt_aggregation import aggregate_entries_by_tax_rate, coerce_tax_rate
+from receipt_aggregation import (
+    aggregate_entries_by_tax_rate,
+    coerce_tax_amount,
+    coerce_tax_included,
+    coerce_tax_rate,
+)
 
 try:
     from pypdf import PdfReader, PdfWriter
@@ -747,8 +752,9 @@ PROMPTS = {
             "items": [
                 {
                     "description": "品目・内容",
-                    "amount": 税込金額(数値),
+                    "amount": 品目の票面金額(数値。内税レシートは税込額、外税レシートは税抜の印字額のまま),
                     "tax_rate": 0.08 or 0.10 or 0,
+                    "tax_included": true or false (内税=true / 外税=false。下記判定基準参照),
                     "tax_amount": 消費税額(数値, なければ0),
                     "debit_account": "費用の勘定科目を推定"
                 }
@@ -787,8 +793,24 @@ PROMPTS = {
 印字がない場合は以下のルールで判定:
 - 0.10（デフォルト）: ほとんどの品目。外食(店内飲食), 酒類, 日用品, サービス, 交通費等
 - 0.08: レシートに軽減税率マーク(※/軽/8%)がある飲食料品のみ。外食は対象外
-- 0: 銀行振込本体(bank_transfer)
+- 0: 銀行振込本体(bank_transfer)、および消費税の課税対象外・非課税の品目。
+  例: ゴルフ場利用税・宿泊税・入湯税・収入印紙・印紙代・行政手数料。
+  レシートの税率別内訳に「非課税金額」「対象外」として載る品目はこれに該当する
+  （品目側の「＊」「※」マークが軽減税率ではなく非課税を示すPOSもあるため、内訳行を優先）
 迷ったら 0.10 を使用してください
+
+【tax_included（内税/外税）の判定基準】
+- true（内税・デフォルト）: 票面の品目金額が税込で、消費税が「(内消費税等 ¥…)」
+  「○%内税対象額/内税額」のように括弧書き・内訳表示されるレシート。
+  amount は税込額、tax_amount は内訳の消費税額（表示があれば）
+- false（外税）: 票面が税抜価格で、消費税が「○%外税額」「消費税」等の独立行で
+  合計に加算されるレシート（品目に「外」マークが付くことが多い）。
+  amount は税抜の印字額のまま、tax_amount はレシート印字の消費税額。
+  品目単位の税額が不明な場合は、同じ税率グループの税額合計をそのグループの
+  いずれか1品目の tax_amount に付与し、他の品目は 0 とする
+- 同一レシート内で内税と外税が混在する場合（例: 外税の商品+税込のレジ袋）は、
+  品目ごとに正しく true/false を付けること
+- tax_rate=0（非課税・対象外）の品目は true とする
 
 【payment_method の判定基準】
 - コンビニ（FamilyMart, セブンイレブン等）での支払い → "現金"
@@ -929,6 +951,9 @@ def _is_subtotal_line(description, amount, all_items):
         "小計", "合計", "税込合計", "税抜合計", "内消費税", "消費税額",
         "課税対象額", "10%対象額", "8%対象額", "税額合計", "うち消費税",
         "10%対象計", "8%対象計",
+        # 外税/内税レシートの税率別内訳行（例: "8%外税額", "(8%外税対象額)",
+        # "10%内税対象額", "内税計"）。品目と誤認して重複計上しないようにする
+        "外税額", "外税対象額", "内税額", "内税対象額", "内税計",
     ]
     desc_lower = description.lower()
     for kw in subtotal_keywords:
@@ -992,7 +1017,10 @@ def _build_entries_for_single_doc(doc):
             "credit_tax_type": credit_tax_type,
             "amount": int(amount),
             "description": item.get("description", ""),
-            "tax_rate": tax_rate,  # 税率別集計用（集計後は破棄）
+            # 以下3つは税率別集計用（集計後は破棄）。外税は集約時に税込へ正規化
+            "tax_rate": tax_rate,
+            "tax_included": coerce_tax_included(item.get("tax_included")),
+            "tax_amount": coerce_tax_amount(item.get("tax_amount")),
         })
 
     # 仕様変更(5/25): 明細は逐行出力せず、税率(8%/10%)別の合計に集約する

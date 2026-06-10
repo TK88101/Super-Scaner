@@ -14,8 +14,13 @@ import receipt_aggregation as agg
 from receipt_aggregation import aggregate_entries_by_tax_rate, coerce_tax_rate
 
 
-def _item(amount, tax_rate, debit_account, debit_tax_type, description="品目"):
-    """明細エントリ生成ヘルパー。"""
+def _item(amount, tax_rate, debit_account, debit_tax_type, description="品目",
+          tax_included=True, tax_amount=0):
+    """明細エントリ生成ヘルパー。
+
+    tax_included: True=内税(税込表示)、False=外税(税抜表示+消費税別建て)。
+    tax_amount:   外税レシートの票面消費税額（内税では集約時に無視される）。
+    """
     return {
         "debit_account": debit_account,
         "debit_tax_type": debit_tax_type,
@@ -24,6 +29,8 @@ def _item(amount, tax_rate, debit_account, debit_tax_type, description="品目")
         "amount": amount,
         "description": description,
         "tax_rate": tax_rate,
+        "tax_included": tax_included,
+        "tax_amount": tax_amount,
     }
 
 
@@ -181,6 +188,224 @@ class AggregateEntriesByTaxRateTest(unittest.TestCase):
             )
         finally:
             agg.AGGREGATED_DEBIT_ACCOUNT_STRATEGY = original
+
+
+class RealSamplePatternTest(unittest.TestCase):
+    """顧客フィードバック表（6/10 版）の6パターン実票サンプルに基づく検証。
+
+    Google Sheet「自動仕訳ツール 税区分」の期待出力と完全一致させる。
+    金額は実票（紅枠スクリーンショット）から検証済み。
+    """
+
+    def test_p1_gooday_8_and_10_uchizei(self):
+        # Arrange: GooDay 甘木店（8%+10% 内税）。割引は8%対象額に純額化済み
+        entries = [
+            _item(124, 0.08, "備品・消耗品費", "課対仕入8% (軽)", "紅茶花伝(割引後)"),
+            _item(940, 0.10, "備品・消耗品費", "課対仕入10%", "ジョイントコーク"),
+            _item(591, 0.10, "備品・消耗品費", "課対仕入10%", "モール外角"),
+        ]
+
+        # Act
+        result = aggregate_entries_by_tax_rate(entries)
+
+        # Assert: 8%行=124, 10%行=1531（出現順を保持）
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["description"], "8%対象")
+        self.assertEqual(result[0]["amount"], 124)
+        self.assertEqual(result[1]["description"], "10%対象")
+        self.assertEqual(result[1]["amount"], 1531)
+
+    def test_p2_tonkatsu_10_only_uchizei(self):
+        # Arrange: とんかつきく富（10%のみ 内税、ランチ2点）
+        entries = [
+            _item(1200, 0.10, "接待交際費", "課対仕入10%", "ヒレ＆メンチカツランチ"),
+            _item(1200, 0.10, "接待交際費", "課対仕入10%", "ヒレカツランチ"),
+        ]
+
+        # Act
+        result = aggregate_entries_by_tax_rate(entries)
+
+        # Assert: 1行のみ、税込合計2400
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["amount"], 2400)
+        self.assertEqual(result[0]["debit_tax_type"], "課対仕入10%")
+
+    def test_p3_chidori_8_sotozei_with_printed_tax(self):
+        # Arrange: 千鳥饅頭（8%のみ 外税）。票面: 対象額1,620 + 8%外税額130
+        entries = [
+            _item(1620, 0.08, "接待交際費", "課対仕入8% (軽)", "千鳥饅頭詰合せ",
+                  tax_included=False, tax_amount=130),
+        ]
+
+        # Act
+        result = aggregate_entries_by_tax_rate(entries)
+
+        # Assert: 借方金額は税込 1,750（=1,620+130）。税抜のまま出さない
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["amount"], 1750)
+        self.assertEqual(result[0]["debit_tax_type"], "課対仕入8% (軽)")
+
+    def test_p3_sotozei_without_printed_tax_falls_back_to_rounding(self):
+        # Arrange: 外税だが票面税額を抽出できなかった場合（tax_amount=0）
+        entries = [
+            _item(1620, 0.08, "接待交際費", "課対仕入8% (軽)", "千鳥饅頭詰合せ",
+                  tax_included=False, tax_amount=0),
+        ]
+
+        # Act
+        result = aggregate_entries_by_tax_rate(entries)
+
+        # Assert: 1,620×8%=129.6 → 四捨五入130 を加算して税込1,750
+        self.assertEqual(result[0]["amount"], 1750)
+
+    def test_p4_golf_8_10_and_taxfree_uchizei(self):
+        # Arrange: ゴルフ利用明細（8%+10%+非課税 内税）。
+        # 10%: プレーフィ13,490−割引2,000+担々麺1,650+おにぎり300=13,440
+        # 8%: 和菓子270+キリンレモン380=650 / 非課税: 利用税500
+        entries = [
+            _item(13490, 0.10, "接待交際費", "課対仕入10%", "プレーフィ"),
+            _item(-2000, 0.10, "接待交際費", "課対仕入10%", "グリーンメンテナンス割"),
+            _item(1650, 0.10, "接待交際費", "課対仕入10%", "担々麺"),
+            _item(300, 0.10, "接待交際費", "課対仕入10%", "おにぎり"),
+            _item(270, 0.08, "接待交際費", "課対仕入8% (軽)", "和菓子"),
+            _item(380, 0.08, "接待交際費", "課対仕入8% (軽)", "キリンレモン"),
+            _item(500, 0, "接待交際費", "対象外", "ゴルフ場利用税"),
+        ]
+
+        # Act
+        result = aggregate_entries_by_tax_rate(entries)
+
+        # Assert: 10%/8%/対象外 の3行（出現順）、貸借合計14,590と整合
+        self.assertEqual(len(result), 3)
+        self.assertEqual(
+            [(r["description"], r["amount"]) for r in result],
+            [("10%対象", 13440), ("8%対象", 650), ("対象外", 500)],
+        )
+        self.assertEqual(sum(r["amount"] for r in result), 14590)
+
+    def test_p5_akizuki_10_and_taxfree_uchizei(self):
+        # Arrange: 秋月CC（10%+非課税 内税）。プレーフィ6,700−値引700 / 利用税200
+        entries = [
+            _item(6700, 0.10, "接待交際費", "課対仕入10%", "プレーフィ"),
+            _item(-700, 0.10, "接待交際費", "課対仕入10%", "特別値引"),
+            _item(200, 0, "接待交際費", "対象外", "ゴルフ場利用税"),
+        ]
+
+        # Act
+        result = aggregate_entries_by_tax_rate(entries)
+
+        # Assert: 10%行=6,000 と 対象外行=200、合計6,200
+        self.assertEqual(len(result), 2)
+        self.assertEqual(
+            [(r["description"], r["amount"]) for r in result],
+            [("10%対象", 6000), ("対象外", 200)],
+        )
+
+    def test_p6_trial_uchizei_sotozei_mixed_not_merged(self):
+        # Arrange: TRIAL（内税と外税が混在）。同じ10%でも内税/外税は別行。
+        # 外税グループ: 596+180+356=1,132 + 外税113 = 1,245 / 内税: レジ袋5
+        entries = [
+            _item(596, 0.10, "備品・消耗品費", "課対仕入10%", "領収証小切手判",
+                  tax_included=False, tax_amount=113),
+            _item(180, 0.10, "備品・消耗品費", "課対仕入10%", "ウェットフローリング(値引後)",
+                  tax_included=False),
+            _item(356, 0.10, "備品・消耗品費", "課対仕入10%", "トイレクリーナー",
+                  tax_included=False),
+            _item(5, 0.10, "備品・消耗品費", "課対仕入10%", "レジ袋"),
+        ]
+
+        # Act
+        result = aggregate_entries_by_tax_rate(entries)
+
+        # Assert: 10%外税1,245 と 10%内税5 の2行（合算して1,250にしない）
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["amount"], 1245)
+        self.assertEqual(result[1]["amount"], 5)
+        self.assertTrue(all(r["debit_tax_type"] == "課対仕入10%" for r in result))
+
+    def test_p6_sotozei_fallback_rounding_when_no_tax_amount(self):
+        # Arrange: 外税グループの票面税額が無い場合、1,132×10%=113.2→113
+        entries = [
+            _item(596, 0.10, "備品・消耗品費", "課対仕入10%", tax_included=False),
+            _item(180, 0.10, "備品・消耗品費", "課対仕入10%", tax_included=False),
+            _item(356, 0.10, "備品・消耗品費", "課対仕入10%", tax_included=False),
+        ]
+
+        # Act
+        result = aggregate_entries_by_tax_rate(entries)
+
+        # Assert
+        self.assertEqual(result[0]["amount"], 1245)
+
+    def test_negative_sotozei_group_passes_through(self):
+        # Arrange: 純返品の外税グループ（負額）。無断で行を落とさず赤字行として残す
+        entries = [
+            _item(-500, 0.10, "備品・消耗品費", "課対仕入10%", "返品",
+                  tax_included=False, tax_amount=-50),
+        ]
+
+        # Act
+        result = aggregate_entries_by_tax_rate(entries)
+
+        # Assert: -500-50=-550 の赤字行（人手確認に委ねる）
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["amount"], -550)
+
+    def test_zero_rate_normalized_to_single_taxfree_row(self):
+        # Arrange: rate=0 で Gemini が tax_included を true/false 混在で返しても
+        # 対象外行は1行に集約される（プロンプト契約違反への防御）
+        entries = [
+            _item(300, 0, "接待交際費", "対象外", "宿泊税", tax_included=True),
+            _item(200, 0, "接待交際費", "対象外", "入湯税", tax_included=False),
+        ]
+
+        # Act
+        result = aggregate_entries_by_tax_rate(entries)
+
+        # Assert: 2行に割れず1行500
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["amount"], 500)
+        self.assertEqual(result[0]["description"], "対象外")
+
+    def test_uchizei_ignores_tax_amount(self):
+        # Arrange: 内税では amount が既に税込のため tax_amount を加算してはならない
+        entries = [
+            _item(2400, 0.10, "接待交際費", "課対仕入10%", tax_included=True,
+                  tax_amount=218),
+        ]
+
+        # Act
+        result = aggregate_entries_by_tax_rate(entries)
+
+        # Assert: 2,400 のまま（2,618 にしない）
+        self.assertEqual(result[0]["amount"], 2400)
+
+
+class CoerceTaxIncludedTest(unittest.TestCase):
+    def test_none_defaults_to_included(self):
+        # 日本のレシートは税込表示が大半のため既定は内税
+        self.assertTrue(agg.coerce_tax_included(None))
+
+    def test_bool_passthrough(self):
+        self.assertTrue(agg.coerce_tax_included(True))
+        self.assertFalse(agg.coerce_tax_included(False))
+
+    def test_string_false_parsed(self):
+        self.assertFalse(agg.coerce_tax_included("false"))
+
+    def test_invalid_value_defaults_to_included(self):
+        self.assertTrue(agg.coerce_tax_included("???"))
+
+
+class CoerceTaxAmountTest(unittest.TestCase):
+    def test_none_is_zero(self):
+        self.assertEqual(agg.coerce_tax_amount(None), 0)
+
+    def test_string_number_parsed(self):
+        self.assertEqual(agg.coerce_tax_amount("130"), 130)
+
+    def test_invalid_is_zero(self):
+        self.assertEqual(agg.coerce_tax_amount("abc"), 0)
 
 
 class CoerceTaxRateTest(unittest.TestCase):

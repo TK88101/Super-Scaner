@@ -97,3 +97,35 @@
 3. python3 -m unittest 全緑
 4. PR で feat/receipt-tax-rate-aggregation → main マージ
 5. 顧客は git pull origin main で取得
+
+=== Session 5 (2026-06-10) — 6パターン対応実装（摘要・科目ルールのみ回答待ち）===
+状態: 非ブロック分を実装完了・残り2点（借方科目ルール/摘要書式）は顧客回答待ち
+
+6/10 進展:
+- 員工の Google Sheet が6パターンに拡張（新規: ⑥内税外税混在 TRIAL 1,245+5/貸方未払金1,250）
+  ※Sheet はリンク公開、export?format=xlsx で匿名取得可。6枚の実票截図は xl/media/ に内嵌
+  全6パターンを2重チェック（読取+対抗検証）で金額検証済み、期待仕訳と零差額
+- Sheet が実質回答した点: 外税の借方金額=税込(③⑥)/非課税行は税区分「対象外」で独立1行/
+  ゴルフ票は全行「接待交際費」(租税公課ではない)/グループ化キー=税率×内税外税(⑥)
+- Chatwork で5ルール復唱+2点追問を送信(message_id 2116435721454886912)
+  → チョウギョウエイさん「明天之内回复」(6/11中に回答予定)、テスト用実票も提供予定
+
+実装済み（全35テスト緑、python3 -m unittest test_receipt_aggregation）:
+- receipt_aggregation.py: グループ化キーを(税率×tax_included)に拡張。同率でも内税/外税は別行
+  外税グループは税込に正規化: Σ票面額+Σ票面税額、税額欠損時は ROUND_HALF_UP(Σ額×率) 兜底
+  coerce_tax_included/coerce_tax_amount 追加（null/文字列防御）。rate=0 は内税側に正規化
+  （対象外行が2行に割れる事故防止）。負合計グループは赤字行として意図的に直通
+- ocr_engine.py: RECEIPT prompt に tax_included 契約と内税/外税判定基準を追加
+  tax_rate=0 をゴルフ場利用税・宿泊税・入湯税・印紙代等の非課税項目に拡張
+  （品目の＊/※が非課税を示すPOSがあるため税率別内訳行を優先）
+  _is_subtotal_line に外税額/内税対象額等の内訳行キーワード追加（重複計上防止）
+- test_receipt_aggregation.py: 6パターン実票金額の回帰テスト+coerce/エッジテスト追加
+
+コードレビュー済み(WARNING→対処): 負額外税グループの挙動明文化+テスト、rate=0正規化、
+max_amount戦略の負額混在コメント。未対処(意図的): tax_amount の None哨兵化（YAGNI）
+
+残タスク（顧客回答後、即日対応可能）:
+1. 借方勘定科目ルール反映（AGGREGATED_DEBIT_ACCOUNT_STRATEGY 切替 or 新戦略追加）
+2. 摘要書式反映（_format_tax_label / sheets_output 前置の調整）
+3. 提供される実票で local_test.py のE2E確認（要 GEMINI_API_KEY）
+4. PR作成 → main マージ
