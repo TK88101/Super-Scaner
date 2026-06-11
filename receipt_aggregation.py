@@ -15,6 +15,12 @@
 - 非課税・不課税品目（ゴルフ場利用税・宿泊税等）は tax_rate=0 として独立1行
   （税区分「対象外」）に集約される。
 
+6/11 顧客回答で確定した仕様:
+- 摘要は「店名 税率」形式（例: ファミマ 10% / ファミマ 8% / ファミマ 対象外）。
+  税率ラベルに「対象」後綴は付けない。店名は sheets_output 側で空白区切りで前置。
+- 普通領収書は1枚=1借方科目（票全体の用途で決定。ゴルフ場→接待交際費等）。
+  整票判定は呼び出し側 ocr_engine._build_entries_for_single_doc で行う。
+
 外部依存（gemini/paddleocr 等）を持たない純粋ロジックとして切り出し、単体テスト可能にする。
 """
 import unicodedata
@@ -177,10 +183,11 @@ def build_rows_from_tax_summary(tax_summary, debit_account, doc_category="receip
 def _format_tax_label(tax_rate):
     """集約行の摘要に使う税率ラベルを生成する。
 
-    NOTE: 店名は付けない。sheets_output 側で「{店名} - {description}」と
-    前置されるため、ここで店名を入れると二重になる。
+    NOTE: 店名は付けない。sheets_output 側で領収書は「{店名} {description}」と
+    空白区切りで前置されるため、ここで店名を入れると二重になる。
+    「対象」後綴は付けない（6/11 顧客回答: 例 ファミマ 10%）。
     """
-    return f"{int(round(tax_rate * 100))}%対象" if tax_rate else "対象外"
+    return f"{int(round(tax_rate * 100))}%" if tax_rate else "対象外"
 
 
 def aggregate_entries_by_tax_rate(entries):

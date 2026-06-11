@@ -53,8 +53,8 @@ class AggregateEntriesByTaxRateTest(unittest.TestCase):
         self.assertEqual(by_rate["課対仕入8% (軽)"]["amount"], 280)
         self.assertEqual(by_rate["課対仕入10%"]["amount"], 720)
         # 摘要は税率ラベルのみ（店名は sheets_output 側で前置されるため二重防止）
-        self.assertEqual(by_rate["課対仕入8% (軽)"]["description"], "8%対象")
-        self.assertEqual(by_rate["課対仕入10%"]["description"], "10%対象")
+        self.assertEqual(by_rate["課対仕入8% (軽)"]["description"], "8%")
+        self.assertEqual(by_rate["課対仕入10%"]["description"], "10%")
 
     def test_single_tax_rate_produces_one_line(self):
         # Arrange: 10% のみ（単一税率）
@@ -69,7 +69,7 @@ class AggregateEntriesByTaxRateTest(unittest.TestCase):
         # Assert: 合計1行のみ
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["amount"], 800)
-        self.assertEqual(result[0]["description"], "10%対象")
+        self.assertEqual(result[0]["description"], "10%")
 
     def test_same_rate_different_accounts_uses_max_amount(self):
         # Arrange: 同一8%グループで科目が異なる（弁当500 vs 購物袋30）
@@ -119,7 +119,7 @@ class AggregateEntriesByTaxRateTest(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["amount"], 500)
         self.assertEqual(result[0]["debit_tax_type"], "課対仕入10%")
-        self.assertEqual(result[0]["description"], "10%対象")
+        self.assertEqual(result[0]["description"], "10%")
 
     def test_string_tax_rate_does_not_crash_and_groups(self):
         # Arrange: Gemini が文字列 "0.08" を返したエントリ（round(str*100) で従来クラッシュ）
@@ -128,10 +128,10 @@ class AggregateEntriesByTaxRateTest(unittest.TestCase):
         # Act: TypeError を出さず正常に集約できる
         result = aggregate_entries_by_tax_rate(entries)
 
-        # Assert: 0.08 として扱われ「8%対象」になる
+        # Assert: 0.08 として扱われ「8%」になる
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["amount"], 150)
-        self.assertEqual(result[0]["description"], "8%対象")
+        self.assertEqual(result[0]["description"], "8%")
 
     def test_zero_rate_not_coerced_to_default(self):
         # Arrange: 税率0(対象外)は既定税率に変えてはならない（or 演算子バグ回帰防止）
@@ -167,7 +167,7 @@ class AggregateEntriesByTaxRateTest(unittest.TestCase):
         result = aggregate_entries_by_tax_rate(entries)
 
         # Assert
-        self.assertEqual(result[0]["description"], "10%対象")
+        self.assertEqual(result[0]["description"], "10%")
 
     def test_fixed_strategy_uses_fixed_account(self):
         # Arrange: 戦略を fixed に切り替え（テスト後に必ず復元）
@@ -210,9 +210,9 @@ class RealSamplePatternTest(unittest.TestCase):
 
         # Assert: 8%行=124, 10%行=1531（出現順を保持）
         self.assertEqual(len(result), 2)
-        self.assertEqual(result[0]["description"], "8%対象")
+        self.assertEqual(result[0]["description"], "8%")
         self.assertEqual(result[0]["amount"], 124)
-        self.assertEqual(result[1]["description"], "10%対象")
+        self.assertEqual(result[1]["description"], "10%")
         self.assertEqual(result[1]["amount"], 1531)
 
     def test_p2_tonkatsu_10_only_uchizei(self):
@@ -279,7 +279,7 @@ class RealSamplePatternTest(unittest.TestCase):
         self.assertEqual(len(result), 3)
         self.assertEqual(
             [(r["description"], r["amount"]) for r in result],
-            [("10%対象", 13440), ("8%対象", 650), ("対象外", 500)],
+            [("10%", 13440), ("8%", 650), ("対象外", 500)],
         )
         self.assertEqual(sum(r["amount"] for r in result), 14590)
 
@@ -298,7 +298,7 @@ class RealSamplePatternTest(unittest.TestCase):
         self.assertEqual(len(result), 2)
         self.assertEqual(
             [(r["description"], r["amount"]) for r in result],
-            [("10%対象", 6000), ("対象外", 200)],
+            [("10%", 6000), ("対象外", 200)],
         )
 
     def test_p6_trial_uchizei_sotozei_mixed_not_merged(self):
@@ -394,7 +394,7 @@ class BuildRowsFromTaxSummaryTest(unittest.TestCase):
             {"tax_rate": 0.10, "tax_included": True, "base_amount": 1531, "tax_amount": 139},
         ])
         self.assertEqual([(r["description"], r["amount"]) for r in rows],
-                         [("8%対象", 124), ("10%対象", 1531)])
+                         [("8%", 124), ("10%", 1531)])
         self.assertEqual(rows[0]["debit_tax_type"], "課対仕入8% (軽)")
         self.assertEqual(rows[1]["debit_tax_type"], "課対仕入10%")
 
@@ -422,7 +422,7 @@ class BuildRowsFromTaxSummaryTest(unittest.TestCase):
             {"tax_rate": 0, "tax_included": True, "base_amount": 500, "tax_amount": 0},
         ], account="接待交際費")
         self.assertEqual([(r["description"], r["amount"]) for r in rows],
-                         [("10%対象", 13440), ("8%対象", 650), ("対象外", 500)])
+                         [("10%", 13440), ("8%", 650), ("対象外", 500)])
         # 非課税行も票全体の代表科目（接待交際費）を共有する
         self.assertTrue(all(r["debit_account"] == "接待交際費" for r in rows))
         self.assertEqual(rows[2]["debit_tax_type"], "対象外")

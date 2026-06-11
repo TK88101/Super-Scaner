@@ -4,6 +4,7 @@ import time
 import gspread
 from gspread_formatting import CellFormat, Color, format_cell_range, format_cell_ranges, Border, Borders
 from datetime import datetime, timezone, timedelta
+from doc_types import DocType
 
 JST = timezone(timedelta(hours=9))
 
@@ -16,6 +17,19 @@ MF_HEADERS = [
     "タグ", "MF仕訳タイプ", "決算整理仕訳", "作成日時", "作成者",
     "最終更新日時", "最終更新者", "原票URL"
 ]
+
+
+def _build_description(doc_type, vendor_name, item_description):
+    """摘要文字列を組み立てる。
+
+    領収書（6/11 顧客回答）: 「店名 税率」形式（空白区切り、例: ファミマ 10%）。
+    vendor が空の場合は strip で先頭空白を付けない。同 tab 内の振込控え
+    （bank_transfer）行も tab 内格式統一のため同形式を適用する。
+    その他の doc_type は既存の「店名 - 内容」形式を維持する。
+    """
+    if doc_type == DocType.RECEIPT:
+        return f"{vendor_name} {item_description}".strip()
+    return f"{vendor_name} - {item_description}"
 
 
 class SheetsOutputWriter:
@@ -186,7 +200,7 @@ class SheetsOutputWriter:
             credit_account = entry.get("credit_account", "")
             credit_account = ACCOUNT_MAP.get(credit_account, credit_account)
 
-            description = f"{vendor_name} - {entry.get('description', '')}"
+            description = _build_description(doc_type, vendor_name, entry.get('description', ''))
 
             now_jst = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
 

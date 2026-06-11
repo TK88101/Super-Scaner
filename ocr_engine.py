@@ -4,6 +4,7 @@ import json
 import re
 import gc
 import time
+import unicodedata
 import http.client
 import google.generativeai as genai
 from google.api_core import exceptions as google_exceptions
@@ -610,7 +611,8 @@ _VENDOR_ACCOUNT_OVERRIDE = {
     "ファミリーマート": "備品・消耗品費",
     "FamilyMart": "備品・消耗品費",
     "エディオン": "備品・消耗品費",
-    "MEGA": "備品・消耗品費",
+    # メガドン・キホーテ。裸の "MEGA" は casefold 後に omega/mega 系店名を誤爆するため収窄
+    "MEGAドン": "備品・消耗品費",
     # 飲食店・弁当店 → 接待交際費
     "Mister Donut": "接待交際費",
     "ミスタードーナツ": "接待交際費",
@@ -633,16 +635,50 @@ _VENDOR_ACCOUNT_OVERRIDE = {
     "タクシー": "旅費交通費",
     # 空港 → 旅費交通費
     "空港": "旅費交通費",
+    # ゴルフ用品店は物販 → 備品・消耗品費（先勝ちのため除外項を一般語より前に置く）
+    "ゴルフ5": "備品・消耗品費",
+    "GOLF5": "備品・消耗品費",
+    "ゴルフパートナー": "備品・消耗品費",
+    "GOLF Partner": "備品・消耗品費",
+    "つるやゴルフ": "備品・消耗品費",
+    "ゴルフ用品": "備品・消耗品費",
+    # ゴルフ場 → 接待交際費（6/11 顧客回答）
+    "ゴルフ": "接待交際費",
+    "カントリークラブ": "接待交際費",
+    "カンツリー": "接待交際費",
+    "GOLF": "接待交際費",
 }
 
+def _normalize_vendor_key(text):
+    """ベンダー照合用の正規化（NFKC + casefold + 空白除去）。
+
+    OCR は「ゴルフ５」のような全角数字・半角カナや、「GOLF 5」のように
+    語中へ空白を挟んだ店名を返すことがあるため、全角半角・大文字小文字・
+    空白をすべて無視して照合する。
+    """
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text)).casefold()
+
+
+# キーワードはモジュール定数のため、照合用正規化をロード時に1回だけ前計算する
+_VENDOR_ACCOUNT_OVERRIDE_NORMALIZED = [
+    (_normalize_vendor_key(keyword), account)
+    for keyword, account in _VENDOR_ACCOUNT_OVERRIDE.items()
+]
+
+
 def _override_account_by_vendor(vendor, gemini_account):
-    """取引先名に基づいて科目を強制上書きする。Gemini の分類揺れを防止。"""
+    """取引先名に基づいて科目を強制上書きする。Gemini の分類揺れを防止。
+
+    照合は _normalize_vendor_key（NFKC・casefold・空白除去）で行う。
+    辞書の定義順で最初に命中したキーワードを無条件で採用する（厳格な先勝ち）。
+    GOLF5 のような除外項は一般キーワード（GOLF 等）より前に定義すること。
+    """
     if not vendor:
         return gemini_account
-    for keyword, forced_account in _VENDOR_ACCOUNT_OVERRIDE.items():
-        if keyword in vendor:
-            if gemini_account != forced_account:
-                return forced_account
+    vendor_norm = _normalize_vendor_key(vendor)
+    for keyword_norm, forced_account in _VENDOR_ACCOUNT_OVERRIDE_NORMALIZED:
+        if keyword_norm in vendor_norm:
+            return forced_account
     return gemini_account
 
 
@@ -1008,6 +1044,9 @@ def _build_entries_for_single_doc(doc):
     pay_method = str(doc.get("payment_method", "現金"))
     credit_account = _determine_credit_account(pay_method, doc_category)
 
+    # 取引先名は items が空でも参照するためループ前に取得
+    vendor = doc.get("vendor", "")
+
     # 有効金額の品目数を事前カウント（領収証の単一合計行を誤フィルタ防止）
     valid_items = [it for it in doc.get("items", [])
                    if it.get("amount") and int(it.get("amount", 0)) != 0]
@@ -1026,9 +1065,11 @@ def _build_entries_for_single_doc(doc):
         tax_rate = coerce_tax_rate(item.get("tax_rate"))
         debit_account = item.get("debit_account", "消耗品費")
 
-        # 取引先名に基づく科目兜底（Gemini 分類揺れ防止）
-        vendor = doc.get("vendor", "")
-        debit_account = _override_account_by_vendor(vendor, debit_account)
+        # 取引先名に基づく科目兜底（Gemini 分類揺れ防止）。bank_transfer/
+        # fee_receipt は借方科目が固定（未払金/支払手数料）のため対象外
+        # （振込先がゴルフ場等でも上書きしない）
+        if doc_category == "receipt":
+            debit_account = _override_account_by_vendor(vendor, debit_account)
 
         # 税区分決定
         debit_tax_type, credit_tax_type = determine_tax_types(
@@ -1049,16 +1090,28 @@ def _build_entries_for_single_doc(doc):
             "tax_amount": item.get("tax_amount"),
         })
 
+    # 6/11 顧客回答: 普通領収書は1枚=1科目（票全体の用途で借方科目を決定）。
+    # bank_transfer / fee_receipt は複数科目（振込本体=未払金、手数料=支払手数料）
+    # が正当なため対象外。entries が空（items 空/全行小計）でも override を通す:
+    # select_aggregated_debit_account([]) は固定科目を返すが、vendor override
+    # （ゴルフ場→接待交際費等）で補正できるため、ここで弾かない。
+    repr_account = None
+    if doc_category == "receipt":
+        repr_account = _override_account_by_vendor(
+            vendor, select_aggregated_debit_account(entries))
+        entries = [{**e, "debit_account": repr_account} for e in entries]
+
     # 内訳優先(6/10): レシートに税率別内訳（○%対象額・消費税額）が印字
     # されていれば、それを正解として直接行を起こす。Gemini の逐品目集計
     # （割引の二重控除・税率誤判定・内外税混在の取りこぼし）を回避する。
-    # 借方科目は票全体の代表科目を全行へ適用（高ゴルフ票=接待交際費等、
+    # 借方科目は票全体の代表科目を全行へ適用（ゴルフ票=接待交際費等、
     # 顧客サンプルの「同票同科目」に一致）。
     tax_summary = doc.get("tax_summary") or []
     if tax_summary:
-        repr_account = select_aggregated_debit_account(entries)
+        summary_account = (repr_account if repr_account is not None
+                           else select_aggregated_debit_account(entries))
         rows = build_rows_from_tax_summary(
-            tax_summary, repr_account, doc_category, credit_account
+            tax_summary, summary_account, doc_category, credit_account
         )
         if rows:
             return rows
