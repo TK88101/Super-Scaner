@@ -15,10 +15,12 @@ except ImportError:
 from dotenv import load_dotenv
 from doc_types import DocType, DOC_TYPE_CONFIG
 from receipt_aggregation import (
+    KEIYUZEI_DEBIT_ACCOUNT,
     aggregate_entries_by_tax_rate,
     build_rows_from_tax_summary,
     coerce_tax_rate,
     determine_tax_types,
+    is_keiyuzei_text,
     select_aggregated_debit_account,
 )
 
@@ -801,7 +803,8 @@ PROMPTS = {
                     "tax_rate": 0.08 or 0.10 or 0,
                     "tax_included": true or false,
                     "base_amount": その税率区分の対象額(数値),
-                    "tax_amount": その税率区分の消費税額(数値, なければ0)
+                    "tax_amount": その税率区分の消費税額(数値, なければ0),
+                    "label": "非課税/対象外行(tax_rate=0)のみ票面の名目（例: \"軽油税\", \"ゴルフ場利用税\", \"非課税金額\"）。課税行は空文字"
                 }
             ]
         }
@@ -847,7 +850,8 @@ PROMPTS = {
   （tax_rate=0、tax_included=true）、10%課税グループに含めないこと。
   このとき燃料品目側の金額は軽油税を除いた本体額に分解し、二重計上しないこと
   （例: 軽油 ¥5,000・内軽油税 ¥493 → 品目「軽油」¥4,507(10%) と「軽油税」¥493(0%)
-  の2行。全品目の金額合計が票面の合計金額と一致すること）
+  の2行。全品目の金額合計が票面の合計金額と一致すること）。
+  軽油税品目の debit_account は "租税公課"（燃料本体は "旅費交通費" のまま）
 迷ったら 0.10 を使用してください
 
 【tax_included（内税/外税）の判定基準】
@@ -872,7 +876,7 @@ PROMPTS = {
   ・外税表示（"(8%外税対象額) ¥1,620 / 8%外税額 ¥130"、"10%外税 タイショウ ¥1,132 / 10%外税 ¥113"）
     → tax_included=false、base_amount=税抜対象額（1620 / 1132）、tax_amount=外税額（130 / 113）
   ・非課税/対象外（"非課税金額 ¥500"、"ゴルフ場利用税 ¥200"、"軽油税 ¥493"）→ tax_rate=0、tax_included=true、
-    base_amount=その金額、tax_amount=0
+    base_amount=その金額、tax_amount=0、label=票面の名目（"軽油税"・"ゴルフ場利用税"・"非課税金額" 等）
 - 税率別内訳が印字されていないレシート（単純な品目羅列のみ）は tax_summary=[] とする。
   内訳行を品目(items)に混ぜないこと。
 
@@ -1101,23 +1105,43 @@ def _build_entries_for_single_doc(doc):
     # が正当なため対象外。entries が空（items 空/全行小計）でも override を通す:
     # select_aggregated_debit_account([]) は固定科目を返すが、vendor override
     # （ゴルフ場→接待交際費等）で補正できるため、ここで弾かない。
+    # 6/12 顧客サンプル: 軽油税（軽油引取税）の品目だけは整票一科目の例外として
+    # 租税公課に固定する（代表科目の選出からも除外）。ゴルフ場利用税等の
+    # 他の非課税項は従来どおり整票科目に統一される。
     repr_account = None
+    keiyuzei_amounts = frozenset()
     if doc_category == "receipt":
+        # 例外は rate=0 行限定: Gemini が分解せず課税の燃料行に「内軽油税」
+        # 注記を残しても、10%行を租税公課へ流出させない
+        flagged = [
+            (e, is_keiyuzei_text(e.get("description"))
+                and not coerce_tax_rate(e.get("tax_rate")))
+            for e in entries
+        ]
+        keiyuzei_amounts = frozenset(
+            e["amount"] for e, is_keiyuzei in flagged if is_keiyuzei)
+        normal_entries = [e for e, is_keiyuzei in flagged if not is_keiyuzei]
         repr_account = _override_account_by_vendor(
-            vendor, select_aggregated_debit_account(entries))
-        entries = [{**e, "debit_account": repr_account} for e in entries]
+            vendor, select_aggregated_debit_account(normal_entries or entries))
+        entries = [
+            {**e, "debit_account": KEIYUZEI_DEBIT_ACCOUNT if is_keiyuzei
+             else repr_account}
+            for e, is_keiyuzei in flagged
+        ]
 
     # 内訳優先(6/10): レシートに税率別内訳（○%対象額・消費税額）が印字
     # されていれば、それを正解として直接行を起こす。Gemini の逐品目集計
     # （割引の二重控除・税率誤判定・内外税混在の取りこぼし）を回避する。
     # 借方科目は票全体の代表科目を全行へ適用（ゴルフ票=接待交際費等、
-    # 顧客サンプルの「同票同科目」に一致）。
+    # 顧客サンプルの「同票同科目」に一致）。軽油税の対象外行のみ租税公課
+    # （label 一致 + 品目金額一致の保険、6/12）。
     tax_summary = doc.get("tax_summary") or []
     if tax_summary:
         summary_account = (repr_account if repr_account is not None
                            else select_aggregated_debit_account(entries))
         rows = build_rows_from_tax_summary(
-            tax_summary, summary_account, doc_category, credit_account
+            tax_summary, summary_account, doc_category, credit_account,
+            keiyuzei_amounts=keiyuzei_amounts,
         )
         if rows:
             return rows

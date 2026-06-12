@@ -367,6 +367,23 @@ class RealSamplePatternTest(unittest.TestCase):
         self.assertEqual(result[0]["amount"], 500)
         self.assertEqual(result[0]["description"], "対象外")
 
+    def test_zero_rate_split_by_account_keeps_keiyuzei_isolated(self):
+        # Arrange: 軽油税(租税公課)と他の非課税項(整票科目)の同居。
+        # rate=0 でも科目が異なれば別行を維持する（6/12 仕様の保全）
+        entries = [
+            _item(493, 0, "租税公課", "対象外", "軽油税"),
+            _item(500, 0, "接待交際費", "対象外", "ゴルフ場利用税"),
+        ]
+
+        # Act
+        result = aggregate_entries_by_tax_rate(entries)
+
+        # Assert: 1行に潰さず科目別の2行
+        self.assertEqual(
+            [(r["debit_account"], r["amount"]) for r in result],
+            [("租税公課", 493), ("接待交際費", 500)],
+        )
+
     def test_uchizei_ignores_tax_amount(self):
         # Arrange: 内税では amount が既に税込のため tax_amount を加算してはならない
         entries = [
@@ -453,6 +470,84 @@ class BuildRowsFromTaxSummaryTest(unittest.TestCase):
             {"tax_rate": 0.10, "tax_included": True, "base_amount": "１，２００", "tax_amount": 0},
         ])
         self.assertEqual(rows[0]["amount"], 1200)
+
+    def test_p7_enejet_keiyuzei_label_splits_to_sozeikoka(self):
+        # 6/12 顧客サンプル（EneJet 外税票）: 10%外税5,806+581=6,387 / 軽油税708。
+        # 軽油税の対象外行は整票一科目の例外として租税公課に分離する
+        rows = self._rows([
+            {"tax_rate": 0.10, "tax_included": False, "base_amount": 5806, "tax_amount": 581},
+            {"tax_rate": 0, "tax_included": True, "base_amount": 708, "tax_amount": 0,
+             "label": "軽油税"},
+        ], account="旅費交通費")
+        self.assertEqual([(r["description"], r["amount"]) for r in rows],
+                         [("10%", 6387), ("対象外", 708)])
+        self.assertEqual(rows[0]["debit_account"], "旅費交通費")
+        self.assertEqual(rows[1]["debit_account"], "租税公課")
+        self.assertEqual(sum(r["amount"] for r in rows), 7095)
+
+    def test_golf_tax_label_keeps_receipt_account(self):
+        # ゴルフ場利用税は租税公課に分離しない（P5 回帰: 整票一科目のまま）
+        rows = self._rows([
+            {"tax_rate": 0.10, "tax_included": True, "base_amount": 6000, "tax_amount": 545},
+            {"tax_rate": 0, "tax_included": True, "base_amount": 200, "tax_amount": 0,
+             "label": "ゴルフ場利用税"},
+        ], account="接待交際費")
+        self.assertTrue(all(r["debit_account"] == "接待交際費" for r in rows))
+
+    def test_taxfree_without_label_keeps_receipt_account(self):
+        # label 欠落（旧契約/Gemini 未出力）時は従来挙動（後方互換）
+        rows = self._rows([
+            {"tax_rate": 0, "tax_included": True, "base_amount": 500, "tax_amount": 0},
+        ], account="接待交際費")
+        self.assertEqual(rows[0]["debit_account"], "接待交際費")
+
+    def test_keiyuzei_label_on_taxable_row_not_split(self):
+        # 課税行に label が誤って付いても分離しない（rate=0 限定）
+        rows = self._rows([
+            {"tax_rate": 0.10, "tax_included": True, "base_amount": 4917,
+             "tax_amount": 447, "label": "軽油税"},
+        ], account="旅費交通費")
+        self.assertEqual(rows[0]["debit_account"], "旅費交通費")
+
+    def test_labeled_non_keiyuzei_row_not_hit_by_amount_fallback(self):
+        # 明示の非軽油税 label は金額一致の保険より優先される（誤爆防止）。
+        # 例: ゴルフ場利用税の額が偶然品目側の軽油税額と一致しても分離しない
+        rows = agg.build_rows_from_tax_summary(
+            [
+                {"tax_rate": 0, "tax_included": True, "base_amount": 493,
+                 "tax_amount": 0, "label": "ゴルフ場利用税"},
+            ],
+            "接待交際費",
+            keiyuzei_amounts=frozenset({493}),
+        )
+        self.assertEqual(rows[0]["debit_account"], "接待交際費")
+
+    def test_keiyuzei_amount_fallback_when_label_missing(self):
+        # label 欠落でも品目側の軽油税金額と一致する対象外行は分離（保険）
+        rows = agg.build_rows_from_tax_summary(
+            [
+                {"tax_rate": 0.10, "tax_included": True, "base_amount": 4507, "tax_amount": 410},
+                {"tax_rate": 0, "tax_included": True, "base_amount": 493, "tax_amount": 0},
+            ],
+            "旅費交通費",
+            keiyuzei_amounts=frozenset({493}),
+        )
+        self.assertEqual(rows[0]["debit_account"], "旅費交通費")
+        self.assertEqual(rows[1]["debit_account"], "租税公課")
+
+
+class IsKeiyuzeiTextTest(unittest.TestCase):
+    def test_matches_keiyuzei_variants(self):
+        self.assertTrue(agg.is_keiyuzei_text("軽油税"))
+        self.assertTrue(agg.is_keiyuzei_text("(内軽油税 @15.0 ¥493)"))
+        self.assertTrue(agg.is_keiyuzei_text("軽油引取税"))
+
+    def test_rejects_other_taxes_and_empty(self):
+        self.assertFalse(agg.is_keiyuzei_text("ゴルフ場利用税"))
+        self.assertFalse(agg.is_keiyuzei_text("宿泊税"))
+        self.assertFalse(agg.is_keiyuzei_text("軽油"))  # 燃料本体は対象外
+        self.assertFalse(agg.is_keiyuzei_text(""))
+        self.assertFalse(agg.is_keiyuzei_text(None))
 
 
 class DetermineTaxTypesTest(unittest.TestCase):

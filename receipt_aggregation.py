@@ -21,6 +21,12 @@
 - 普通領収書は1枚=1借方科目（票全体の用途で決定。ゴルフ場→接待交際費等）。
   整票判定は呼び出し側 ocr_engine._build_entries_for_single_doc で行う。
 
+6/12 顧客サンプル（EneJet 軽油票）で確定した追加仕様:
+- 軽油税（軽油引取税）由来の対象外行だけは整票一科目の例外として
+  「租税公課」に分離する（例: 旅費交通費 6,387 + 租税公課 708）。
+  ゴルフ場利用税・宿泊税等の他の非課税項は従来どおり票全体の科目に従う。
+  品目行側の例外適用は呼び出し側 ocr_engine._build_entries_for_single_doc で行う。
+
 外部依存（gemini/paddleocr 等）を持たない純粋ロジックとして切り出し、単体テスト可能にする。
 """
 import unicodedata
@@ -32,6 +38,12 @@ from decimal import ROUND_HALF_UP, Decimal
 # NOTE: 顧客の最終確認待ち。確定後はこの定数を切り替えるだけでよい。
 AGGREGATED_DEBIT_ACCOUNT_STRATEGY = "max_amount"
 AGGREGATED_DEBIT_ACCOUNT_FIXED = "備品・消耗品費"
+
+# 軽油税（軽油引取税）の対象外行は整票一科目の例外として租税公課に分離する
+# （6/12 顧客サンプル: EneJet 軽油票 = 旅費交通費 6,387 + 租税公課 708）。
+# ゴルフ場利用税・宿泊税等の他の非課税項は対象外（票全体の科目に従う）。
+KEIYUZEI_KEYWORDS = ("軽油税", "軽油引取税")
+KEIYUZEI_DEBIT_ACCOUNT = "租税公課"
 
 DEFAULT_TAX_RATE = 0.10
 DEFAULT_CREDIT_ACCOUNT = "未払金"
@@ -106,6 +118,18 @@ def _to_tax_inclusive_total(base_amount, tax_amount, tax_rate):
     return base_amount + int(computed)
 
 
+def is_keiyuzei_text(value):
+    """品目名・内訳ラベルが軽油税（軽油引取税）由来かを判定する。
+
+    "(内軽油税 @15.0 ¥493)" のような括弧書き表記も部分一致で拾う。
+    ゴルフ場利用税・宿泊税等の他の非課税項は対象にしない（整票一科目のまま）。
+    """
+    if not value:
+        return False
+    text = unicodedata.normalize("NFKC", str(value))
+    return any(keyword in text for keyword in KEIYUZEI_KEYWORDS)
+
+
 def select_aggregated_debit_account(group_entries):
     """税率グループの代表借方科目を決定する。"""
     if AGGREGATED_DEBIT_ACCOUNT_STRATEGY == "fixed" or not group_entries:
@@ -132,7 +156,8 @@ def determine_tax_types(doc_category, tax_rate):
 
 
 def build_rows_from_tax_summary(tax_summary, debit_account, doc_category="receipt",
-                                credit_account=DEFAULT_CREDIT_ACCOUNT):
+                                credit_account=DEFAULT_CREDIT_ACCOUNT,
+                                keiyuzei_amounts=frozenset()):
     """レシート印字の税率別内訳から、税率別の仕訳行を直接生成する（内訳優先）。
 
     Gemini の逐品目集計（割引の二重控除・税率誤判定・内外税混在の取りこぼし）
@@ -144,9 +169,12 @@ def build_rows_from_tax_summary(tax_summary, debit_account, doc_category="receip
         tax_summary: 各 dict が tax_rate / tax_included / base_amount /
             tax_amount を持つ list。base_amount は対象額（内税=税込、
             外税=税抜、非課税=その額）。
-        debit_account: 票全体の代表借方科目（全行共通）。
+        debit_account: 票全体の代表借方科目（全行共通。軽油税の対象外行のみ
+            例外として租税公課に分離する。6/12 顧客サンプル）。
         doc_category: 税区分判定用。
         credit_account: 貸方科目。
+        keiyuzei_amounts: 品目側で軽油税と判定された行の金額集合。label が
+            欠落した対象外行でも金額一致で租税公課に分離するための保険。
 
     Returns:
         税率別の仕訳行 list。金額0の区分は出力しない。
@@ -169,8 +197,17 @@ def build_rows_from_tax_summary(tax_summary, debit_account, doc_category="receip
         if amount == 0:
             continue
         debit_tax_type, credit_tax_type = determine_tax_types(doc_category, rate)
+        # 軽油税由来の対象外行のみ租税公課（rate=0 限定。課税行の誤 label は無視）。
+        # 金額一致の保険は label 欠落時のみ: 明示の非軽油税 label
+        # （ゴルフ場利用税等）を金額の偶然一致で上書きしない
+        label = item.get("label")
+        is_keiyuzei_row = not rate and (
+            is_keiyuzei_text(label)
+            or (not label and amount in keiyuzei_amounts)
+        )
         rows.append({
-            "debit_account": debit_account,
+            "debit_account": (KEIYUZEI_DEBIT_ACCOUNT if is_keiyuzei_row
+                              else debit_account),
             "debit_tax_type": debit_tax_type,
             "credit_account": credit_account,
             "credit_tax_type": credit_tax_type,
@@ -217,10 +254,15 @@ def aggregate_entries_by_tax_rate(entries):
         # 対象外行が2行に割れないよう内税側に正規化する
         if not rate:
             included = True
-        groups.setdefault((rate, included), []).append(entry)
+        # rate=0 のみ科目もキーに含める: 軽油税(租税公課)と他の非課税項
+        # （整票科目）が同票に同居しても1行に潰さない（6/12 仕様の保全）。
+        # 課税行は従来どおり科目横断で集約するため第3要素は None 固定
+        # （max_amount 戦略で代表科目を選出）
+        account_key = entry.get("debit_account") if not rate else None
+        groups.setdefault((rate, included, account_key), []).append(entry)
 
     aggregated = []
-    for (rate, included), group in groups.items():
+    for (rate, included, _account_key), group in groups.items():
         base_amount = sum(int(e.get("amount", 0)) for e in group)
         if included:
             # 内税: 票面金額が既に税込のためそのまま使用（tax_amount は内訳情報）
@@ -235,6 +277,9 @@ def aggregate_entries_by_tax_rate(entries):
         # 赤字行として人手確認に委ねる方が、無断で行を落とすより安全なため。
 
         # 税区分・貸方科目はグループ内で一致するため先頭から採用
+        # NOTE: 軽油税の品目は呼び出し側（ocr_engine の整票統一）で既に
+        # 租税公課が設定済み。rate=0 グループが軽油税のみなら max_amount
+        # 戦略によりそのまま租税公課が代表科目になる（6/12 仕様）。
         head = group[0]
         aggregated.append({
             "debit_account": select_aggregated_debit_account(group),
