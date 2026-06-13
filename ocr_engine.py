@@ -4,6 +4,7 @@ import json
 import re
 import gc
 import time
+import unicodedata
 import http.client
 import google.generativeai as genai
 from google.api_core import exceptions as google_exceptions
@@ -13,6 +14,15 @@ except ImportError:
     vision = None
 from dotenv import load_dotenv
 from doc_types import DocType, DOC_TYPE_CONFIG
+from receipt_aggregation import (
+    KEIYUZEI_DEBIT_ACCOUNT,
+    aggregate_entries_by_tax_rate,
+    build_rows_from_tax_summary,
+    coerce_tax_rate,
+    determine_tax_types,
+    is_keiyuzei_text,
+    select_aggregated_debit_account,
+)
 
 try:
     from pypdf import PdfReader, PdfWriter
@@ -83,10 +93,14 @@ def _generate_content_with_retry(contents):
     raise last_err
 
 
+# gemini-2.5 系列は thinking tokens が max_output_tokens と予算を共有するため、
+# 思考分の余裕を確保する（flash の動的思考上限 24,576 + JSON 本文 <2k）
+GEMINI_MAX_OUTPUT_TOKENS = 32768
+
 GEMINI_GENERATION_CONFIG = {
     "temperature": 0,
     "response_mime_type": "application/json",
-    "max_output_tokens": 8192,
+    "max_output_tokens": GEMINI_MAX_OUTPUT_TOKENS,
 }
 
 
@@ -180,6 +194,15 @@ def _get_finish_reason(response):
         return str(getattr(candidates[0], "finish_reason", "")) or ""
     except Exception:
         return ""
+
+
+# proto enum FinishReason.MAX_TOKENS = 2（str() 表現の揺れに備えて文字列も併記）
+_MAX_TOKENS_FINISH_REASONS = {"2", "MAX_TOKENS", "FinishReason.MAX_TOKENS"}
+
+
+def _is_max_tokens_truncated(response):
+    """finish_reason が MAX_TOKENS（=2）かを判定する"""
+    return _get_finish_reason(response) in _MAX_TOKENS_FINISH_REASONS
 
 
 # === Cloud Vision API — 甲方確認待ち、コード保持 ===
@@ -276,19 +299,42 @@ def _ocr_with_paddleocr(image_bytes, mime_type="image/jpeg"):
     return ocr_text, avg_confidence
 
 
+def _format_token_usage(response):
+    """usage_metadata から思考トークン数の近似値を整形する（取得不能時は '?'）"""
+    usage = getattr(response, "usage_metadata", None)
+    if usage is None:
+        return "思考≈?tok"
+    total = getattr(usage, "total_token_count", 0) or 0
+    prompt = getattr(usage, "prompt_token_count", 0) or 0
+    candidates = getattr(usage, "candidates_token_count", 0) or 0
+    return f"思考≈{total - prompt - candidates}tok/全体{total}tok"
+
+
+def _parse_gemini_response(response):
+    """Gemini 応答から JSON を抽出（失敗時は警告ログを出して None を返す）"""
+    try:
+        text = (getattr(response, "text", "") or "").strip()
+    except ValueError:
+        # MAX_TOKENS 等で parts が空の場合、response.text は ValueError を送出する
+        text = ""
+    parsed = extract_json(text)
+    if parsed is None:
+        finish_reason = _get_finish_reason(response)
+        detail = ""
+        if _is_max_tokens_truncated(response):
+            detail = f", {_format_token_usage(response)}"
+        print(
+            f"⚠️ Gemini応答のJSON解析失敗 "
+            f"(finish_reason={finish_reason or 'unknown'}, len={len(text)}{detail})"
+        )
+    return parsed
+
+
 def _call_gemini_text(ocr_text, prompt):
     """OCR テキストを Gemini に送って構造化データを抽出"""
     full_prompt = f"{prompt}\n\n--- OCRテキスト ---\n{ocr_text}"
     response = _generate_content_with_retry([full_prompt])
-    text = (getattr(response, "text", "") or "").strip()
-    parsed = extract_json(text)
-    if parsed is None:
-        finish_reason = _get_finish_reason(response)
-        print(
-            f"⚠️ Gemini応答のJSON解析失敗 "
-            f"(finish_reason={finish_reason or 'unknown'}, len={len(text)})"
-        )
-    return parsed
+    return _parse_gemini_response(response)
 
 
 def _call_gemini_bytes(file_data, mime_type, prompt):
@@ -299,16 +345,7 @@ def _call_gemini_bytes(file_data, mime_type, prompt):
             prompt,
         ]
     )
-
-    text = (getattr(response, "text", "") or "").strip()
-    parsed = extract_json(text)
-    if parsed is None:
-        finish_reason = _get_finish_reason(response)
-        print(
-            f"⚠️ Gemini応答のJSON解析失敗 "
-            f"(finish_reason={finish_reason or 'unknown'}, len={len(text)})"
-        )
-    return parsed
+    return _parse_gemini_response(response)
 
 
 def _call_gemini_cross_validate(ocr_text, file_data, mime_type, prompt):
@@ -327,15 +364,7 @@ def _call_gemini_cross_validate(ocr_text, file_data, mime_type, prompt):
             cross_prompt,
         ]
     )
-    text = (getattr(response, "text", "") or "").strip()
-    parsed = extract_json(text)
-    if parsed is None:
-        finish_reason = _get_finish_reason(response)
-        print(
-            f"⚠️ Gemini応答のJSON解析失敗 "
-            f"(finish_reason={finish_reason or 'unknown'}, len={len(text)})"
-        )
-    return parsed
+    return _parse_gemini_response(response)
 
 
 def _call_gemini(file_path, prompt):
@@ -603,7 +632,8 @@ _VENDOR_ACCOUNT_OVERRIDE = {
     "ファミリーマート": "備品・消耗品費",
     "FamilyMart": "備品・消耗品費",
     "エディオン": "備品・消耗品費",
-    "MEGA": "備品・消耗品費",
+    # メガドン・キホーテ。裸の "MEGA" は casefold 後に omega/mega 系店名を誤爆するため収窄
+    "MEGAドン": "備品・消耗品費",
     # 飲食店・弁当店 → 接待交際費
     "Mister Donut": "接待交際費",
     "ミスタードーナツ": "接待交際費",
@@ -626,16 +656,50 @@ _VENDOR_ACCOUNT_OVERRIDE = {
     "タクシー": "旅費交通費",
     # 空港 → 旅費交通費
     "空港": "旅費交通費",
+    # ゴルフ用品店は物販 → 備品・消耗品費（先勝ちのため除外項を一般語より前に置く）
+    "ゴルフ5": "備品・消耗品費",
+    "GOLF5": "備品・消耗品費",
+    "ゴルフパートナー": "備品・消耗品費",
+    "GOLF Partner": "備品・消耗品費",
+    "つるやゴルフ": "備品・消耗品費",
+    "ゴルフ用品": "備品・消耗品費",
+    # ゴルフ場 → 接待交際費（6/11 顧客回答）
+    "ゴルフ": "接待交際費",
+    "カントリークラブ": "接待交際費",
+    "カンツリー": "接待交際費",
+    "GOLF": "接待交際費",
 }
 
+def _normalize_vendor_key(text):
+    """ベンダー照合用の正規化（NFKC + casefold + 空白除去）。
+
+    OCR は「ゴルフ５」のような全角数字・半角カナや、「GOLF 5」のように
+    語中へ空白を挟んだ店名を返すことがあるため、全角半角・大文字小文字・
+    空白をすべて無視して照合する。
+    """
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text)).casefold()
+
+
+# キーワードはモジュール定数のため、照合用正規化をロード時に1回だけ前計算する
+_VENDOR_ACCOUNT_OVERRIDE_NORMALIZED = [
+    (_normalize_vendor_key(keyword), account)
+    for keyword, account in _VENDOR_ACCOUNT_OVERRIDE.items()
+]
+
+
 def _override_account_by_vendor(vendor, gemini_account):
-    """取引先名に基づいて科目を強制上書きする。Gemini の分類揺れを防止。"""
+    """取引先名に基づいて科目を強制上書きする。Gemini の分類揺れを防止。
+
+    照合は _normalize_vendor_key（NFKC・casefold・空白除去）で行う。
+    辞書の定義順で最初に命中したキーワードを無条件で採用する（厳格な先勝ち）。
+    GOLF5 のような除外項は一般キーワード（GOLF 等）より前に定義すること。
+    """
     if not vendor:
         return gemini_account
-    for keyword, forced_account in _VENDOR_ACCOUNT_OVERRIDE.items():
-        if keyword in vendor:
-            if gemini_account != forced_account:
-                return forced_account
+    vendor_norm = _normalize_vendor_key(vendor)
+    for keyword_norm, forced_account in _VENDOR_ACCOUNT_OVERRIDE_NORMALIZED:
+        if keyword_norm in vendor_norm:
+            return forced_account
     return gemini_account
 
 
@@ -746,12 +810,23 @@ PROMPTS = {
             "items": [
                 {
                     "description": "品目・内容",
-                    "amount": 税込金額(数値),
+                    "amount": 品目の票面金額(数値。内税/外税での扱いは下記判定基準参照),
                     "tax_rate": 0.08 or 0.10 or 0,
+                    "tax_included": true or false (内税=true / 外税=false。下記判定基準参照),
                     "tax_amount": 消費税額(数値, なければ0),
                     "debit_account": "費用の勘定科目を推定"
                 }
-            ]
+            ],
+            "tax_summary": [
+                {
+                    "tax_rate": 0.08 or 0.10 or 0,
+                    "tax_included": true or false,
+                    "base_amount": その税率区分の対象額(数値),
+                    "tax_amount": その税率区分の消費税額(数値, なければ0),
+                    "label": "非課税/対象外行(tax_rate=0)のみ票面の名目（例: \"軽油税\", \"ゴルフ場利用税\", \"非課税金額\"）。課税行は空文字"
+                }
+            ],
+            "total_amount": 票面に印字された税込の合計金額(「合計」「お買上計」等, 数値。印字が無ければ 0)
         }
     ]
 }
@@ -786,8 +861,57 @@ PROMPTS = {
 印字がない場合は以下のルールで判定:
 - 0.10（デフォルト）: ほとんどの品目。外食(店内飲食), 酒類, 日用品, サービス, 交通費等
 - 0.08: レシートに軽減税率マーク(※/軽/8%)がある飲食料品のみ。外食は対象外
-- 0: 銀行振込本体(bank_transfer)
+- 0: 銀行振込本体(bank_transfer)、および消費税の課税対象外・非課税の品目。
+  例: ゴルフ場利用税・宿泊税・入湯税・収入印紙・印紙代・行政手数料・軽油税。
+  レシートの税率別内訳に「非課税金額」「対象外」として載る品目はこれに該当する
+  （品目側の「＊」「※」マークが軽減税率ではなく非課税を示すPOSもあるため、内訳行を優先）
+  ガソリンスタンドのレシートでは軽油税が「(内軽油税 @15.0 ¥493)」のように明細内に
+  印字される場合がある。これは非課税（対象外）の独立した品目行として出力し
+  （tax_rate=0、tax_included=true）、10%課税グループに含めないこと。
+  このとき燃料品目側の金額は軽油税を除いた本体額に分解し、二重計上しないこと
+  （例: 軽油 ¥5,000・内軽油税 ¥493 → 品目「軽油」¥4,507(10%) と「軽油税」¥493(0%)
+  の2行。全品目の金額合計が票面の合計金額と一致すること）。
+  軽油税品目の debit_account は "租税公課"（燃料本体は "旅費交通費" のまま）
 迷ったら 0.10 を使用してください
+
+【tax_included（内税/外税）の判定基準】
+- true（内税・デフォルト）: 票面の品目金額が税込で、消費税が「(内消費税等 ¥…)」
+  「○%内税対象額/内税額」のように括弧書き・内訳表示されるレシート。
+  amount は税込額、tax_amount は内訳の消費税額（表示があれば）
+- false（外税）: 票面が税抜価格で、消費税が「○%外税額」「消費税」等の独立行で
+  合計に加算されるレシート（品目に「外」マークが付くことが多い）。
+  amount は税抜の印字額のまま、tax_amount はレシート印字の消費税額。
+  品目単位の税額が不明な場合は、同じ税率グループの税額合計をそのグループの
+  いずれか1品目の tax_amount に付与し、他の品目は 0 とする
+- 同一レシート内で内税と外税が混在する場合（例: 外税の商品+税込のレジ袋）は、
+  品目ごとに正しく true/false を付けること
+
+【tax_summary（税率別内訳）の抽出 — 最重要】
+レシートに税率別の内訳が印字されている場合は、それを必ず tax_summary に
+そのまま転記してください（印字値を再計算しない）。
+- 1つの税率区分（税率 × 内税/外税）につき1要素。
+- base_amount = その区分の「対象額」:
+  ・内税表示（"8%内税対象額 ¥124"、"(10%対象 ¥2,400 消費税等 ¥218)"）→ tax_included=true、
+    base_amount=税込対象額（124 / 2400）、tax_amount=その消費税額
+  ・外税表示（"(8%外税対象額) ¥1,620 / 8%外税額 ¥130"、"10%外税 タイショウ ¥1,132 / 10%外税 ¥113"）
+    → tax_included=false、base_amount=税抜対象額（1620 / 1132）、tax_amount=外税額（130 / 113）
+  ・非課税/対象外（"非課税金額 ¥500"、"ゴルフ場利用税 ¥200"、"軽油税 ¥493"）→ tax_rate=0、tax_included=true、
+    base_amount=その金額、tax_amount=0、label=票面の名目（"軽油税"・"ゴルフ場利用税"・"非課税金額" 等）
+- 税率別内訳が印字されていないレシート（単純な品目羅列のみ）は tax_summary=[] とする。
+  内訳行を品目(items)に混ぜないこと。
+
+【total_amount（票面合計）の抽出】
+- 票面に印字された税込の合計金額（「合計」「お買上計」「領収金額」等）をそのまま転記する（items から再計算しない）
+- 必ず「税率別内訳（tax_summary）の対象額の税込合計」と一致する金額を選ぶこと
+  （この金額は仕訳の各行金額の合計と照合されるため、行と食い違う額を入れない）
+- 値引・割引・ポイント・商品券の扱いは上記原則で判断する:
+  ・ポイント・商品券・クーポンを「支払い手段」として充当した場合
+    （税率別内訳の対象額は減らない）→ 充当前の商品合計（「お買上計」「小計」）を転記する
+  ・値引・割引が税率別内訳の対象額そのものを減額している場合
+    （内訳が値引後の対象額を表示）→ 値引後の合計（票面の「合計」）を転記する
+- お預り・お釣り・現金（お預り金額）と混同しないこと
+- 外税レシートでは税抜小計ではなく、消費税加算後の合計金額を使う
+- 合計の印字が無い場合は 0 とする
 
 【payment_method の判定基準】
 - コンビニ（FamilyMart, セブンイレブン等）での支払い → "現金"
@@ -911,28 +1035,34 @@ def _determine_credit_account(pay_method, doc_category="receipt"):
     return "未払金"
 
 
-def _determine_tax_types(doc_category, tax_rate):
-    """ドキュメントカテゴリと税率から借方・貸方税区分を決定"""
-    if doc_category == "bank_transfer" or tax_rate == 0:
-        return "対象外", "対象外"
-    elif tax_rate == 0.08:
-        return "課対仕入8% (軽)", "対象外"
-    else:  # 0.10
-        return "課対仕入10%", "対象外"
-
-
 def _is_subtotal_line(description, amount, all_items):
     """小計・合計・税額集計行かどうかを判定"""
     # キーワード検出（品目名に含まれうる「対象」等は除外、集計行のみ）
+    # 部分一致は税語を含まない集計語のみ。消費税/外税/内税の語を部分一致にすると
+    # 「ゴルフ場利用税（消費税等対象外）」のような注記付き品目まで落として
+    # 対象外行が欠落するため、税語の行は下の全体一致パターンでのみ除外する
     subtotal_keywords = [
-        "小計", "合計", "税込合計", "税抜合計", "内消費税", "消費税額",
-        "課税対象額", "10%対象額", "8%対象額", "税額合計", "うち消費税",
+        "小計", "合計",
+        "課税対象額", "10%対象額", "8%対象額",
         "10%対象計", "8%対象計",
     ]
     desc_lower = description.lower()
     for kw in subtotal_keywords:
         if kw in desc_lower:
             return True
+
+    # 税率別内訳行・独立税額行（例: "消費税", "内消費税等 ¥218", "消費税額等(10%)",
+    # "8%外税額", "(8%外税対象額)", "10%外税 タイショウ", "内税計"）。
+    # 行全体が「税語＋税率＋金額」だけの場合のみ除外する（注記付き品目を誤って
+    # 落とさないため全体一致）。裸の税額行が品目として流れると二重計上になる
+    if re.fullmatch(
+        r"\s*[\(（]?\s*(?:[0-9０-９]+\s*[%％])?\s*"
+        r"(?:(?:内|うち)?消費税(?:対象)?(?:額|等)*|(?:内税|外税)\s*(?:対象|タイショウ)?\s*(?:額|計)?)"
+        r"\s*(?:[\(（]?\s*[0-9０-９]+\s*[%％]\s*[\)）]?)?"
+        r"\s*(?:[¥￥]?\s*[0-9０-９][0-9０-９,，]*\s*円?)?\s*[\)）]?\s*",
+        description,
+    ):
+        return True
 
     # 金額一致チェック: 他の品目の合計と一致する場合はスキップ
     if len(all_items) > 2:
@@ -957,6 +1087,9 @@ def _build_entries_for_single_doc(doc):
     pay_method = str(doc.get("payment_method", "現金"))
     credit_account = _determine_credit_account(pay_method, doc_category)
 
+    # 取引先名は items が空でも参照するためループ前に取得
+    vendor = doc.get("vendor", "")
+
     # 有効金額の品目数を事前カウント（領収証の単一合計行を誤フィルタ防止）
     valid_items = [it for it in doc.get("items", [])
                    if it.get("amount") and int(it.get("amount", 0)) != 0]
@@ -971,15 +1104,18 @@ def _build_entries_for_single_doc(doc):
         if len(valid_items) > 1 and _is_subtotal_line(desc, int(amount), doc.get("items", [])):
             continue
 
-        tax_rate = item.get("tax_rate", 0.10)
+        # tax_rate を float に正規化（null/文字列対策）。税区分と集約を整合させる
+        tax_rate = coerce_tax_rate(item.get("tax_rate"))
         debit_account = item.get("debit_account", "消耗品費")
 
-        # 取引先名に基づく科目兜底（Gemini 分類揺れ防止）
-        vendor = doc.get("vendor", "")
-        debit_account = _override_account_by_vendor(vendor, debit_account)
+        # 取引先名に基づく科目兜底（Gemini 分類揺れ防止）。bank_transfer/
+        # fee_receipt は借方科目が固定（未払金/支払手数料）のため対象外
+        # （振込先がゴルフ場等でも上書きしない）
+        if doc_category == "receipt":
+            debit_account = _override_account_by_vendor(vendor, debit_account)
 
         # 税区分決定
-        debit_tax_type, credit_tax_type = _determine_tax_types(
+        debit_tax_type, credit_tax_type = determine_tax_types(
             doc_category, tax_rate
         )
 
@@ -990,9 +1126,62 @@ def _build_entries_for_single_doc(doc):
             "credit_tax_type": credit_tax_type,
             "amount": int(amount),
             "description": item.get("description", ""),
+            # 以下3つは税率別集計用（集計後は破棄）。tax_included/tax_amount の
+            # 正規化は唯一の消費者 aggregate_entries_by_tax_rate 側で一元的に行う
+            "tax_rate": tax_rate,
+            "tax_included": item.get("tax_included"),
+            "tax_amount": item.get("tax_amount"),
         })
 
-    return entries
+    # 6/11 顧客回答: 普通領収書は1枚=1科目（票全体の用途で借方科目を決定）。
+    # bank_transfer / fee_receipt は複数科目（振込本体=未払金、手数料=支払手数料）
+    # が正当なため対象外。entries が空（items 空/全行小計）でも override を通す:
+    # select_aggregated_debit_account([]) は固定科目を返すが、vendor override
+    # （ゴルフ場→接待交際費等）で補正できるため、ここで弾かない。
+    # 6/12 顧客サンプル: 軽油税（軽油引取税）の品目だけは整票一科目の例外として
+    # 租税公課に固定する（代表科目の選出からも除外）。ゴルフ場利用税等の
+    # 他の非課税項は従来どおり整票科目に統一される。
+    repr_account = None
+    keiyuzei_amounts = frozenset()
+    if doc_category == "receipt":
+        # 例外は rate=0 行限定: Gemini が分解せず課税の燃料行に「内軽油税」
+        # 注記を残しても、10%行を租税公課へ流出させない
+        flagged = [
+            (e, is_keiyuzei_text(e.get("description"))
+                and not coerce_tax_rate(e.get("tax_rate")))
+            for e in entries
+        ]
+        keiyuzei_amounts = frozenset(
+            e["amount"] for e, is_keiyuzei in flagged if is_keiyuzei)
+        normal_entries = [e for e, is_keiyuzei in flagged if not is_keiyuzei]
+        repr_account = _override_account_by_vendor(
+            vendor, select_aggregated_debit_account(normal_entries or entries))
+        entries = [
+            {**e, "debit_account": KEIYUZEI_DEBIT_ACCOUNT if is_keiyuzei
+             else repr_account}
+            for e, is_keiyuzei in flagged
+        ]
+
+    # 内訳優先(6/10): レシートに税率別内訳（○%対象額・消費税額）が印字
+    # されていれば、それを正解として直接行を起こす。Gemini の逐品目集計
+    # （割引の二重控除・税率誤判定・内外税混在の取りこぼし）を回避する。
+    # 借方科目は票全体の代表科目を全行へ適用（ゴルフ票=接待交際費等、
+    # 顧客サンプルの「同票同科目」に一致）。軽油税の対象外行のみ租税公課
+    # （label 一致 + 品目金額一致の保険、6/12）。
+    tax_summary = doc.get("tax_summary") or []
+    if tax_summary:
+        summary_account = (repr_account if repr_account is not None
+                           else select_aggregated_debit_account(entries))
+        rows = build_rows_from_tax_summary(
+            tax_summary, summary_account, doc_category, credit_account,
+            keiyuzei_amounts=keiyuzei_amounts,
+        )
+        if rows:
+            return rows
+
+    # 仕様変更(5/25): 内訳が無い場合は明細を税率(8%/10%)別の合計に集約する
+    # 摘要の店名は sheets_output 側で前置されるため、ここでは渡さない
+    return aggregate_entries_by_tax_rate(entries)
 
 
 def _build_entries_from_receipt(raw_data):
@@ -1244,6 +1433,11 @@ def _normalize_receipt_results(raw_data, prefix=""):
                 "vendor": vendor,
                 "invoice_num": doc.get("invoice_num", ""),
                 "memo": doc.get("memo", ""),
+                # 票面合計（B' 照合用、票面印字値の転記）。bank_transfer /
+                # fee_receipt は合計の語義が曖昧（振込金額 vs 手数料込み）な
+                # ため receipt のみ伝搬する（None=照合スキップ）
+                "total_amount": (doc.get("total_amount")
+                                 if doc_cat == "receipt" else None),
                 "entries": entries,
             })
         return results

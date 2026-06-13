@@ -4,6 +4,7 @@ import time
 import gspread
 from gspread_formatting import CellFormat, Color, format_cell_range, format_cell_ranges, Border, Borders
 from datetime import datetime, timezone, timedelta
+from doc_types import DocType
 
 JST = timezone(timedelta(hours=9))
 
@@ -16,6 +17,19 @@ MF_HEADERS = [
     "タグ", "MF仕訳タイプ", "決算整理仕訳", "作成日時", "作成者",
     "最終更新日時", "最終更新者", "原票URL"
 ]
+
+
+def _build_description(doc_type, vendor_name, item_description):
+    """摘要文字列を組み立てる。
+
+    領収書（6/11 顧客回答）: 「店名 税率」形式（空白区切り、例: ファミマ 10%）。
+    vendor が空の場合は strip で先頭空白を付けない。同 tab 内の振込控え
+    （bank_transfer）行も tab 内格式統一のため同形式を適用する。
+    その他の doc_type は既存の「店名 - 内容」形式を維持する。
+    """
+    if doc_type == DocType.RECEIPT:
+        return f"{vendor_name} {item_description}".strip()
+    return f"{vendor_name} - {item_description}"
 
 
 class SheetsOutputWriter:
@@ -86,7 +100,7 @@ class SheetsOutputWriter:
         try:
             legend_rows = [
                 ["【ハイライト凡例】"],
-                ["🔴 赤系: 日付空欄 / 認識不能ページ（一行丸ごと）"],
+                ["🔴 赤系: 日付空欄 / 認識不能ページ（一行丸ごと） / 票面合計≠行合計（金額列）"],
                 ["🟠 橙系: 取引先空欄 / T番号不正"],
                 ["🟡 黄系: T番号空 / 要確認科目(地代家賃・保険料・雑収入) / 高額(修繕費>30万・備品>10万)"],
             ]
@@ -146,7 +160,8 @@ class SheetsOutputWriter:
         """
         from doc_types import DOC_TYPE_TAB_SUFFIX
         from config import ACCOUNT_MAP, UNKNOWN_ACCOUNT, CREDIT_SUB_ACCOUNT_RECEIPT, CREDIT_ONLY_ACCOUNTS
-        from anomaly_detector import detect_anomalies
+        from anomaly_detector import detect_anomalies, detect_document_anomalies
+        from receipt_aggregation import coerce_tax_amount
 
         tab_suffix = DOC_TYPE_TAB_SUFFIX.get(doc_type, "領収書")
         tab_name = f"{employee_name}_{tab_suffix}"
@@ -186,7 +201,7 @@ class SheetsOutputWriter:
             credit_account = entry.get("credit_account", "")
             credit_account = ACCOUNT_MAP.get(credit_account, credit_account)
 
-            description = f"{vendor_name} - {entry.get('description', '')}"
+            description = _build_description(doc_type, vendor_name, entry.get('description', ''))
 
             now_jst = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
 
@@ -263,6 +278,28 @@ class SheetsOutputWriter:
                 except Exception as e:
                     print(f"⚠️ 異常ハイライト適用失敗: {e}")
 
+            # 票面合計とΣ行金額の照合（doc 級）。Gemini の外税換算漏れ・幻覚行・
+            # 行落ちを金額列（I列）の赤ハイライトで可視化する
+            # （6/12 E2E 静默錯 2/28 対策。領収書限定の機能のため他 doc_type では呼ばない）
+            if doc_type == DocType.RECEIPT:
+                doc_flags = detect_document_anomalies(
+                    entries_data, [r[8] for r in rows])
+                if doc_flags:
+                    print(f"⚠️ 合計照合NG: {doc_flags[0]['message']}")
+                    # severity=high → 赤（_apply_anomaly_highlight の high と同色）。
+                    # per-entry ハイライトの後に1回で適用し、同列の黄を赤が上書きする。
+                    # 上の一括 try/except とは独立（429 はリトライ、失敗しても行データは無傷）
+                    try:
+                        self._format_with_retry(
+                            ws, f"I{start_row}:I{end_row}",
+                            CellFormat(backgroundColor=Color(1, 0.8, 0.8)))
+                    except Exception as e:
+                        print(f"⚠️ 合計照合ハイライト適用失敗: {e}")
+                elif not coerce_tax_amount(entries_data.get("total_amount")):
+                    # 照合カバレッジの可観測性: total_amount 欠損で照合が
+                    # 無言で蒸発していないか E2E ログで確認できるようにする
+                    print(f"ℹ️ 合計照合スキップ（total_amount なし）: {vendor_name}")
+
             print(f"💾 Sheets に {len(rows)} 行追加: {tab_name}")
 
     def flush(self):
@@ -274,6 +311,20 @@ class SheetsOutputWriter:
         for attempt in range(max_retries):
             try:
                 worksheet.append_rows(rows, value_input_option='USER_ENTERED')
+                return
+            except gspread.exceptions.APIError as e:
+                if '429' in str(e) and attempt < max_retries - 1:
+                    wait = (2 ** attempt) + 1
+                    print(f"⏳ Sheets API レート制限、{wait}秒待機中...")
+                    time.sleep(wait)
+                else:
+                    raise
+
+    def _format_with_retry(self, worksheet, cell_ref, fmt, max_retries=5):
+        """レート制限対策付きのセル書式適用（_write_with_retry と同方針）"""
+        for attempt in range(max_retries):
+            try:
+                format_cell_range(worksheet, cell_ref, fmt)
                 return
             except gspread.exceptions.APIError as e:
                 if '429' in str(e) and attempt < max_retries - 1:

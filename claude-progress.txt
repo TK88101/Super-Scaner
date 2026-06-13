@@ -63,3 +63,199 @@
 - requirements.txt (Paddle v3)
 - .gitignore (venv311/)
 - PRD.md (v2.9 変更履歴)
+
+=== Session 4 (2026-05-27) — v3.0 領収書 税率別集約（顧客確認待ちで保留中）===
+状態: コア実装済み・顧客フィードバック待ちのサスペンド状態
+ブランチ: feat/receipt-tax-rate-aggregation（main 未マージ）
+
+実装済み（commit 320bdf8 / 6493996）:
+- 領収書(レシート/發票)を明細逐行出力から税率別(8%/10%)合計1行へ集約
+- 純ロジックを receipt_aggregation.py に分離（aggregate_entries_by_tax_rate + coerce_tax_rate）
+- ocr_engine.py::_build_entries_for_single_doc 末尾で呼び出し、DocType.RECEIPT のみ対象
+- 単体テスト test_receipt_aggregation.py（zero 依存、python3 -m unittest で全緑）
+- PRD.md を v3.0 に更新
+
+5/27 進展:
+- 担当者から Google Sheet「自動仕訳ツール 税区分」（id 11ugj5...kbZI）受領
+  - 赤枠付き実票サンプル5枚 + 期待出力。金額は正解と自洽を確認
+    ① 8%+10% 内税(GooDay 124+1531=1655) ② 10%のみ 内税(とんかつ 2400)
+    ③ 8%のみ 外税(千鳥饅頭 対象1620+税130=1750) ④ 8%+10%+非課税 内税(ゴルフ系 13440+650+非課税500=14590)
+    ⑤ 10%+非課税 内税(秋月CC 6000+ゴルフ場利用税200=6200)
+  - 税区分グルーピング規格は確定。ただし借方勘定科目・摘要の両列は空欄
+- サンプルが新たに露呈した未対応2点:
+  ・非課税(宿泊税・ゴルフ場利用税=租税公課)を独立1行(税区分「対象外」)で集約 → 借方科目要特判
+  ・内税/外税(税込/税抜)の区別 → 現コードは amount 単純合算のみ
+- Chatwork GASチーム(room 416290400)に @チョウギョウエイ で4点確認を送信(message_id 2111399299425505280)
+  【1】集約行の借方勘定科目（最大金額品目 vs 「備品・消耗品費」固定）
+  【2】摘要の表記（店名+税率 / 税率のみ / 店名のみ）
+  【3】非課税行の借方科目（「租税公課」固定でよいか）
+  【4】外税レシートの借方金額（税込 / 税抜）
+
+次アクション（回答受領後）:
+1. 回答どおり receipt_aggregation.py を改修（非課税特判・必要なら内税/外税処理）
+2. test_receipt_aggregation.py を上記5サンプルの金額で更新
+3. python3 -m unittest 全緑
+4. PR で feat/receipt-tax-rate-aggregation → main マージ
+5. 顧客は git pull origin main で取得
+
+=== Session 5 (2026-06-10) — 6パターン対応実装（摘要・科目ルールのみ回答待ち）===
+状態: 非ブロック分を実装完了・残り2点（借方科目ルール/摘要書式）は顧客回答待ち
+
+6/10 進展:
+- 員工の Google Sheet が6パターンに拡張（新規: ⑥内税外税混在 TRIAL 1,245+5/貸方未払金1,250）
+  ※Sheet はリンク公開、export?format=xlsx で匿名取得可。6枚の実票截図は xl/media/ に内嵌
+  全6パターンを2重チェック（読取+対抗検証）で金額検証済み、期待仕訳と零差額
+- Sheet が実質回答した点: 外税の借方金額=税込(③⑥)/非課税行は税区分「対象外」で独立1行/
+  ゴルフ票は全行「接待交際費」(租税公課ではない)/グループ化キー=税率×内税外税(⑥)
+- Chatwork で5ルール復唱+2点追問を送信(message_id 2116435721454886912)
+  → チョウギョウエイさん「明天之内回复」(6/11中に回答予定)、テスト用実票も提供予定
+
+実装済み（全35テスト緑、python3 -m unittest test_receipt_aggregation）:
+- receipt_aggregation.py: グループ化キーを(税率×tax_included)に拡張。同率でも内税/外税は別行
+  外税グループは税込に正規化: Σ票面額+Σ票面税額、税額欠損時は ROUND_HALF_UP(Σ額×率) 兜底
+  coerce_tax_included/coerce_tax_amount 追加（null/文字列防御）。rate=0 は内税側に正規化
+  （対象外行が2行に割れる事故防止）。負合計グループは赤字行として意図的に直通
+- ocr_engine.py: RECEIPT prompt に tax_included 契約と内税/外税判定基準を追加
+  tax_rate=0 をゴルフ場利用税・宿泊税・入湯税・印紙代等の非課税項目に拡張
+  （品目の＊/※が非課税を示すPOSがあるため税率別内訳行を優先）
+  _is_subtotal_line に外税額/内税対象額等の内訳行キーワード追加（重複計上防止）
+- test_receipt_aggregation.py: 6パターン実票金額の回帰テスト+coerce/エッジテスト追加
+
+コードレビュー済み(WARNING→対処): 負額外税グループの挙動明文化+テスト、rate=0正規化、
+max_amount戦略の負額混在コメント。未対処(意図的): tax_amount の None哨兵化（YAGNI）
+
+残タスク（顧客回答後、即日対応可能）:
+1. 借方勘定科目ルール反映（AGGREGATED_DEBIT_ACCOUNT_STRATEGY 切替 or 新戦略追加）
+2. 摘要書式反映（_format_tax_label / sheets_output 前置の調整）
+3. 提供される実票で local_test.py のE2E確認（要 GEMINI_API_KEY）
+4. PR作成 → main マージ
+
+=== Session 6 (2026-06-10) — 内訳優先で P1/P6 集計誤りを解消・E2E 6/6 ===
+状態: 内訳優先の実装完了・全49テスト緑・E2E 6/6 真実链路で金額零差错。顧客回答待ちは継続。
+
+経緯:
+- 当初の逐品目集計では複雑POSで誤集計（E2E 1回目: P1 GooDay 8%を1078/10%591に誤り、
+  P6 TRIAL 値引2重控除で1121単行）。根因=票面に税率別内訳が印字されていても
+  Gemini が品目を自前集計し、割引2重控除・税率誤判定・内外税取りこぼしが発生。
+- 修正方針「内訳優先」: 票面に税率別内訳（○%対象額・消費税額）があれば、それを
+  正解として直接行を起こす（読取はGemini、採用判断はコードで確定的に）。
+
+実装（commit 予定）:
+- receipt_aggregation.py 追加:
+  ・build_rows_from_tax_summary(tax_summary, debit_account, doc_category, credit_account)
+    票面内訳→税率別仕訳行。外税は base+tax で税込換算、1区分=1行（同10%でも内外税別行）
+  ・determine_tax_types() を ocr_engine から移設・一元化（逐品目と内訳優先で共用）
+  ・select_aggregated_debit_account() を公開化（空グループは固定科目に退避）
+- ocr_engine.py:
+  ・RECEIPT prompt に document級 tax_summary 抽出指示（内税/外税/非課税の印字例つき）
+  ・_build_entries_for_single_doc を分流: tax_summary あれば内訳優先、無ければ従来集約
+  ・借方科目=票全体の代表科目を全行共有 → 非課税行も「接待交際費」になり員工表と一致
+    （Session5 で懸案だった非課税行科目=租税公課 問題が副次的に解決）
+- test_receipt_aggregation.py: 内訳行6サンプル+税区分判定+全角金額+空退避（35→49テスト）
+
+検証:
+- E2E 2回目（venv311 + 本物のGemini/PaddleOCR、test_images/receipt の6截図）: 6/6 全金額一致
+  P1=8%124/10%1531、P6=10%外税1245/10%内税5、P4/P5 非課税行も接待交際費。失敗0。
+- /simcodex 2輪 early-exit: simplify 3 fix（死別名削除/prompt精簡/docstring）、
+  codex 2輪とも correctness 0 finding。
+- 信頼度（正直評価）: コード端 ~97%、Gemini の tax_summary 抽出 ~75-85%、
+  端到端 ~82-88%。上限の理由 = サンプル n=6・教科書票（内訳印字あり）偏重・
+  Gemini に乱数性（同图1回目誤・2回目正）。fallback路径（内訳印字なし票）は未圧。
+
+未完了TODO（次セッション）:
+[A] 顧客回答待ち（Chatwork msg_id 2116467542011936768、チョウギョウエイ氏が6/11中回答約束）:
+    ① 借方科目の自動判定ルール ② 摘要書式（店名+税率/税率のみ/店名のみ）
+    → 回答後 AGGREGATED_DEBIT_ACCOUNT_STRATEGY と _format_tax_label を調整
+[B] 顧客提供の実票が届いたら: fallback路径（内訳印字なし票）をE2E圧、
+    同一票を3-5回リランして Gemini 抽出の安定度を定量化
+[C] defer済P2（評審分岐で見送り、記録のみ）: build_rows_from_tax_summary と
+    aggregate_entries_by_tax_rate の共有 _build_tax_row helper（信頼モデル差+
+    安定関数への引数追加で risk>reward）。build-then-discard repr_account（DRY優先）
+[D] PR作成 → main マージ（顧客が公司Windows機で git pull）
+
+環境メモ:
+- このMacに venv311 を新規作成（.gitignore済）。E2Eは venv311/bin/python local_test.py --only-file P
+- 公司Windows機の main.py サービスは現在停止中の可能性大（黒箱、要遠程排査）。
+  当面 Mac側で main.py を起動してはいけない（二重稼働で同一ファイル争奪→重複行）
+- EC2/Docker 部署残骸を整理済（commit 263cad5、.py コードは不変）
+
+=== Session 7 (2026-06-11) ===
+状态: 6/11 顧客回答実装完了 + 14 票 E2E 圧測 13/14 PASS（commit 3e0685d / 74bdf09）
+
+[1] 顧客回答（員工転述）の実装（commit 3e0685d）:
+- 摘要=「店名 税率」書式（例: ファミマ 10%。空白区切り・「対象」後綴なし）
+  ・_format_tax_label 改修 + sheets_output._build_description 新設
+    （RECEIPT tab のみ空白書式、他 doc_type は従来「店名 - 内容」維持）
+- 普通領収書は1枚=1借方科目（票全体の用途で決定）
+  ・ocr_engine 呼び出し側で doc_category=="receipt" 限定の整票統一
+    （bank_transfer/fee_receipt の複数科目は保持、逐品目 override にも guard）
+- vendor 照合強化: _normalize_vendor_key（NFKC+casefold+空白除去、ロード時前計算）
+  ＋厳格先勝ち。ゴルフ場→接待交際費、用品店（GOLF5/ゴルフパートナー/つるや等）
+  は除外項先勝ちで備品・消耗品費、MEGA→MEGAドン収窄
+- テスト 64 green（test_ocr_engine_receipt.py / test_sheets_output.py 新設）
+- プロセス: plan v3（実装前 codex 計画審2輪）→ workflow 6 agent 実装＋対抗検証
+  → /simcodex 3輪収束（codex 終審 0 finding）
+
+[2] 14 票新サンプル E2E 圧測（Desktop/税区分テスト、LocalTest_領収書 行22-55）:
+- 結果 13/14 PASS（行数・金額・税区分・摘要標籤全対、API エラー 0）
+- 軽油税 2 票（EneJet 内税493/外税708）対象外行独立・金額正確
+  ← prompt 非課税例示に軽油税を追加してから実行（commit 74bdf09）
+- 手書き票（焼鳥の六角堂 7,310）PASS・科目接待交際費も正解（fallback 路径初実証）
+- TRIAL=員工表⑥原票の再現一致（乱数性アンカー n=1）
+- 唯一 miss: #9 ダスキン低解像度納品・請求書兼領収書 → 出力5,870=税抜額、
+  票面領収額6,456（+消費税586）。外税→税込換算不発。票面合計 vs Σ行金額の
+  照合で機械検出可能な失敗モード
+- 信頼度更新: 端到端実測 13/14≈93%（n=14、CI 広い）。合計照合チェック導入後は
+  実効信頼度（誤りが帳面に漏れる確率）はさらに改善見込み
+
+[3] /simcodex（74bdf09 分）: 2輪 early-exit。codex P2 1件
+  （fallback 軽油票の二重計上リスク）→ prompt に本体額分解指示＋具体例を追記
+
+未完了TODO（次セッション）:
+[B'] anomaly_detector に「票面合計 vs Σ行金額」照合を追加（#9 類の静默誤りを攔截）
+[C] defer済P2: 共有 _build_tax_row helper / golf 変体テストの subTest 統合
+[D] PR作成 → main マージ（顧客が公司Windows機で git pull）
+[E] ⑥未払金の貸方部門列錯位は顧客口頭確認待ち（コード変更不要）
+[F] 同票リラン乱数性の定量化（現状アンカー TRIAL n=1 のみ）
+
+=== Session 8 (2026-06-12) ===
+状态: 6/12 顧客新サンプル（軽油税→租税公課）実装完了 + 全量 E2E 回帰 13/14
+
+[1] 顧客 Sheet 最下部に新サンプル追加（行186-187、EneJet 外税票 7,095）:
+- 期待: 旅費交通費 6,387(10%) + 租税公課 708(対象外) ← 軽油税は整票一科目の例外
+- ゴルフ場利用税(P4/P5)は従来どおり接待交際費（実務慣例: 接待中の利用税は
+  交際費に含める / 軽油引取税は租税公課で別建て。矛盾ではなく並存規則）
+- 実装規則はホワイトリスト収窄: KEIYUZEI_KEYWORDS=("軽油税","軽油引取税")のみ。
+  入湯税・宿泊税等はサンプル無しのため整票科目のまま（顧客確認待ち）
+
+[2] 実装（TDD、テスト64→80 green）:
+- receipt_aggregation.py: is_keiyuzei_text / KEIYUZEI_DEBIT_ACCOUNT。
+  build_rows_from_tax_summary に label判定＋keiyuzei_amounts金額兜底（label欠落時のみ）。
+  rate=0グループのキーに科目を追加（軽油税と他の非課税項を1行に潰さない）
+- ocr_engine.py: RECEIPT prompt の tax_summary 契約に label 欄位追加、
+  軽油税品目→租税公課指示。整票統一に rate=0×軽油税の例外
+  （課税燃料行の「内軽油税」注記では発動しない。repr_account 選出からも除外）
+- /simcodex 3輪: R1 simplify2+codex2修、R2 simplify1+codex1修、R3 双方0 finding
+  codex 指摘で潰した穴: 課税行誤マッチ / rate=0混在グループ合併 / label優先順位
+
+[3] E2E 検証（LocalTest_領収書）:
+- 軽油2票（内税4,507+493 / 外税6,387+708）租税公課分離 ✓ リラン込み n=10 全対零漂移
+- 全量14票再圧: 13/14（6/11 と同率）。D票ダスキン（6/11 唯一の靜默錯 5,870）
+  は今回 6,456 で正解＝乱数性と確定。C票六角堂（6/11 PASS）が今回幻覚行
+  「対象外 ¥2,420」を追加出力＝新の靜默錯。どちらも票面合計照合で攔截可能型
+- TRIAL 型 MAX_TOKENS（finish_reason=2, len≈821-826）計3回観測、
+  内蔵 Vision fallback で 2/3 自動回復
+
+[4] 置信度更新（2輪全量 n=28 + リラン15票次）:
+- 端到端首跑全対 26/28 ≈ 93%（両輪一致で安定）
+- 靜默錯 2/28 ≈ 7%（全て「Σ行金額≠票面合計」型・同票再測で消える乱数錯）
+  → [B'] 実装後の実効残錯率 <1-2% 見込み。[B'] が次の最優先タスク
+- [F] リラン定量化は本セッションで実質完了（軽油6票次+TRIAL3票次）
+
+未完了TODO（次セッション）:
+[B'] 票面合計 vs Σ行金額 照合（最優先。今回の靜默錯2例とも攔截可能を実証済）
+[B''] TRIAL型 MAX_TOKENS 加固（max_output_tokens 拡大 or finish_reason=2 自動再試）
+[C] defer済P2: 共有 _build_tax_row helper / golf 変体テストの subTest 統合
+[D] PR作成 → main マージ（顧客が公司Windows機で git pull）
+[E] ⑥未払金の貸方部門列錯位は顧客口頭確認待ち
+[G] 規則境界（入湯税・宿泊税等）の顧客確認 / 摘要「店名 軽油税」表記の要否確認
