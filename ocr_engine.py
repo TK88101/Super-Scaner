@@ -93,10 +93,14 @@ def _generate_content_with_retry(contents):
     raise last_err
 
 
+# gemini-2.5 系列は thinking tokens が max_output_tokens と予算を共有するため、
+# 思考分の余裕を確保する（flash の動的思考上限 24,576 + JSON 本文 <2k）
+GEMINI_MAX_OUTPUT_TOKENS = 32768
+
 GEMINI_GENERATION_CONFIG = {
     "temperature": 0,
     "response_mime_type": "application/json",
-    "max_output_tokens": 8192,
+    "max_output_tokens": GEMINI_MAX_OUTPUT_TOKENS,
 }
 
 
@@ -190,6 +194,15 @@ def _get_finish_reason(response):
         return str(getattr(candidates[0], "finish_reason", "")) or ""
     except Exception:
         return ""
+
+
+# proto enum FinishReason.MAX_TOKENS = 2（str() 表現の揺れに備えて文字列も併記）
+_MAX_TOKENS_FINISH_REASONS = {"2", "MAX_TOKENS", "FinishReason.MAX_TOKENS"}
+
+
+def _is_max_tokens_truncated(response):
+    """finish_reason が MAX_TOKENS（=2）かを判定する"""
+    return _get_finish_reason(response) in _MAX_TOKENS_FINISH_REASONS
 
 
 # === Cloud Vision API — 甲方確認待ち、コード保持 ===
@@ -286,19 +299,42 @@ def _ocr_with_paddleocr(image_bytes, mime_type="image/jpeg"):
     return ocr_text, avg_confidence
 
 
+def _format_token_usage(response):
+    """usage_metadata から思考トークン数の近似値を整形する（取得不能時は '?'）"""
+    usage = getattr(response, "usage_metadata", None)
+    if usage is None:
+        return "思考≈?tok"
+    total = getattr(usage, "total_token_count", 0) or 0
+    prompt = getattr(usage, "prompt_token_count", 0) or 0
+    candidates = getattr(usage, "candidates_token_count", 0) or 0
+    return f"思考≈{total - prompt - candidates}tok/全体{total}tok"
+
+
+def _parse_gemini_response(response):
+    """Gemini 応答から JSON を抽出（失敗時は警告ログを出して None を返す）"""
+    try:
+        text = (getattr(response, "text", "") or "").strip()
+    except ValueError:
+        # MAX_TOKENS 等で parts が空の場合、response.text は ValueError を送出する
+        text = ""
+    parsed = extract_json(text)
+    if parsed is None:
+        finish_reason = _get_finish_reason(response)
+        detail = ""
+        if _is_max_tokens_truncated(response):
+            detail = f", {_format_token_usage(response)}"
+        print(
+            f"⚠️ Gemini応答のJSON解析失敗 "
+            f"(finish_reason={finish_reason or 'unknown'}, len={len(text)}{detail})"
+        )
+    return parsed
+
+
 def _call_gemini_text(ocr_text, prompt):
     """OCR テキストを Gemini に送って構造化データを抽出"""
     full_prompt = f"{prompt}\n\n--- OCRテキスト ---\n{ocr_text}"
     response = _generate_content_with_retry([full_prompt])
-    text = (getattr(response, "text", "") or "").strip()
-    parsed = extract_json(text)
-    if parsed is None:
-        finish_reason = _get_finish_reason(response)
-        print(
-            f"⚠️ Gemini応答のJSON解析失敗 "
-            f"(finish_reason={finish_reason or 'unknown'}, len={len(text)})"
-        )
-    return parsed
+    return _parse_gemini_response(response)
 
 
 def _call_gemini_bytes(file_data, mime_type, prompt):
@@ -309,16 +345,7 @@ def _call_gemini_bytes(file_data, mime_type, prompt):
             prompt,
         ]
     )
-
-    text = (getattr(response, "text", "") or "").strip()
-    parsed = extract_json(text)
-    if parsed is None:
-        finish_reason = _get_finish_reason(response)
-        print(
-            f"⚠️ Gemini応答のJSON解析失敗 "
-            f"(finish_reason={finish_reason or 'unknown'}, len={len(text)})"
-        )
-    return parsed
+    return _parse_gemini_response(response)
 
 
 def _call_gemini_cross_validate(ocr_text, file_data, mime_type, prompt):
@@ -337,15 +364,7 @@ def _call_gemini_cross_validate(ocr_text, file_data, mime_type, prompt):
             cross_prompt,
         ]
     )
-    text = (getattr(response, "text", "") or "").strip()
-    parsed = extract_json(text)
-    if parsed is None:
-        finish_reason = _get_finish_reason(response)
-        print(
-            f"⚠️ Gemini応答のJSON解析失敗 "
-            f"(finish_reason={finish_reason or 'unknown'}, len={len(text)})"
-        )
-    return parsed
+    return _parse_gemini_response(response)
 
 
 def _call_gemini(file_path, prompt):
@@ -806,7 +825,8 @@ PROMPTS = {
                     "tax_amount": その税率区分の消費税額(数値, なければ0),
                     "label": "非課税/対象外行(tax_rate=0)のみ票面の名目（例: \"軽油税\", \"ゴルフ場利用税\", \"非課税金額\"）。課税行は空文字"
                 }
-            ]
+            ],
+            "total_amount": 票面に印字された税込の合計金額(「合計」「お買上計」等, 数値。印字が無ければ 0)
         }
     ]
 }
@@ -879,6 +899,19 @@ PROMPTS = {
     base_amount=その金額、tax_amount=0、label=票面の名目（"軽油税"・"ゴルフ場利用税"・"非課税金額" 等）
 - 税率別内訳が印字されていないレシート（単純な品目羅列のみ）は tax_summary=[] とする。
   内訳行を品目(items)に混ぜないこと。
+
+【total_amount（票面合計）の抽出】
+- 票面に印字された税込の合計金額（「合計」「お買上計」「領収金額」等）をそのまま転記する（items から再計算しない）
+- 必ず「税率別内訳（tax_summary）の対象額の税込合計」と一致する金額を選ぶこと
+  （この金額は仕訳の各行金額の合計と照合されるため、行と食い違う額を入れない）
+- 値引・割引・ポイント・商品券の扱いは上記原則で判断する:
+  ・ポイント・商品券・クーポンを「支払い手段」として充当した場合
+    （税率別内訳の対象額は減らない）→ 充当前の商品合計（「お買上計」「小計」）を転記する
+  ・値引・割引が税率別内訳の対象額そのものを減額している場合
+    （内訳が値引後の対象額を表示）→ 値引後の合計（票面の「合計」）を転記する
+- お預り・お釣り・現金（お預り金額）と混同しないこと
+- 外税レシートでは税抜小計ではなく、消費税加算後の合計金額を使う
+- 合計の印字が無い場合は 0 とする
 
 【payment_method の判定基準】
 - コンビニ（FamilyMart, セブンイレブン等）での支払い → "現金"
@@ -1400,6 +1433,11 @@ def _normalize_receipt_results(raw_data, prefix=""):
                 "vendor": vendor,
                 "invoice_num": doc.get("invoice_num", ""),
                 "memo": doc.get("memo", ""),
+                # 票面合計（B' 照合用、票面印字値の転記）。bank_transfer /
+                # fee_receipt は合計の語義が曖昧（振込金額 vs 手数料込み）な
+                # ため receipt のみ伝搬する（None=照合スキップ）
+                "total_amount": (doc.get("total_amount")
+                                 if doc_cat == "receipt" else None),
                 "entries": entries,
             })
         return results

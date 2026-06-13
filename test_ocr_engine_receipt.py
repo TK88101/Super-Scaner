@@ -305,5 +305,84 @@ class KeiyuzeiSozeikokaSplitTest(unittest.TestCase):
         )
 
 
+class NormalizeReceiptResultsTotalAmountTest(unittest.TestCase):
+    """[B'] total_amount の伝搬（receipt のみ、語義閘）。"""
+
+    def test_receipt_doc_passes_total_amount_through(self):
+        # Arrange: receipt doc に票面合計6456 + 有効品目1件
+        raw = {"documents": [_doc(
+            doc_category="receipt", vendor="ダスキン",
+            items=[_receipt_item("商品", 6456, 0.10, "備品・消耗品費")])]}
+        raw["documents"][0]["total_amount"] = 6456
+
+        # Act
+        result = ocr_engine._normalize_receipt_results(raw)
+
+        # Assert: result dict に total_amount が伝搬する
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["total_amount"], 6456)
+
+    def test_bank_transfer_total_amount_not_propagated(self):
+        # Arrange: bank_transfer は合計語義が曖昧なため伝搬しない
+        raw = {"documents": [_doc(
+            doc_category="bank_transfer", vendor="○○銀行",
+            items=[_receipt_item("振込", 50000, 0, "未払金")])]}
+        raw["documents"][0]["total_amount"] = 50000
+
+        # Act
+        result = ocr_engine._normalize_receipt_results(raw)
+
+        # Assert: 語義閘で None に落ちる
+        self.assertEqual(len(result), 1)
+        self.assertIsNone(result[0]["total_amount"])
+
+    def test_receipt_doc_without_total_defaults_none(self):
+        # Arrange: total_amount キーが無い receipt doc
+        raw = {"documents": [_doc(
+            doc_category="receipt", vendor="店",
+            items=[_receipt_item("商品", 1000, 0.10, "備品・消耗品費")])]}
+
+        # Act
+        result = ocr_engine._normalize_receipt_results(raw)
+
+        # Assert: キー欠損は None（照合スキップ）
+        self.assertEqual(len(result), 1)
+        self.assertIsNone(result[0]["total_amount"])
+
+
+class ReceiptPromptTotalAmountGuidanceTest(unittest.TestCase):
+    """[B'] total_amount 抽出指示が割引票で誤照合を招かない文言であること。
+
+    codex P2: 「一律値引前」だと、対象額そのものを減額する値引票で
+    total_amount > Σ行金額 となり正しい票が赤化する。total を「対象額の
+    税込合計＝仕訳行と一致」に縛り、支払手段充当と対象額減額を区別する。
+    """
+
+    def _receipt_prompt(self):
+        from doc_types import DocType
+        return ocr_engine.PROMPTS[DocType.RECEIPT]
+
+    def test_total_must_match_tax_summary_taxable_sum(self):
+        # Arrange / Act
+        prompt = self._receipt_prompt()
+        # Assert: 行と一致させる原則が明示されている
+        self.assertIn("対象額の税込合計", prompt)
+        self.assertIn("各行金額の合計と照合", prompt)
+
+    def test_distinguishes_payment_tender_from_taxable_discount(self):
+        # Arrange / Act
+        prompt = self._receipt_prompt()
+        # Assert: 支払手段充当（値引前）と対象額減額（値引後）の両分岐がある
+        self.assertIn("支払い手段", prompt)
+        self.assertIn("充当前の商品合計", prompt)
+        self.assertIn("値引後の合計", prompt)
+
+    def test_no_blanket_pre_discount_instruction(self):
+        # Arrange / Act
+        prompt = self._receipt_prompt()
+        # Assert: 誤導を招く「一律値引前」旧文言が残っていない
+        self.assertNotIn("値引前の税込合計（「合計」「お買上計」）を転記", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

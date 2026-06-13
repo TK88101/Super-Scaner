@@ -1,6 +1,7 @@
 # anomaly_detector.py — 異常検出モジュール
 import re
 from config import UNKNOWN_ACCOUNT
+from receipt_aggregation import coerce_tax_amount
 
 
 def detect_anomalies(entry, parent_data=None):
@@ -125,6 +126,44 @@ def detect_anomalies(entry, parent_data=None):
         })
 
     return flags
+
+
+# 票面合計とΣ行金額の照合の許容差（円）。外税→税込換算（ROUND_HALF_UP 兜底）
+# で税率グループごとに±1円の丸め差が生じうるため、外税2グループ分の2円まで許容
+TOTAL_MISMATCH_TOLERANCE_YEN = 2
+
+
+def detect_document_anomalies(parent_data, row_amounts):
+    """文書（票）単位の異常を検出する。
+
+    detect_anomalies が逐 entry 検査なのに対し、本関数は1票の書き込み行全体を
+    対象とする（sheets_output.append_entries から票ごとに1回呼ばれる）。
+    現状は票面合計 vs Σ行金額の照合のみ（6/12 静默錯対策: D票=外税換算漏れ、
+    C票=幻覚行 を機械検出する）。
+
+    Args:
+        parent_data: doc 級 dict。total_amount（票面の税込合計）を参照する。
+        row_amounts: 実際に書き込む行の借方金額 list（amount==0 行は除外済み）。
+
+    Returns:
+        list[dict]: 異常フラグ（detect_anomalies と同形式）。
+        total_amount が欠損・0・非数値の場合は照合せず空リストを返す
+        （誤報防止。スキップの可視化は呼び出し側 sheets_output が行う）。
+    """
+    total = coerce_tax_amount((parent_data or {}).get("total_amount"))
+    if not total or not row_amounts:
+        return []
+    row_sum = sum(row_amounts)
+    diff = row_sum - total
+    if abs(diff) <= TOTAL_MISMATCH_TOLERANCE_YEN:
+        return []
+    return [{
+        "type": "total_mismatch",
+        "message": (f"票面合計¥{total:,} ≠ 行合計¥{row_sum:,}"
+                    f"（差額 ¥{diff:+,}）"),
+        "severity": "high",
+        "col": 8,
+    }]
 
 
 def _is_valid_t_number(raw):
