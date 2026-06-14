@@ -8,6 +8,7 @@ import するため venv311 で実行する:
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -382,6 +383,81 @@ class ReceiptPromptTotalAmountGuidanceTest(unittest.TestCase):
         prompt = self._receipt_prompt()
         # Assert: 誤導を招く「一律値引前」旧文言が残っていない
         self.assertNotIn("値引前の税込合計（「合計」「お買上計」）を転記", prompt)
+
+
+class OcrConfidencePlumbingTest(unittest.TestCase):
+    """規則② plumbing: ocr_conf を doc 級 result dict まで透出する。
+
+    _normalize_receipt_results は documents 1 件につき result dict を1つ
+    生成し、同一ページの page-level conf を各 dict に押す（page-level 信号で
+    意図的、1:1 ではない）。欠損時は None（無信号）で detect_low_confidence は
+    空を返す。_ocr_with_paddleocr の戻り 2-tuple 契約は不変（取り違え防止）。
+    """
+
+    def test_normalize_stamps_ocr_confidence_on_each_doc(self):
+        # Arrange: 同一ページ2書類 + page-level conf=0.62
+        raw = {"documents": [
+            _doc(doc_category="receipt", vendor="店A",
+                 items=[_receipt_item("商品", 1000, 0.10, "備品・消耗品費")]),
+            _doc(doc_category="receipt", vendor="店B",
+                 items=[_receipt_item("商品", 2000, 0.10, "備品・消耗品費")]),
+        ]}
+        # Act
+        results = ocr_engine._normalize_receipt_results(
+            raw, ocr_confidence=0.62)
+        # Assert: 各 result dict に同一 page-level conf が乗る
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0]["ocr_confidence"], 0.62)
+        self.assertEqual(results[1]["ocr_confidence"], 0.62)
+
+    def test_normalize_defaults_ocr_confidence_none(self):
+        # Arrange: ocr_confidence 未指定（Gemini-Vision 兜底等）
+        raw = {"documents": [_doc(
+            doc_category="receipt", vendor="店",
+            items=[_receipt_item("商品", 1000, 0.10, "備品・消耗品費")])]}
+        # Act
+        results = ocr_engine._normalize_receipt_results(raw)
+        # Assert: 既定 None（無信号）
+        self.assertEqual(len(results), 1)
+        self.assertIsNone(results[0]["ocr_confidence"])
+
+    def test_normalize_legacy_format_includes_ocr_confidence_key(self):
+        # Arrange: 旧フォーマット（documents キーなし、tax_10_area ベース）
+        raw = {
+            "vendor": "店", "date": "2026/06/01",
+            "debit_account": "備品・消耗品費",
+            # candidates は生の数値列。税込1,100 と消費税100 が10%整合
+            "tax_10_area": {"candidates": [1100, 100]},
+        }
+        # Act
+        results = ocr_engine._normalize_receipt_results(
+            raw, ocr_confidence=0.50)
+        # Assert: 旧フォーマット result にも键が乗る
+        self.assertGreaterEqual(len(results), 1)
+        self.assertEqual(results[0]["ocr_confidence"], 0.50)
+
+    def test_route_ocr_strategy_returns_three_tuple(self):
+        # Arrange: PaddleOCR を「テキスト無し」にして Gemini を呼ばずに返す
+        # （戻り値のアリティ＝3 のみを契約として確認）
+        with mock.patch.object(
+                ocr_engine, "_ocr_with_paddleocr", return_value=("", 0.0)):
+            # Act
+            out = ocr_engine._route_ocr_strategy(
+                b"x", "image/jpeg", "prompt", "C")
+        # Assert: (raw_data, ocr_text, ocr_conf) の3要素
+        self.assertEqual(len(out), 3)
+        raw_data, ocr_text, ocr_conf = out
+        self.assertIsNone(raw_data)
+        self.assertEqual(ocr_text, "")
+
+    def test_ocr_with_paddleocr_contract_stays_two_tuple(self):
+        # Arrange / Act: 取り違え防止。_ocr_with_paddleocr は 2 引数のまま
+        import inspect
+        sig = inspect.signature(ocr_engine._ocr_with_paddleocr)
+        # Assert: シグネチャ（image_bytes, mime_type）= 2 引数を維持
+        self.assertEqual(len(sig.parameters), 2)
+        self.assertIn("image_bytes", sig.parameters)
+        self.assertIn("mime_type", sig.parameters)
 
 
 if __name__ == "__main__":

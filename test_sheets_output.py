@@ -65,9 +65,10 @@ def _make_writer():
     return writer
 
 
-def _entry(amount, account="備品・消耗品費"):
+def _entry(amount, account="備品・消耗品費", tax_type="課対仕入10%"):
     """借方科目つきの仕訳エントリ（異常検出を避ける一般科目）。"""
     return {"amount": amount, "debit_account": account,
+            "debit_tax_type": tax_type,
             "description": "商品", "credit_account": "未払金"}
 
 
@@ -158,6 +159,165 @@ class AppendEntriesTotalMismatchTest(unittest.TestCase):
         # Assert: doc 高亮なし、かつ可観測性のスキップ通知が出る
         self.assertEqual([c for c in call_log if c[0] == "doc"], [])
         self.assertIn("合計照合スキップ", out)
+
+
+class AppendEntriesOutlierExemptTest(unittest.TestCase):
+    """規則①: 対象外行の構造異常 → I列赤（合計照合と同経路で合流）。"""
+
+    def _run(self, entries, entries_extra=None):
+        writer = _make_writer()
+        ws = _FakeWorksheet()
+        call_log = []
+
+        def fake_apply_highlight(self, worksheet, row, flags):
+            call_log.append(("entry", row, flags))
+
+        def fake_format_with_retry(self, worksheet, cell_ref, fmt,
+                                   max_retries=5):
+            call_log.append(("doc", cell_ref, fmt))
+
+        data = {"date": "2026/06/01", "vendor": "焼鳥の六角堂",
+                "invoice_num": "", "memo": "", "entries": entries,
+                "doc_category": "receipt"}
+        if entries_extra:
+            data.update(entries_extra)
+
+        with patch.object(SheetsOutputWriter, "_get_or_create_tab",
+                          return_value=ws), \
+             patch.object(SheetsOutputWriter, "_apply_anomaly_highlight",
+                          fake_apply_highlight), \
+             patch.object(SheetsOutputWriter, "_format_with_retry",
+                          fake_format_with_retry):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                writer.append_entries("従業員", DocType.RECEIPT, data,
+                                      source_url="http://x")
+        return call_log, ws, buf.getvalue()
+
+    def test_rokkakudo_hallucination_highlights_amount_column(self):
+        # Arrange: 六角堂（課税7,310 + 対象外90,000）。Σ=票面=97,310 で
+        #   合計照合は通る（total_mismatch は出ない）が、規則①が拾う
+        # Act
+        call_log, ws, out = self._run(
+            [_entry(7310, tax_type="課対仕入10%"),
+             _entry(90000, account="備品・消耗品費", tax_type="対象外")],
+            {"total_amount": 97310})
+        # Assert: I列赤が1回（合計照合は不一致でないため①単独）
+        doc_calls = [c for c in call_log if c[0] == "doc"]
+        i_calls = [c for c in doc_calls if c[1].startswith("I")]
+        self.assertEqual(len(i_calls), 1)
+        self.assertEqual(i_calls[0][1], "I6:I7")
+        self.assertIn("対象外", out)
+
+    def test_normal_receipt_no_outlier_highlight(self):
+        # Arrange: 正常票（課税5,000 + 対象外200）
+        # Act
+        call_log, ws, out = self._run(
+            [_entry(5000, tax_type="課対仕入10%"),
+             _entry(200, tax_type="対象外")],
+            {"total_amount": 5200})
+        # Assert: I列赤なし
+        i_calls = [c for c in call_log
+                   if c[0] == "doc" and c[1].startswith("I")]
+        self.assertEqual(i_calls, [])
+
+    def test_mismatch_and_outlier_paint_amount_column_once(self):
+        # Arrange: 合計照合NG かつ 規則①命中（対象外100,000 突出, 票面が不一致）
+        # Act
+        call_log, ws, out = self._run(
+            [_entry(7310, tax_type="課対仕入10%"),
+             _entry(100000, tax_type="対象外")],
+            {"total_amount": 50000})
+        # Assert: 両命中でも I列赤は1回に合流（重複塗りしない）
+        i_calls = [c for c in call_log
+                   if c[0] == "doc" and c[1].startswith("I")]
+        self.assertEqual(len(i_calls), 1)
+        self.assertEqual(i_calls[0][1], "I6:I7")
+
+    def test_bank_transfer_exempt_not_flagged(self):
+        # Arrange: bank_transfer（本体が対象外・高額）は規則①の対象外。
+        #   DocType.RECEIPT 経路でも doc_category!="receipt" でスキップ（codex 指摘）
+        # Act
+        call_log, ws, out = self._run(
+            [_entry(100000, tax_type="対象外")],
+            {"doc_category": "bank_transfer"})
+        # Assert: I列赤なし（規則①は真の receipt 限定）
+        i_calls = [c for c in call_log
+                   if c[0] == "doc" and c[1].startswith("I")]
+        self.assertEqual(i_calls, [])
+
+
+class AppendEntriesLowConfidenceTest(unittest.TestCase):
+    """規則②: 低置信整票 → 全行（A:AB）黄、I列赤の後に置く。"""
+
+    def _run(self, entries, entries_extra=None):
+        writer = _make_writer()
+        ws = _FakeWorksheet()
+        call_log = []
+
+        def fake_format_with_retry(self, worksheet, cell_ref, fmt,
+                                   max_retries=5):
+            call_log.append(("doc", cell_ref, fmt))
+
+        data = {"date": "2026/06/01", "vendor": "店",
+                "invoice_num": "", "memo": "", "entries": entries}
+        if entries_extra:
+            data.update(entries_extra)
+
+        with patch.object(SheetsOutputWriter, "_get_or_create_tab",
+                          return_value=ws), \
+             patch.object(SheetsOutputWriter, "_format_with_retry",
+                          fake_format_with_retry):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                writer.append_entries("従業員", DocType.RECEIPT, data,
+                                      source_url="http://x")
+        return call_log, ws, buf.getvalue()
+
+    def test_low_confidence_paints_full_row_yellow(self):
+        # Arrange: ocr_confidence=0.60 < 0.85 閾値
+        # Act
+        call_log, ws, out = self._run(
+            [_entry(5000)], {"ocr_confidence": 0.60})
+        # Assert: A6:AB6 黄が1回
+        ab_calls = [c for c in call_log
+                    if c[0] == "doc" and c[1] == "A6:AB6"]
+        self.assertEqual(len(ab_calls), 1)
+        self.assertIn("低置信", out)
+
+    def test_high_confidence_no_yellow(self):
+        # Arrange: 六角堂相当の 0.91（①主力・②は抓えない裏付け）
+        # Act
+        call_log, ws, out = self._run(
+            [_entry(5000)], {"ocr_confidence": 0.91})
+        # Assert: 黄なし
+        ab_calls = [c for c in call_log
+                    if c[0] == "doc" and c[1].startswith("A6:AB")]
+        self.assertEqual(ab_calls, [])
+
+    def test_missing_confidence_no_yellow(self):
+        # Arrange: ocr_confidence 欠損（Vision 兜底等の無信号）
+        # Act
+        call_log, ws, out = self._run([_entry(5000)])
+        # Assert: 黄なし
+        ab_calls = [c for c in call_log
+                    if c[0] == "doc" and c[1].startswith("A6:AB")]
+        self.assertEqual(ab_calls, [])
+
+    def test_red_applied_after_yellow(self):
+        # Arrange: 合計照合NG（赤）+ 低置信（黄）が同票に同居
+        # Act
+        call_log, ws, out = self._run(
+            [_entry(5000)], {"total_amount": 99999, "ocr_confidence": 0.50})
+        # Assert: A:AB 黄を先に塗り、I列赤を後に塗る。全行黄が I列を含むため、
+        # 赤を最終色にして漏账の赤信号が黄に被覆されないようにする（codex 指摘の修正）
+        i_idx = next((i for i, c in enumerate(call_log)
+                      if c[0] == "doc" and c[1].startswith("I")), None)
+        ab_idx = next((i for i, c in enumerate(call_log)
+                       if c[0] == "doc" and c[1].startswith("A6:AB")), None)
+        self.assertIsNotNone(i_idx)
+        self.assertIsNotNone(ab_idx)
+        self.assertGreater(i_idx, ab_idx)
 
 
 if __name__ == "__main__":

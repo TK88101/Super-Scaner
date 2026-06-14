@@ -132,6 +132,15 @@ def detect_anomalies(entry, parent_data=None):
 # で税率グループごとに±1円の丸め差が生じうるため、外税2グループ分の2円まで許容
 TOTAL_MISMATCH_TOLERANCE_YEN = 2
 
+# 規則①（対象外行の構造異常）用の定数。
+# EXEMPT_TAX_TYPE: determine_tax_types が rate=0 で固定出力する税区分ラベル。
+#   精確等値で判定する（"課対仕入…" も「対」を含むため in/含「対」は使わない）。
+EXEMPT_TAX_TYPE: str = "対象外"
+# EXEMPT_RATIO_THRESHOLD: 対象外金額合計 / 票面合計 の上限（規則①b）。
+EXEMPT_RATIO_THRESHOLD: float = 0.5
+# EXEMPT_ABSOLUTE_THRESHOLD_YEN: 単個対象外行の絶対閾値（規則①c）。
+EXEMPT_ABSOLUTE_THRESHOLD_YEN: int = 50000
+
 
 def detect_document_anomalies(parent_data, row_amounts):
     """文書（票）単位の異常を検出する。
@@ -163,6 +172,106 @@ def detect_document_anomalies(parent_data, row_amounts):
                     f"（差額 ¥{diff:+,}）"),
         "severity": "high",
         "col": 8,
+    }]
+
+
+def _exempt_outlier_triggered(
+    max_exempt: int,
+    sum_taxable: int,
+    sum_exempt_positive: int,
+    total: int,
+) -> bool:
+    """規則①の3閾値（OR）を評価する。命中で True。
+
+    a) 単個の対象外行が課税行合計を上回る（taxable 空=分母0なら除零回避でスキップ）。
+    b) 正額対象外の合計が票面合計の EXEMPT_RATIO_THRESHOLD を超える
+       （total 欠損=0、または taxable 空=純税費小票 ならスキップ）。
+    c) 単個の対象外行が EXEMPT_ABSOLUTE_THRESHOLD_YEN を超える（無依存の兜底）。
+
+    NOTE: a/b はいずれも taxable>0 を前提にする。純税費小票（印紙税・利用税の
+    みで課税本体が無い票）は対象外比率が当然 100% になるため、taxable 空では
+    比率判定をスキップし c（絶対額）だけで守る（誤報防止）。
+    """
+    if sum_taxable > 0 and max_exempt > sum_taxable:
+        return True
+    if (sum_taxable > 0 and total > 0
+            and sum_exempt_positive / total > EXEMPT_RATIO_THRESHOLD):
+        return True
+    return max_exempt > EXEMPT_ABSOLUTE_THRESHOLD_YEN
+
+
+def detect_outlier_exempt_rows(
+    row_amounts: list,
+    row_tax_types: list,
+    total_amount: object = None,
+) -> list:
+    """規則①: 対象外（rate=0）行の構造的不合理を検出する純関数。
+
+    Σ行金額==票面合計を満たす幻覚（六角堂: 課税7,310 + 対象外90,000 で
+    Σ=票面=97,310）は detect_document_anomalies を素通りするため、税区分の
+    構造（debit_tax_type 精確等値 "対象外"）から不合理な対象外行を拾う。
+    row_amounts と row_tax_types は同序・同長。命中時は 1 件 high flag（I列）。
+    非 list / 長さ不一致 / 対象外行なし / 正額対象外ゼロ（純返品）は空を返す。
+    """
+    if not isinstance(row_amounts, list) or not isinstance(row_tax_types, list):
+        return []
+    if not row_amounts or len(row_amounts) != len(row_tax_types):
+        return []
+
+    paired = list(zip(row_amounts, row_tax_types))
+    exempt = [coerce_tax_amount(a) for a, t in paired
+              if str(t).strip() == EXEMPT_TAX_TYPE]
+    taxable = [coerce_tax_amount(a) for a, t in paired
+               if str(t).strip() and str(t).strip() != EXEMPT_TAX_TYPE]
+    if not exempt:
+        return []
+
+    max_exempt = max((x for x in exempt if x > 0), default=0)
+    if max_exempt == 0:  # 全額が負（返品・値引）の対象外は誤判しない
+        return []
+
+    sum_taxable = sum(x for x in taxable if x > 0)
+    sum_exempt_positive = sum(x for x in exempt if x > 0)
+    total = coerce_tax_amount(total_amount)
+    if not _exempt_outlier_triggered(
+            max_exempt, sum_taxable, sum_exempt_positive, total):
+        return []
+
+    return [{
+        "type": "outlier_exempt_row",
+        "message": (f"対象外¥{max_exempt:,} が課税¥{sum_taxable:,}/"
+                    f"票面50%/5万円基準を超過"),
+        "severity": "high",
+        "col": 8,
+    }]
+
+
+def detect_low_confidence(parent_data: object, threshold: float) -> list:
+    """規則②: 整票の OCR 置信度が低い場合に人手複査フラグを返す純関数。
+
+    Args:
+        parent_data: doc 級 dict。ocr_confidence（PaddleOCR 平均置信度）を参照。
+        threshold: 黄マークの閾値（厳密小なり）。記账复核门槛（config 注入）。
+
+    Returns:
+        list[dict]: conf < threshold で 1 件の low（full_row）flag。
+        ocr_confidence の欠損・None・非数値は無信号として空リスト
+        （Gemini-Vision 兜底票を誤報しない）。
+    """
+    conf = (parent_data or {}).get("ocr_confidence")
+    if conf is None:
+        return []
+    try:
+        conf_val = float(conf)
+    except (TypeError, ValueError):
+        return []
+    if conf_val >= threshold:
+        return []
+    return [{
+        "type": "low_confidence",
+        "message": f"低置信・人工複査推奨（OCR置信度 {conf_val:.2f}）",
+        "severity": "low",
+        "full_row": True,
     }]
 
 

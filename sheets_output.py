@@ -19,6 +19,20 @@ MF_HEADERS = [
 ]
 
 
+# 異常ハイライトの severity → 背景色。凡例・per-entry・doc 級で共用し、
+# 同じ severity が複数箇所で別の色にブレる事故を防ぐ（single source of truth）。
+_SEVERITY_COLORS = {
+    "high": Color(1, 0.8, 0.8),    # 赤系
+    "medium": Color(1, 0.9, 0.7),  # 橙系
+    "low": Color(1, 1, 0.7),       # 黄系
+}
+
+
+def _severity_color(severity):
+    """severity ラベルから背景色を返す（未知値は黄系にフォールバック）。"""
+    return _SEVERITY_COLORS.get(severity, _SEVERITY_COLORS["low"])
+
+
 def _build_description(doc_type, vendor_name, item_description):
     """摘要文字列を組み立てる。
 
@@ -106,13 +120,13 @@ class SheetsOutputWriter:
             ]
             ws.append_rows(legend_rows, value_input_option='USER_ENTERED')
 
-            # 色見本を適用
+            # 色見本を適用（_severity_color と同一ソース、色ブレ防止）
             format_cell_range(ws, "A2:A2",
-                              CellFormat(backgroundColor=Color(1, 0.8, 0.8)))   # 赤系
+                              CellFormat(backgroundColor=_severity_color("high")))    # 赤系
             format_cell_range(ws, "A3:A3",
-                              CellFormat(backgroundColor=Color(1, 0.9, 0.7)))   # 橙系
+                              CellFormat(backgroundColor=_severity_color("medium")))  # 橙系
             format_cell_range(ws, "A4:A4",
-                              CellFormat(backgroundColor=Color(1, 1, 0.7)))     # 黄系
+                              CellFormat(backgroundColor=_severity_color("low")))     # 黄系
         except Exception as e:
             print(f"⚠️ 凡例書き込み失敗: {e}")
 
@@ -159,8 +173,13 @@ class SheetsOutputWriter:
             source_url: 原票 PDF の webViewLink
         """
         from doc_types import DOC_TYPE_TAB_SUFFIX
-        from config import ACCOUNT_MAP, UNKNOWN_ACCOUNT, CREDIT_SUB_ACCOUNT_RECEIPT, CREDIT_ONLY_ACCOUNTS
-        from anomaly_detector import detect_anomalies, detect_document_anomalies
+        from config import (ACCOUNT_MAP, UNKNOWN_ACCOUNT,
+                            CREDIT_SUB_ACCOUNT_RECEIPT, CREDIT_ONLY_ACCOUNTS,
+                            DOC_LOW_CONFIDENCE_THRESHOLD)
+        from anomaly_detector import (detect_anomalies,
+                                      detect_document_anomalies,
+                                      detect_outlier_exempt_rows,
+                                      detect_low_confidence)
         from receipt_aggregation import coerce_tax_amount
 
         tab_suffix = DOC_TYPE_TAB_SUFFIX.get(doc_type, "領収書")
@@ -269,6 +288,22 @@ class SheetsOutputWriter:
             except Exception as e:
                 print(f"⚠️ 新規行の背景リセット失敗: {e}")
 
+            # 規則②: 低置信整票を全行黄で下地マーク（人手複査推奨）。
+            # 塗り順は「黄(全行) → per-entry(各セル) → 赤(I列)」: 全行黄を最初に塗り、
+            # より高優先度の per-entry 赤橙・doc 赤を後から被せて消さない（codex 指摘）。
+            # 領収書限定。独立 try/except（429 リトライ、失敗しても行データは無傷）。
+            if doc_type == DocType.RECEIPT:
+                conf_flags = detect_low_confidence(
+                    entries_data, DOC_LOW_CONFIDENCE_THRESHOLD)
+                if conf_flags:
+                    print(f"🟡 {conf_flags[0]['message']}: {vendor_name}")
+                    try:
+                        self._format_with_retry(
+                            ws, f"A{start_row}:AB{end_row}",
+                            CellFormat(backgroundColor=_severity_color("low")))
+                    except Exception as e:
+                        print(f"⚠️ 低置信ハイライト適用失敗: {e}")
+
             # 異常行のハイライト（書き込み前の行数から位置を正確に算出）
             if anomaly_flags_list:
                 try:
@@ -282,19 +317,33 @@ class SheetsOutputWriter:
             # 行落ちを金額列（I列）の赤ハイライトで可視化する
             # （6/12 E2E 静默錯 2/28 対策。領収書限定の機能のため他 doc_type では呼ばない）
             if doc_type == DocType.RECEIPT:
-                doc_flags = detect_document_anomalies(
-                    entries_data, [r[8] for r in rows])
-                if doc_flags:
-                    print(f"⚠️ 合計照合NG: {doc_flags[0]['message']}")
-                    # severity=high → 赤（_apply_anomaly_highlight の high と同色）。
-                    # per-entry ハイライトの後に1回で適用し、同列の黄を赤が上書きする。
-                    # 上の一括 try/except とは独立（429 はリトライ、失敗しても行データは無傷）
+                # 票面合計照合（[B']）と対象外行の構造異常（規則①）を合流し、
+                # I列（金額列）を一度だけ赤塗りする（重複塗り防止）
+                amount_col = [r[8] for r in rows]      # I列=借方金額
+                tax_type_col = [r[6] for r in rows]    # G列=借方税区分
+                doc_flags = detect_document_anomalies(entries_data, amount_col)
+                # 規則①は真の receipt 限定。bank_transfer/fee_receipt は本体が
+                # 「対象外」かつ高額になり得るため除外（合計照合は total=None で既に
+                # スキップ済み、規則①も doc_category で揃える。codex 指摘）
+                exempt_flags = []
+                if entries_data.get("doc_category") == "receipt":
+                    exempt_flags = detect_outlier_exempt_rows(
+                        amount_col, tax_type_col,
+                        entries_data.get("total_amount"))
+                red_flags = doc_flags + exempt_flags
+
+                # 票面合計照合[B']+対象外[規則①] → I列を一度だけ赤塗り（重複塗り防止）。
+                # severity=high → 赤（_severity_color の high）。黄(下地)・per-entry の
+                # 後に塗り、I列を最終的に赤にする。上の一括 try/except とは独立（429 リトライ）。
+                if red_flags:
+                    for flag in red_flags:
+                        print(f"⚠️ 異常検出: {flag['message']}")
                     try:
                         self._format_with_retry(
                             ws, f"I{start_row}:I{end_row}",
-                            CellFormat(backgroundColor=Color(1, 0.8, 0.8)))
+                            CellFormat(backgroundColor=_severity_color("high")))
                     except Exception as e:
-                        print(f"⚠️ 合計照合ハイライト適用失敗: {e}")
+                        print(f"⚠️ 異常ハイライト適用失敗: {e}")
                 elif not coerce_tax_amount(entries_data.get("total_amount")):
                     # 照合カバレッジの可観測性: total_amount 欠損で照合が
                     # 無言で蒸発していないか E2E ログで確認できるようにする
@@ -378,14 +427,7 @@ class SheetsOutputWriter:
         """異常セルにハイライトを適用（該当セルのみ or 全行）"""
         for flag in flags:
             severity = flag.get("severity", "low")
-            if severity == "high":
-                color = Color(1, 0.8, 0.8)    # 赤系
-            elif severity == "medium":
-                color = Color(1, 0.9, 0.7)    # オレンジ系
-            else:
-                color = Color(1, 1, 0.7)       # 薄い黄色
-
-            fmt = CellFormat(backgroundColor=color)
+            fmt = CellFormat(backgroundColor=_severity_color(severity))
 
             if flag.get("full_row"):
                 cell_ref = f"A{row_num}:AB{row_num}"

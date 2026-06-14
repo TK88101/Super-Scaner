@@ -12,6 +12,11 @@ SPLIT_PDF_FOLDER_ID = os.getenv("SPLIT_PDF_FOLDER_ID", "")
 # === OCR 戦略設定 ===
 OCR_STRATEGY = os.getenv("OCR_STRATEGY", "C")
 OCR_CONFIDENCE_THRESHOLD = float(os.getenv("OCR_CONFIDENCE_THRESHOLD", "0.7"))
+# 記账复核门槛（規則②専用）。整票の OCR 置信度がこれ未満なら全行を黄で
+# マークし人手複査を促す。OCR エンジン路由门槛（OCR_CONFIDENCE_THRESHOLD,
+# 既定 OCR_STRATEGY=="C" では未読）とは語義が異なるため別定数にする。env 可調。
+DOC_LOW_CONFIDENCE_THRESHOLD = float(
+    os.getenv("DOC_LOW_CONFIDENCE_THRESHOLD", "0.85"))
 
 # === 科目マッピング（AI 出力名 → MF 正確名） ===
 # ※ 標準化勘定科目　法人.xlsx (2026-03-24 受領) に基づく

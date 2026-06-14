@@ -1404,8 +1404,17 @@ ENTRY_BUILDERS = {
 }
 
 
-def _normalize_receipt_results(raw_data, prefix=""):
-    """領収書レスポンスを統一結果(list[dict])に正規化"""
+def _normalize_receipt_results(
+    raw_data: object,
+    prefix: str = "",
+    ocr_confidence: float | None = None,
+) -> list[dict]:
+    """領収書レスポンスを統一結果(list[dict])に正規化。
+
+    ocr_confidence は規則②用の page-level PaddleOCR 置信度。同一ページに複数
+    書類があれば全 result dict に同じ page-level 値を押す（page-level 信号で
+    意図的、書類との 1:1 対応ではない）。None=無信号（下游は黄を付けない）。
+    """
     results = []
 
     # 新フォーマット: documents 配列
@@ -1438,6 +1447,11 @@ def _normalize_receipt_results(raw_data, prefix=""):
                 # ため receipt のみ伝搬する（None=照合スキップ）
                 "total_amount": (doc.get("total_amount")
                                  if doc_cat == "receipt" else None),
+                # 規則② page-level 置信度（同ページ全書類に同値を押す）
+                "ocr_confidence": ocr_confidence,
+                # 規則①（対象外行異常）は真の receipt のみ対象。bank_transfer /
+                # fee_receipt は本体が「対象外」かつ高額になり得るため除外（codex 指摘）
+                "doc_category": doc_cat,
                 "entries": entries,
             })
         return results
@@ -1453,6 +1467,9 @@ def _normalize_receipt_results(raw_data, prefix=""):
         "vendor": (raw_data or {}).get("vendor", ""),
         "invoice_num": (raw_data or {}).get("invoice_num", ""),
         "memo": (raw_data or {}).get("memo", ""),
+        "ocr_confidence": ocr_confidence,
+        # 旧フォーマットは単一 receipt 書類の fallback 経路（doc_category=receipt 固定）
+        "doc_category": "receipt",
         "entries": entries,
     })
     return results
@@ -1462,28 +1479,44 @@ def _normalize_receipt_results(raw_data, prefix=""):
 # メインパイプライン
 # ============================================================
 
-def _route_ocr_strategy(data_bytes, mime_type, prompt, ocr_strategy, prefix=""):
-    """OCR 戦略に基づいてルーティング。(raw_data, ocr_text) を返す。"""
+def _route_ocr_strategy(
+    data_bytes: bytes,
+    mime_type: str,
+    prompt: str,
+    ocr_strategy: str,
+    prefix: str = "",
+) -> tuple[object, str, float | None]:
+    """OCR 戦略に基づいてルーティング。(raw_data, ocr_text, ocr_confidence) を返す。
+
+    ocr_confidence は規則②（低置信整票送審）用の PaddleOCR 平均置信度。
+    raw_data が PaddleOCR テキスト経由でない場合（Gemini-Vision 兜底・例外・
+    テキスト無し）は None を返す（Vision 結果に低置信を誤って付けないため）。
+    """
     import config
     raw_data = None
     ocr_text = ""
+    ocr_conf: float | None = None
     try:
-        ocr_text, ocr_conf = _ocr_with_paddleocr(data_bytes, mime_type)
+        ocr_text, paddle_conf = _ocr_with_paddleocr(data_bytes, mime_type)
         if ocr_text.strip():
-            print(f"{prefix}📝 PaddleOCR完了 ({len(ocr_text)}文字, 置信度: {ocr_conf:.3f})")
+            print(f"{prefix}📝 PaddleOCR完了 ({len(ocr_text)}文字, 置信度: {paddle_conf:.3f})")
             if ocr_strategy == "A":
                 raw_data = _call_gemini_text(ocr_text, prompt)
+                ocr_conf = paddle_conf
             elif ocr_strategy == "B":
-                if ocr_conf >= config.OCR_CONFIDENCE_THRESHOLD:
+                if paddle_conf >= config.OCR_CONFIDENCE_THRESHOLD:
                     raw_data = _call_gemini_text(ocr_text, prompt)
+                    ocr_conf = paddle_conf
                 else:
-                    print(f"{prefix}⚠️ 置信度低 ({ocr_conf:.3f} < {config.OCR_CONFIDENCE_THRESHOLD}) → Gemini Vision")
+                    # Vision 兜底: raw_data は Vision 由来のため置信度は無信号(None)
+                    print(f"{prefix}⚠️ 置信度低 ({paddle_conf:.3f} < {config.OCR_CONFIDENCE_THRESHOLD}) → Gemini Vision")
                     raw_data = _call_gemini_bytes(data_bytes, mime_type, prompt)
             elif ocr_strategy == "C":
                 raw_data = _call_gemini_cross_validate(ocr_text, data_bytes, mime_type, prompt)
+                ocr_conf = paddle_conf
     except Exception as ocr_err:
         print(f"{prefix}⚠️ PaddleOCR失敗: {ocr_err}")
-    return raw_data, ocr_text
+    return raw_data, ocr_text, ocr_conf
 
 
 def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, start_page=1):
@@ -1541,13 +1574,14 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                         continue
 
                     try:
-                        page_raw_data, ocr_text = _route_ocr_strategy(
+                        page_raw_data, ocr_text, ocr_conf = _route_ocr_strategy(
                             page_data, "application/pdf", prompt, ocr_strategy, prefix=prefix
                         )
 
                         if not page_raw_data:
                             print(f"{prefix}🔄 フォールバック: Gemini Vision で再試行")
                             page_raw_data = _call_gemini_bytes(page_data, "application/pdf", prompt)
+                            ocr_conf = None  # Vision 兜底は無信号（低置信を誤付しない）
                     except Exception as page_err:
                         failed_pages += 1
                         print(f"{prefix}❌ ページ処理エラーのためスキップ: {type(page_err).__name__}: {str(page_err)[:120]}")
@@ -1580,7 +1614,8 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                     # OCR テキストから日付・T番号を抽出し Gemini 結果を上書き
                     _apply_ocr_overrides(page_raw_data, ocr_text, prefix)
 
-                    page_results = _normalize_receipt_results(page_raw_data, prefix=prefix)
+                    page_results = _normalize_receipt_results(
+                        page_raw_data, prefix=prefix, ocr_confidence=ocr_conf)
                     if not page_results:
                         print(f"{prefix}⚠️ 有効な仕訳エントリが見つかりません → 認識不能として記録")
                         p_date, p_vendor = _extract_partial_data(page_raw_data)
@@ -1683,13 +1718,14 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
         with open(file_path, "rb") as f:
             file_data = f.read()
 
-        raw_data, ocr_text = _route_ocr_strategy(file_data, mime_type, prompt, ocr_strategy)
+        raw_data, ocr_text, ocr_conf = _route_ocr_strategy(file_data, mime_type, prompt, ocr_strategy)
         del file_data
         gc.collect()
 
         if not raw_data:
             print("🔄 フォールバック: Gemini Vision で再試行")
             raw_data = _call_gemini(file_path, prompt)
+            ocr_conf = None  # Vision 兜底は無信号（低置信を誤付しない）
 
         if not raw_data:
             print("⚠️ AIの応答がJSONではありませんでした")
@@ -1700,7 +1736,8 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
 
         # ── 領収書処理（単ページ PDF / 画像）──
         if doc_type == DocType.RECEIPT:
-            results = _normalize_receipt_results(raw_data)
+            results = _normalize_receipt_results(
+                raw_data, ocr_confidence=ocr_conf)
             if not results:
                 p_date, p_vendor = _extract_partial_data(raw_data)
                 yield {
