@@ -69,6 +69,11 @@ def list_files(service, folder_id):
     results = _call_with_retry(lambda: service.files().list(
         q=query,
         orderBy='createdTime',
+        # 共有ドライブ(Shared Drive)対応。両方必須:
+        #   supportsAllDrives だけでは list は「0件」を黙って返す(エラー無し)。
+        #   個人 My Drive でもこの2フラグは無害なので常時付与し両対応にする。
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
         fields="nextPageToken, files(id, name, lastModifyingUser, md5Checksum)"
     ).execute())
     return results.get('files', [])
@@ -78,7 +83,8 @@ def download_file(service, file_id, file_name):
     if not os.path.exists(LOCAL_DOWNLOAD_DIR):
         os.makedirs(LOCAL_DOWNLOAD_DIR)
     file_path = os.path.join(LOCAL_DOWNLOAD_DIR, file_name)
-    request = service.files().get_media(fileId=file_id)
+    # 共有ドライブ対応: supportsAllDrives が無いと共有ドライブ上のファイル DL が 404/403
+    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
 
     print(f"⬇️  ダウンロード中: {file_name} ...")
     fh = io.FileIO(file_path, 'wb')
@@ -95,6 +101,8 @@ def move_file(service, file_id, previous_folder_id, new_folder_id):
             fileId=file_id,
             addParents=new_folder_id,
             removeParents=previous_folder_id,
+            # 共有ドライブ対応: 共有ドライブ内/への移動には supportsAllDrives が必須
+            supportsAllDrives=True,
             fields='id, parents'
         ).execute()
         print(f"📦 元画像を処理済みフォルダ(Processed)へ移動しました")
@@ -114,6 +122,9 @@ def is_duplicate_file(service, md5_checksum):
             q=query,
             orderBy='createdTime desc',
             pageSize=200,
+            # 共有ドライブ対応（list は supportsAllDrives だけだと0件になる）
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
             fields="files(id, name, md5Checksum)"
         ).execute())
 
