@@ -118,6 +118,22 @@ def _to_tax_inclusive_total(base_amount, tax_amount, tax_rate):
     return base_amount + int(computed)
 
 
+# 票面合計とΣ行金額の照合の許容差（円）。外税→税込換算（ROUND_HALF_UP 兜底）で
+# 税率グループごとに±1円の丸め差が生じうるため、外税2グループ分の2円まで許容する。
+# [B'] 合計照合（anomaly_detector）と tax_summary 回退ガード（ocr_engine）が共用する
+# 単一の真実源（純ロジック層に置き依存方向を統一）。
+TOTAL_MISMATCH_TOLERANCE_YEN = 2
+
+
+def sum_row_amounts(rows):
+    """仕訳行 list の amount 合計を返す（票面合計との照合用の純ヘルパ）。
+
+    rows は build_rows_from_tax_summary / aggregate_entries_by_tax_rate が返す行
+    （amount は int）。欠損・None は 0 として扱い、例外を出さない。
+    """
+    return sum(int(r.get("amount") or 0) for r in rows)
+
+
 def is_keiyuzei_text(value):
     """品目名・内訳ラベルが軽油税（軽油引取税）由来かを判定する。
 

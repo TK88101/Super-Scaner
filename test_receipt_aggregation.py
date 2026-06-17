@@ -398,6 +398,21 @@ class RealSamplePatternTest(unittest.TestCase):
         self.assertEqual(result[0]["amount"], 2400)
 
 
+class SumRowAmountsTest(unittest.TestCase):
+    """仕訳行 list の amount 合計を頑健に取る純ヘルパ（票面合計照合の基礎）。"""
+
+    def test_sums_int_amounts(self):
+        rows = [{"amount": 4620}, {"amount": 300}]
+        self.assertEqual(agg.sum_row_amounts(rows), 4920)
+
+    def test_missing_or_none_amount_treated_as_zero(self):
+        rows = [{"amount": 100}, {}, {"amount": None}]
+        self.assertEqual(agg.sum_row_amounts(rows), 100)
+
+    def test_empty_rows_is_zero(self):
+        self.assertEqual(agg.sum_row_amounts([]), 0)
+
+
 class BuildRowsFromTaxSummaryTest(unittest.TestCase):
     """票面の税率別内訳から直接行を起こす（内訳優先）。6サンプルで検証。"""
 

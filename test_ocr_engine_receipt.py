@@ -351,6 +351,151 @@ class NormalizeReceiptResultsTotalAmountTest(unittest.TestCase):
         self.assertIsNone(result[0]["total_amount"])
 
 
+class TaxSummaryTotalReconciliationGuardTest(unittest.TestCase):
+    """税率%だけ印字・対象額金額が無い票で Gemini が税抜を逆算し tax_summary に
+    詰める幻覚（丸三タクシー型: 票面4920 を 4920÷1.1≈4473 で誤記）を、票面
+    total_amount を基準に items へ回退して是正する。total が信頼基準。
+    """
+
+    def test_falls_back_to_items_when_tax_summary_undershoots_total(self):
+        # Arrange: 丸三タクシー型。items は正しい4920、tax_summary は税抜逆算4473、票面4920
+        doc = _doc(
+            vendor="丸三タクシー",
+            items=[
+                _receipt_item("基本運賃", 4620, 0.10, "旅費交通費"),
+                _receipt_item("迎車料金", 300, 0.10, "旅費交通費"),
+            ],
+            tax_summary=[{"tax_rate": 0.10, "tax_included": True,
+                          "base_amount": 4473, "tax_amount": 0}],
+        )
+        doc["total_amount"] = 4920
+
+        # Act
+        result = ocr_engine._build_entries_for_single_doc(doc)
+
+        # Assert: tax_summary(4473)を捨て、票面と一致する items 由来の4920を採用
+        self.assertEqual(sum(r["amount"] for r in result), 4920)
+        self.assertTrue(all(r["debit_account"] == "旅費交通費" for r in result))
+
+    def test_keeps_tax_summary_when_matches_total(self):
+        # Arrange: 正常票。tax_summary 税込合計=票面total=14590 → 回退しない
+        doc = _doc(
+            vendor="○○カントリークラブ",
+            items=[_receipt_item("プレー代", 13440, 0.10, "接待交際費")],
+            tax_summary=[
+                {"tax_rate": 0.10, "tax_included": True, "base_amount": 13440, "tax_amount": 1221},
+                {"tax_rate": 0.08, "tax_included": True, "base_amount": 650, "tax_amount": 48},
+                {"tax_rate": 0, "tax_included": True, "base_amount": 500, "tax_amount": 0},
+            ],
+        )
+        doc["total_amount"] = 14590
+
+        # Act
+        result = ocr_engine._build_entries_for_single_doc(doc)
+
+        # Assert: tax_summary の3行をそのまま採用（回退しない＝内訳優先を維持）
+        self.assertEqual([(r["description"], r["amount"]) for r in result],
+                         [("10%", 13440), ("8%", 650), ("対象外", 500)])
+
+    def test_keeps_tax_summary_when_sotozei_rounding_within_tolerance(self):
+        # Arrange: 外税票。tax_summary 税込=1750=票面total。丸め差±2以内で誤回退しない
+        doc = _doc(
+            vendor="千鳥",
+            items=[{"description": "商品", "amount": 1620, "tax_rate": 0.08,
+                    "tax_included": False, "tax_amount": 130,
+                    "debit_account": "接待交際費"}],
+            tax_summary=[{"tax_rate": 0.08, "tax_included": False,
+                          "base_amount": 1620, "tax_amount": 130}],
+        )
+        doc["total_amount"] = 1750
+
+        # Act
+        result = ocr_engine._build_entries_for_single_doc(doc)
+
+        # Assert: tax_summary 税込1750=total → 回退せず内訳採用（外税誤爆防止）
+        self.assertEqual(sum(r["amount"] for r in result), 1750)
+
+    def test_no_fallback_when_total_amount_missing(self):
+        # Arrange: total_amount 無し → 照合できないので従来どおり tax_summary 採用
+        doc = _doc(
+            vendor="店",
+            items=[_receipt_item("商品", 4920, 0.10, "備品・消耗品費")],
+            tax_summary=[{"tax_rate": 0.10, "tax_included": True,
+                          "base_amount": 4473, "tax_amount": 0}],
+        )
+
+        # Act
+        result = ocr_engine._build_entries_for_single_doc(doc)
+
+        # Assert: 照合スキップ → 従来挙動（tax_summary=4473）維持
+        self.assertEqual(sum(r["amount"] for r in result), 4473)
+
+    def test_no_fallback_when_items_empty_keeps_tax_summary(self):
+        # Arrange: items 空 + tax_summary が total と不一致 → 回退先が無い
+        doc = _doc(
+            vendor="○○カントリークラブ",
+            items=[],
+            tax_summary=[{"tax_rate": 0.10, "tax_included": True,
+                          "base_amount": 4473, "tax_amount": 0}],
+        )
+        doc["total_amount"] = 4920
+
+        # Act
+        result = ocr_engine._build_entries_for_single_doc(doc)
+
+        # Assert: items 空では計上漏れ防止のため tax_summary を維持（行ゼロにしない）
+        self.assertEqual(sum(r["amount"] for r in result), 4473)
+        self.assertEqual(len(result), 1)
+
+    def test_both_mismatch_keeps_tax_summary_for_redflag(self):
+        # Arrange: tax_summary も items も total と不一致 → 静默改写せず[B']赤標へ委ねる
+        doc = _doc(
+            vendor="店",
+            items=[_receipt_item("商品", 5000, 0.10, "備品・消耗品費")],
+            tax_summary=[{"tax_rate": 0.10, "tax_included": True,
+                          "base_amount": 4473, "tax_amount": 0}],
+        )
+        doc["total_amount"] = 4920
+
+        # Act
+        result = ocr_engine._build_entries_for_single_doc(doc)
+
+        # Assert: items(5000)も total(4920)に合わない → tax_summary(4473)を返し赤標に任せる
+        self.assertEqual(sum(r["amount"] for r in result), 4473)
+
+    def test_no_fallback_for_bank_transfer_even_if_total_mismatch(self):
+        # Arrange: bank_transfer は doc_total=0 ゲートで照合しない（固定科目路径を壊さない）
+        doc = _doc(
+            doc_category="bank_transfer",
+            vendor="銀行",
+            payment_method="振込",
+            items=[_receipt_item("振込本体", 50000, 0, "未払金")],
+            tax_summary=[{"tax_rate": 0, "tax_included": True,
+                          "base_amount": 30000, "tax_amount": 0}],
+        )
+        doc["total_amount"] = 50000
+
+        # Act
+        result = ocr_engine._build_entries_for_single_doc(doc)
+
+        # Assert: bank_transfer は回退条件に入らず tax_summary(30000)維持
+        self.assertEqual(sum(r["amount"] for r in result), 30000)
+
+
+class ReceiptPromptForbidsReverseTaxCalcTest(unittest.TestCase):
+    """税率%だけ印字・対象額金額が無い区分で税抜を逆算して tax_summary に
+    詰めることを禁じる文言があること（丸三タクシー型の根因を出力段で抑止）。"""
+
+    def _receipt_prompt(self):
+        from doc_types import DocType
+        return ocr_engine.PROMPTS[DocType.RECEIPT]
+
+    def test_forbids_reverse_calculating_base_amount_from_rate_only(self):
+        prompt = self._receipt_prompt()
+        self.assertIn("逆算", prompt)
+        self.assertIn("詰めてはならない", prompt)
+
+
 class ReceiptPromptTotalAmountGuidanceTest(unittest.TestCase):
     """[B'] total_amount 抽出指示が割引票で誤照合を招かない文言であること。
 

@@ -1,7 +1,7 @@
 # anomaly_detector.py — 異常検出モジュール
 import re
 from config import UNKNOWN_ACCOUNT
-from receipt_aggregation import coerce_tax_amount
+from receipt_aggregation import coerce_tax_amount, TOTAL_MISMATCH_TOLERANCE_YEN
 
 
 def detect_anomalies(entry, parent_data=None):
@@ -128,9 +128,8 @@ def detect_anomalies(entry, parent_data=None):
     return flags
 
 
-# 票面合計とΣ行金額の照合の許容差（円）。外税→税込換算（ROUND_HALF_UP 兜底）
-# で税率グループごとに±1円の丸め差が生じうるため、外税2グループ分の2円まで許容
-TOTAL_MISMATCH_TOLERANCE_YEN = 2
+# TOTAL_MISMATCH_TOLERANCE_YEN は receipt_aggregation から import（[B'] 合計照合と
+# tax_summary 回退ガードで共用する単一の真実源。許容差の語義は import 元を参照）。
 
 # 規則①（対象外行の構造異常）用の定数。
 # EXEMPT_TAX_TYPE: determine_tax_types が rate=0 で固定出力する税区分ラベル。

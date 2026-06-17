@@ -16,12 +16,15 @@ from dotenv import load_dotenv
 from doc_types import DocType, DOC_TYPE_CONFIG
 from receipt_aggregation import (
     KEIYUZEI_DEBIT_ACCOUNT,
+    TOTAL_MISMATCH_TOLERANCE_YEN,
     aggregate_entries_by_tax_rate,
     build_rows_from_tax_summary,
+    coerce_tax_amount,
     coerce_tax_rate,
     determine_tax_types,
     is_keiyuzei_text,
     select_aggregated_debit_account,
+    sum_row_amounts,
 )
 
 try:
@@ -899,6 +902,11 @@ PROMPTS = {
     base_amount=その金額、tax_amount=0、label=票面の名目（"軽油税"・"ゴルフ場利用税"・"非課税金額" 等）
 - 税率別内訳が印字されていないレシート（単純な品目羅列のみ）は tax_summary=[] とする。
   内訳行を品目(items)に混ぜないこと。
+- 税率%（例「10%」「消費税10%」「内消費税10%」）だけが印字され、その区分の
+  「対象額」の金額が票面に印字されていない場合は、その区分の行を tax_summary に
+  起こさないこと。税抜・対象額を税率から逆算（税込÷1.1 等）して base_amount に
+  詰めてはならない。対象額の金額印字が無い税率表記は無視し、品目(items)の金額と
+  total_amount を正とする。
 
 【total_amount（票面合計）の抽出】
 - 票面に印字された税込の合計金額（「合計」「お買上計」「領収金額」等）をそのまま転記する（items から再計算しない）
@@ -1177,6 +1185,24 @@ def _build_entries_for_single_doc(doc):
             keiyuzei_amounts=keiyuzei_amounts,
         )
         if rows:
+            # 票面合計照合ガード(6/17): 税率%だけ印字・対象額金額が無い票で Gemini が
+            # 税抜を逆算し base_amount に詰める幻覚（丸三タクシー型: 票面¥4,920 を
+            # 4920÷1.1≈4473 と誤記）を、票面 total_amount を信頼基準に是正する。
+            # tax_summary 行合計が票面合計と乖離し、かつ items 行合計が票面合計と
+            # 一致する場合のみ items へ回退する。total 欠損/0・items 空・両者とも
+            # 不一致なら従来どおり tax_summary を採用し、乖離は[B']の赤標で人手確認に
+            # 委ねる（自動で別の誤値に書き換えない。total と tax_summary は同一 Gemini
+            # 出力ゆえ、一致しない時のみ items を第二の証言として採る設計）。
+            doc_total = (coerce_tax_amount(doc.get("total_amount"))
+                         if doc_category == "receipt" else 0)
+            if (doc_total
+                    and abs(sum_row_amounts(rows) - doc_total)
+                    > TOTAL_MISMATCH_TOLERANCE_YEN):
+                item_rows = aggregate_entries_by_tax_rate(entries)
+                if (item_rows
+                        and abs(sum_row_amounts(item_rows) - doc_total)
+                        <= TOTAL_MISMATCH_TOLERANCE_YEN):
+                    return item_rows
             return rows
 
     # 仕様変更(5/25): 内訳が無い場合は明細を税率(8%/10%)別の合計に集約する
