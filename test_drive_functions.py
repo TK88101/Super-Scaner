@@ -169,5 +169,219 @@ class IsDuplicateFileSharedDriveTest(unittest.TestCase):
             self.assertFalse(main.is_duplicate_file(service, "abc"))
 
 
+class UploadFileTest(unittest.TestCase):
+    """upload_file が単ページPDFを共有ドライブ対応で作成し id を返すこと。"""
+
+    def test_creates_file_with_parents_and_shared_drive_flag(self):
+        # Arrange: create().execute() が新ファイル id を返す mock
+        service = MagicMock()
+        service.files.return_value.create.return_value.execute.return_value = {
+            "id": "NEW_FILE_ID"
+        }
+        # Act: MediaIoBaseUpload はバイト I/O をラップするだけなので patch
+        with patch("main.MediaIoBaseUpload") as m_up, \
+                redirect_stdout(io.StringIO()):
+            file_id = main.upload_file(
+                service, "FOLDER_X", "doc_p2.pdf", b"%PDF-1.4 fake")
+        # Assert: body(name + parents) と supportsAllDrives + fields="id"
+        kwargs = service.files.return_value.create.call_args.kwargs
+        self.assertEqual(kwargs.get("body"), {
+            "name": "doc_p2.pdf",
+            "parents": ["FOLDER_X"],
+        })
+        self.assertIs(kwargs.get("supportsAllDrives"), True)
+        self.assertEqual(kwargs.get("fields"), "id")
+        # media_body は MediaIoBaseUpload の戻り値
+        self.assertIs(kwargs.get("media_body"), m_up.return_value)
+        # 返り値は create が返した id
+        self.assertEqual(file_id, "NEW_FILE_ID")
+
+
+class PageUrlResolverTest(unittest.TestCase):
+    """PageUrlResolver: ページ単位ディープリンク + メモ化 + 安全フォールバック。"""
+
+    BASE_URL = "https://drive.google.com/file/d/ORIGINAL_ID/view"
+
+    def _make_resolver(self, service, folder_id, source_file_id="SRC123"):
+        # 既存ページ照会(list)はデフォルトで空(=新規アップロード経路)。
+        # 既存再利用をテストする場合は呼び出し後に list の戻り値を上書きする。
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": []
+        }
+        return main.PageUrlResolver(
+            service, self.BASE_URL, "scan_doc.pdf", folder_id, source_file_id)
+
+    def test_single_page_returns_base_url_without_upload(self):
+        # Arrange
+        service = MagicMock()
+        resolver = self._make_resolver(service, "FOLDER_X")
+        # Act
+        url = resolver.resolve(page_num=1, total_pages=1, page_bytes=b"x")
+        # Assert: 単ページはアップロードせず base_url をそのまま返す
+        self.assertEqual(url, self.BASE_URL)
+        service.files.return_value.create.assert_not_called()
+
+    def test_multi_page_with_folder_uploads_and_returns_view_url(self):
+        # Arrange
+        service = MagicMock()
+        service.files.return_value.create.return_value.execute.return_value = {
+            "id": "PAGE_FILE_ID"
+        }
+        resolver = self._make_resolver(service, "FOLDER_X")
+        # Act
+        with redirect_stdout(io.StringIO()):
+            url = resolver.resolve(
+                page_num=3, total_pages=5, page_bytes=b"%PDF page3")
+        # Assert: 単ページファイルの /view URL を返し、アップロードは1回
+        self.assertEqual(
+            url, "https://drive.google.com/file/d/PAGE_FILE_ID/view")
+        service.files.return_value.create.assert_called_once()
+        # アップロード名は "{stem}_p{page}.pdf"
+        kwargs = service.files.return_value.create.call_args.kwargs
+        self.assertEqual(
+            kwargs.get("body", {}).get("name"), "scan_doc__SRC123_p3.pdf")
+
+    def test_same_page_uploaded_only_once_dedup(self):
+        # Arrange: 同一ページ(一頁多票)は1回だけアップロードし URL を共有
+        service = MagicMock()
+        service.files.return_value.create.return_value.execute.return_value = {
+            "id": "PAGE_FILE_ID"
+        }
+        resolver = self._make_resolver(service, "FOLDER_X")
+        # Act
+        with redirect_stdout(io.StringIO()):
+            url1 = resolver.resolve(2, 4, b"%PDF page2")
+            url2 = resolver.resolve(2, 4, b"%PDF page2")
+        # Assert: アップロードは1回のみ、両 URL は同一
+        service.files.return_value.create.assert_called_once()
+        self.assertEqual(url1, url2)
+        self.assertEqual(
+            url1, "https://drive.google.com/file/d/PAGE_FILE_ID/view")
+
+    def test_no_folder_falls_back_to_anchor_without_upload(self):
+        # Arrange: folder 未設定("")は今日の挙動(#page=N)に劣化
+        service = MagicMock()
+        resolver = self._make_resolver(service, "")
+        # Act
+        with redirect_stdout(io.StringIO()):
+            url = resolver.resolve(3, 5, b"%PDF page3")
+        # Assert
+        self.assertEqual(url, f"{self.BASE_URL}#page=3")
+        service.files.return_value.create.assert_not_called()
+
+    def test_upload_failure_falls_back_to_anchor_and_warns(self):
+        # Arrange: create().execute() が例外を投げる
+        service = MagicMock()
+        service.files.return_value.create.return_value.execute.side_effect = \
+            Exception("upload boom")
+        resolver = self._make_resolver(service, "FOLDER_X")
+        # Act / Assert: 例外を握りつぶし #page= フォールバック、警告 print
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            try:
+                url = resolver.resolve(4, 6, b"%PDF page4")
+            except Exception:  # noqa: BLE001 - テスト失敗を明示
+                self.fail("resolve がアップロード例外を再送出した")
+        self.assertEqual(url, f"{self.BASE_URL}#page=4")
+        self.assertNotEqual(buf.getvalue().strip(), "")
+
+    def test_no_page_bytes_falls_back_to_anchor(self):
+        # Arrange: page_bytes が無い → アップロードできずフォールバック
+        service = MagicMock()
+        resolver = self._make_resolver(service, "FOLDER_X")
+        # Act
+        with redirect_stdout(io.StringIO()):
+            url = resolver.resolve(2, 3, page_bytes=None)
+        # Assert
+        self.assertEqual(url, f"{self.BASE_URL}#page=2")
+        service.files.return_value.create.assert_not_called()
+
+    def test_filename_embeds_source_file_id(self):
+        # Arrange: アップロード名に源 file id を埋め込み衝突不能にする
+        service = MagicMock()
+        service.files.return_value.create.return_value.execute.return_value = {
+            "id": "PAGE_FILE_ID"
+        }
+        resolver = self._make_resolver(service, "FOLDER_X", "SRCABC")
+        # Act
+        with redirect_stdout(io.StringIO()):
+            resolver.resolve(2, 4, b"%PDF page2")
+        # Assert: "{stem}__{source_id}_p{page}.pdf"
+        kwargs = service.files.return_value.create.call_args.kwargs
+        self.assertEqual(
+            kwargs.get("body", {}).get("name"), "scan_doc__SRCABC_p2.pdf")
+
+    def test_reuses_existing_page_without_upload(self):
+        # Arrange: 再実行時、分割保存先に既に同ページが存在 → 再利用(新規無し)
+        service = MagicMock()
+        resolver = self._make_resolver(service, "FOLDER_X")
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": [
+                {"id": "EXIST_P3", "name": "scan_doc__SRC123_p3.pdf"},
+            ]
+        }
+        # Act
+        with redirect_stdout(io.StringIO()):
+            url = resolver.resolve(3, 5, b"%PDF page3")
+        # Assert: 既存 id の /view を返し、新規アップロードはしない(冪等)
+        self.assertEqual(
+            url, "https://drive.google.com/file/d/EXIST_P3/view")
+        service.files.return_value.create.assert_not_called()
+
+    def test_uploads_only_missing_pages(self):
+        # Arrange: p1 は既存、p2 は未存在
+        service = MagicMock()
+        service.files.return_value.create.return_value.execute.return_value = {
+            "id": "NEW_P2"
+        }
+        resolver = self._make_resolver(service, "FOLDER_X")
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": [
+                {"id": "EXIST_P1", "name": "scan_doc__SRC123_p1.pdf"},
+            ]
+        }
+        # Act
+        with redirect_stdout(io.StringIO()):
+            url1 = resolver.resolve(1, 3, b"%PDF page1")
+            url2 = resolver.resolve(2, 3, b"%PDF page2")
+        # Assert: p1 は再利用(新規無し)、p2 のみ新規アップロード1回
+        self.assertEqual(
+            url1, "https://drive.google.com/file/d/EXIST_P1/view")
+        self.assertEqual(
+            url2, "https://drive.google.com/file/d/NEW_P2/view")
+        service.files.return_value.create.assert_called_once()
+
+    def test_existing_lookup_done_once_per_file(self):
+        # Arrange: 複数ページを解決しても照会(list)はファイル単位で1回のみ
+        service = MagicMock()
+        service.files.return_value.create.return_value.execute.return_value = {
+            "id": "NEW_PAGE"
+        }
+        resolver = self._make_resolver(service, "FOLDER_X")
+        # Act
+        with redirect_stdout(io.StringIO()):
+            resolver.resolve(1, 3, b"%PDF p1")
+            resolver.resolve(2, 3, b"%PDF p2")
+        # Assert: list は per-page ではなく per-file で1回だけ
+        service.files.return_value.list.assert_called_once()
+
+    def test_existing_lookup_failure_falls_back_to_upload(self):
+        # Arrange: 既存照会(list)が例外 → 空とみなし新規アップロードで継続
+        service = MagicMock()
+        service.files.return_value.list.return_value.execute.side_effect = \
+            Exception("list boom")
+        service.files.return_value.create.return_value.execute.return_value = {
+            "id": "NEW_AFTER_FAIL"
+        }
+        resolver = main.PageUrlResolver(
+            service, self.BASE_URL, "scan_doc.pdf", "FOLDER_X", "SRC123")
+        # Act / Assert: 照会失敗でも握りつぶしてアップロードし /view を返す
+        with redirect_stdout(io.StringIO()):
+            url = resolver.resolve(2, 4, b"%PDF p2")
+        self.assertEqual(
+            url, "https://drive.google.com/file/d/NEW_AFTER_FAIL/view")
+        service.files.return_value.create.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

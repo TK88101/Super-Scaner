@@ -1623,6 +1623,7 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                             },
                             "page_num": idx,
                             "total_pages": total,
+                            "page_bytes": page_data,
                         }
                         gc.collect()
                         continue
@@ -1656,6 +1657,7 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                             },
                             "page_num": idx,
                             "total_pages": total,
+                            "page_bytes": page_data,
                         }
                         yielded += 1
                         gc.collect()
@@ -1666,6 +1668,7 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                             "result": entry,
                             "page_num": idx,
                             "total_pages": total,
+                            "page_bytes": page_data,
                         }
                         yielded += 1
                     gc.collect()
