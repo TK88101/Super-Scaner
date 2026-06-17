@@ -44,13 +44,39 @@ _paddle_ocr = None
 def _get_paddle_ocr():
     global _paddle_ocr
     if _paddle_ocr is None:
-        # PaddleOCR 3.x は use_gpu 非対応 → try/except で v2/v3 両対応
+        import config
+        # PP-OCRv5 server モデルは CPU(特に macOS arm64)で ~20GB の内存床があり
+        # 巨大票で OOM(SIGKILL)するため、既定は軽量な mobile モデル(config で切替可)
+        kwargs = dict(lang='japan', cpu_threads=1)
+        if getattr(config, "OCR_MODEL_TIER", "mobile") == "mobile":
+            kwargs["text_detection_model_name"] = "PP-OCRv5_mobile_det"
+            kwargs["text_recognition_model_name"] = "PP-OCRv5_mobile_rec"
         try:
-            _paddle_ocr = PaddleOCR(lang='japan', use_gpu=False, cpu_threads=1)
+            _paddle_ocr = PaddleOCR(**kwargs)  # PaddleOCR 3.x
         except (TypeError, ValueError):
-            # PaddleOCR 3.x: use_gpu パラメータ廃止
-            _paddle_ocr = PaddleOCR(lang='japan', cpu_threads=1)
+            # 旧 2.x 互換: 新パラメータ非対応 → 最小構成で再試行
+            _paddle_ocr = PaddleOCR(lang='japan', use_gpu=False, cpu_threads=1)
     return _paddle_ocr
+
+
+def _downscale_for_ocr(img_array):
+    """巨大スキャンを OCR 前に最長辺 config.OCR_MAX_SIDE まで縮小する。
+
+    PP-OCRv5 の前処理/認識は入力画素数に比例してメモリを消費し、巨大スキャン
+    (例: 6300x8400)で OOM する実測に基づく対策。通常票(dpi150 で ~1754px)は
+    上限未満で無変更。strategy C では Gemini に原寸が渡るため最終精度影響は小。
+    """
+    import config
+    cap = getattr(config, "OCR_MAX_SIDE", 0)
+    if not cap:
+        return img_array
+    h, w = img_array.shape[:2]
+    longest = max(h, w)
+    if longest <= cap:
+        return img_array
+    scale = cap / longest
+    new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+    return np.array(Image.fromarray(img_array).resize(new_size, Image.LANCZOS))
 
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
@@ -271,6 +297,7 @@ def _ocr_with_paddleocr(image_bytes, mime_type="image/jpeg"):
                 continue
             img_array = np.array(images[0])
             del images  # 即座に解放
+            img_array = _downscale_for_ocr(img_array)  # 巨大スキャンのメモリ暴走対策
             if hasattr(ocr, 'predict'):
                 page_result = ocr.predict(img_array)
             else:
@@ -284,7 +311,7 @@ def _ocr_with_paddleocr(image_bytes, mime_type="image/jpeg"):
         return ocr_text, avg_confidence
     else:
         img = Image.open(io.BytesIO(image_bytes))
-        img_array = np.array(img.convert("RGB"))
+        img_array = _downscale_for_ocr(np.array(img.convert("RGB")))
 
     if hasattr(ocr, 'predict'):
         result = ocr.predict(img_array)

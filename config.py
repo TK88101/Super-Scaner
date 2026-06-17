@@ -12,11 +12,24 @@ SPLIT_PDF_FOLDER_ID = os.getenv("SPLIT_PDF_FOLDER_ID", "")
 # === OCR 戦略設定 ===
 OCR_STRATEGY = os.getenv("OCR_STRATEGY", "C")
 OCR_CONFIDENCE_THRESHOLD = float(os.getenv("OCR_CONFIDENCE_THRESHOLD", "0.7"))
+
+# === PaddleOCR メモリ対策 ===
+# PP-OCRv5 server モデルは CPU(特に macOS arm64)で ~20GB の内存床があり、
+# 巨大スキャン(例: 600dpi級)で OOM(SIGKILL)する実測結果に基づく対策。
+#   OCR_MODEL_TIER: "mobile"(既定/軽量) | "server"(高精度・高メモリ)
+#   OCR_MAX_SIDE  : OCR 前に画像の最長辺をこの px まで縮小(0=無効)。
+#     通常票は dpi150 で ~1754px のため未満で無影響。巨大スキャンのみ縮小し
+#     メモリ暴走を防ぐ。strategy C では Gemini に原寸が渡るため精度影響は小。
+OCR_MODEL_TIER = os.getenv("OCR_MODEL_TIER", "mobile")
+OCR_MAX_SIDE = int(os.getenv("OCR_MAX_SIDE", "3000"))
 # 記账复核门槛（規則②専用）。整票の OCR 置信度がこれ未満なら全行を黄で
 # マークし人手複査を促す。OCR エンジン路由门槛（OCR_CONFIDENCE_THRESHOLD,
 # 既定 OCR_STRATEGY=="C" では未読）とは語義が異なるため別定数にする。env 可調。
+# 既定 0.65 に校正(実測6枚基準): 明瞭な印刷票は ~0.86+、手書き/横向き等の難読票が
+# ~0.60-0.78。0.85 は印刷票まで巻き込み過剰標黄(=狼少年化)するため、手書き級
+# (<~0.65)のみ標黄する水準に下げた。手書き凑平幻覚は規則①②でも別途兜底。env 可調。
 DOC_LOW_CONFIDENCE_THRESHOLD = float(
-    os.getenv("DOC_LOW_CONFIDENCE_THRESHOLD", "0.85"))
+    os.getenv("DOC_LOW_CONFIDENCE_THRESHOLD", "0.65"))
 
 # === 科目マッピング（AI 出力名 → MF 正確名） ===
 # ※ 標準化勘定科目　法人.xlsx (2026-03-24 受領) に基づく
