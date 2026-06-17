@@ -9,10 +9,11 @@
 * 🔍 **雙引擎 OCR：** PaddleOCR (ローカル、無料) + Gemini AI（Strategy C、自動回退）
 * 🧠 **OCR 主導抽出：** 日期/T番號由 PaddleOCR 正規表現提取（Gemini 依存度降低），科目分類のみ Gemini
 * 📊 **Generator Pipeline：** 逐頁 OCR → 即時 Sheets 寫入 → GC → 下一頁（低メモリ動作）
+* 🧮 **OCR メモリ対策：** 既定 mobile モデル + 巨大スキャンを OCR 前に自動降采样（`OCR_MAX_SIDE`）。server は env で選択可、低メモリPCでも安定動作
 * 🗺️ **科目自動映射 + 補助科目：** AI 通用名 → MF 正確科目名、適格/非適格/飲食贈答等 自動決定
 * 🔗 **原票 URL 追蹤：** 每行數據關聯原始 PDF 鏈接 + 頁碼
 * 💾 **每日自動備份 (GAS)：** 22:00 JST Google サーバー上で自動実行、全 tab 集約備份、30 天保留、PC 電源不要
-* 🛡️ **異常檢測 + ハイライト凡例：** 日期空/取引先空/T番號空・不正/高額 → 對應單元格標色 + 凡例説明
+* 🛡️ **異常檢測 + ハイライト凡例：** 日期空/取引先空/T番號空・不正/高額→單元格標色、OCR低置信(整票)→整行黄で人工確認促し + 凡例説明
 * 🚫 **不要ページ自動除外：** 封筒/送付状/挨拶状/裏面メモ/説明書パンフレット → 自動スキップ
 * ⚠️ **認識不能ページ記錄：** 全部認識不能→整行赤ハイライト、部分認識→欠損セルハイライト
 * 🔒 **貸方科目兜底：** 借方に未払金/仮受金等が出現→未確定勘定に自動置換
@@ -99,6 +100,11 @@ BACKUP_SPREADSHEET_ID=備份用SpreadsheetID
 # AI
 GEMINI_API_KEY=你的AIza開頭的Key
 
+# OCR 調整 (任意・既定値で動作)
+OCR_MODEL_TIER=mobile               # mobile(既定/軽量/低メモリ) | server(高精度/高メモリ)
+OCR_MAX_SIDE=3000                   # OCR前に画像の最長辺をこのpxへ縮小(巨大スキャンのメモリ対策。通常票は未満で無影響)
+DOC_LOW_CONFIDENCE_THRESHOLD=0.65   # 整票OCR置信度がこれ未満→整行を黄でマーク(人工確認推奨)
+
 # 通知 (可選)
 CHATWORK_API_TOKEN=你的Token
 CHATWORK_ROOM_ID=房間ID
@@ -182,6 +188,9 @@ MF 標準 27 列 + 原票URL (第28列)
 | 修繕費 > 30萬 | I列 | 🟡 黃色 |
 | 備品・消耗品費 > 10萬 | I列 | 🟡 黃色 |
 | 租税公課 (宿泊税/軽油税) | I列 | 🟡 黃色 |
+| **OCR置信度過低 (整票 < 0.65)** | **整行** | 🟡 黃色 |
+
+> 🟡 **整行**が黄 = OCR がそのページを読み取れる自信がない → **人工確認推奨**。**標黃 ≠ データ誤り**（最終値は Gemini が原寸画像から抽出するため正しいことが多い）。閾値は `.env` の `DOC_LOW_CONFIDENCE_THRESHOLD`(既定 0.65) で調整可。
 
 ---
 
@@ -196,6 +205,12 @@ MF 標準 27 列 + 原票URL (第28列)
 **Q: Service Account 報 storageQuotaExceeded？**
 → SA 無法新建 Drive 文件。Spreadsheet 和文件夾需手動預建並共享給 SA。
 
+**Q: 為什麼有些行整行變黃？**
+→ OCR 置信度過低（整票 < 0.65、手書き/橫向き撮影など読みにくい票）。**系統拿不準 → 人工確認推奨**であり、標黃 ≠ データ誤り（最終値は Gemini が原寸画像から抽出するため正しいことが多い）。閾値は `DOC_LOW_CONFIDENCE_THRESHOLD` で調整可。橫向き撮影は置信度を下げるため、なるべく正位置で撮影を推奨。
+
+**Q: 巨大スキャン（高DPI/多頁）で OCR が落ちる/重い？**
+→ PaddleOCR は既定で軽量 mobile モデル + `OCR_MAX_SIDE`(既定3000) による入力縮小で低メモリ動作。高精度が必要なら `OCR_MODEL_TIER=server`（メモリに余裕のある環境のみ）。
+
 ---
 
-*Generated for Project Super Scaner v2.7 — 認識精度改善 + 不要ページ除外 + PDF分割表示*
+*Generated for Project Super Scaner v2.8 — OCRメモリ対策(mobile既定+降采样) + 低置信整行黄の凡例明記 + 標黄閾値0.65*
