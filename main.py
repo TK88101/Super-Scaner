@@ -3,6 +3,7 @@ import sys
 import time
 import io
 import random
+import re
 
 # Windows console encoding fix
 if sys.platform == "win32":
@@ -11,7 +12,7 @@ if sys.platform == "win32":
 from dotenv import load_dotenv
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from googleapiclient.errors import HttpError
 # 引入我們的模塊
 from ocr_engine import process_pipeline
@@ -62,6 +63,150 @@ def _call_with_retry(func, max_retries=5):
                 time.sleep(wait)
             else:
                 raise
+
+
+def upload_file(service, folder_id: str, filename: str, data: bytes,
+                mime_type: str = "application/pdf") -> str:
+    """バイト列を Drive に新規ファイルとして作成し、その file id を返す。
+
+    単ページ PDF を分割保存先フォルダへ resumable=False でアップロードする用途。
+    共有ドライブ(Shared Drive)対応のため supportsAllDrives=True を付与。
+    5xx 一時エラーは _call_with_retry で指数バックオフ再試行する。
+
+    引数を検証し、id 欠落時は例外を送出する（呼び出し側の except で
+    フォールバックに落とせるよう、サイレント障害を作らない）。
+    """
+    if not folder_id:
+        raise ValueError("folder_id is required")
+    if not data:
+        raise ValueError("data is empty")
+    # MediaIoBaseUpload は io.BytesIO を内包し読み取り位置を進めるため、
+    # _call_with_retry のリトライ毎に新しい stream を生成する。
+    # （使い回すと2回目以降は EOF で 0 バイトボディの空ファイルになる）
+    created = _call_with_retry(lambda: service.files().create(
+        body={"name": filename, "parents": [folder_id]},
+        media_body=MediaIoBaseUpload(io.BytesIO(data), mimetype=mime_type,
+                                     resumable=False),
+        supportsAllDrives=True, fields="id").execute())
+    fid = created.get("id")
+    if not fid:
+        raise ValueError(f"Drive create returned no id: {created}")
+    return fid
+
+
+def _drive_view_url(file_id: str) -> str:
+    """Drive ファイルの閲覧 URL を組み立てる。"""
+    return f"https://drive.google.com/file/d/{file_id}/view"
+
+
+class PageUrlResolver:
+    """ページ番号 → 単ページ Drive ファイルの /view URL を解決する。
+
+    多ページ領収書 PDF は Drive ネイティブビューアが #page=N を無視するため、
+    各ページを 1ページ PDF として分割保存先フォルダにアップロードし、その単独
+    ファイル(永遠に 1/1)へリンクする。同一ページは一頁多票でも 1回だけ
+    アップロードして URL をメモ化共有する。アップロード不能・失敗時は今日の
+    挙動(base_url#page=N)へ安全にフォールバックし、例外は伝播させない。
+
+    冪等性: 単ページ名に源 PDF の file id を埋め込み(別 PDF が同じ元名でも衝突
+    不能)、ファイル単位で 1回だけ分割保存先を照会して既存ページを再利用する。
+    これにより処理途中のクラッシュ・再実行で同名ファイルが Drive に重複増殖
+    するのを防ぐ。
+    """
+
+    def __init__(self, service, base_url: str, original_filename: str,
+                 folder_id: str, source_file_id: str = ""):
+        self._service = service
+        self._base_url = base_url
+        self._original_filename = original_filename
+        self._folder_id = folder_id
+        self._source_file_id = source_file_id or ""
+        self._cache: dict[int, str] = {}
+        # 既存ページ {page_num: file_id}（遅延照会、ファイル単位で1回だけ）
+        self._existing: dict[int, str] | None = None
+
+    def _source_marker(self) -> str:
+        """単ページ名に埋め込む「源 file id」セグメント。
+
+        命名(_page_filename)と既存照会(_load_existing)で同一規約を共有する
+        ため、ここを唯一の出所にする（片方だけ変えて齟齬が出るのを防ぐ）。
+        """
+        return f"__{self._source_file_id}_p"
+
+    def _page_filename(self, page_num: int) -> str:
+        stem = os.path.splitext(self._original_filename)[0]
+        # スラッシュ・バックスラッシュ・制御文字を除去
+        # （Drive ファイル名としての誤解釈・表示崩れを防ぐ）
+        stem = "".join(
+            "_" if (c in "/\\" or ord(c) < 0x20) else c for c in stem)
+        # 源 file id を埋め込み命名で衝突不能にする（別 PDF が同名でも区別）
+        return f"{stem}{self._source_marker()}{page_num}.pdf"
+
+    def _load_existing(self) -> None:
+        """分割保存先からこの源 PDF 由来の既存単ページを 1回だけ照会する。
+
+        再実行・クラッシュ復帰時に既存ページを再利用して重複アップロードを
+        防ぐ。照会失敗時は空とみなし新規アップロードに倒す（劣化してもリンクは
+        生成される）。
+        """
+        if self._existing is not None:
+            return
+        self._existing = {}
+        if not self._folder_id or not self._source_file_id:
+            return
+        marker = self._source_marker()
+        try:
+            query = (f"'{self._folder_id}' in parents and trashed = false "
+                     f"and name contains '{self._source_file_id}'")
+            results = _call_with_retry(lambda: self._service.files().list(
+                q=query, pageSize=1000,
+                supportsAllDrives=True, includeItemsFromAllDrives=True,
+                fields="files(id, name)").execute())
+            for f in results.get("files", []):
+                name = f.get("name", "")
+                if marker not in name:
+                    continue  # 別 id の部分一致を除外
+                m = re.search(r"_p(\d+)\.pdf$", name)
+                if m:
+                    self._existing[int(m.group(1))] = f["id"]
+        except Exception as e:  # noqa: BLE001 - 失敗時は新規アップロードへ倒す
+            print(f"⚠️ 既存単ページの照会失敗: "
+                  f"{type(e).__name__}: {str(e)[:120]} → 新規アップロードで継続")
+            self._existing = {}
+
+    def resolve(self, page_num: int, total_pages: int,
+                page_bytes: bytes | None) -> str:
+        # 単ページ文書 / base_url 無し → アップロード不要、そのまま返す
+        if total_pages <= 1 or not self._base_url:
+            return self._base_url
+
+        # 一頁多票: 同一ページは 1回だけ解決し URL を共有
+        if page_num in self._cache:
+            return self._cache[page_num]
+
+        # 今日の挙動(死んだアンカー)。劣化先として常に安全
+        fallback = f"{self._base_url}#page={page_num}"
+
+        if not self._folder_id or not page_bytes:
+            url = fallback
+        else:
+            try:
+                self._load_existing()
+                fid = self._existing.get(page_num)
+                if not fid:
+                    # 既存が無いページのみ新規アップロード（冪等）
+                    fid = upload_file(
+                        self._service, self._folder_id,
+                        self._page_filename(page_num), page_bytes)
+                    self._existing[page_num] = fid
+                url = _drive_view_url(fid)
+            except Exception as e:  # noqa: BLE001 - 明示的に握り潰しフォールバック
+                print(f"⚠️ 単ページPDF解決失敗 (p{page_num}): "
+                      f"{type(e).__name__}: {str(e)[:120]} → #page= に劣化")
+                url = fallback
+
+        self._cache[page_num] = url
+        return url
 
 
 def list_files(service, folder_id):
@@ -158,7 +303,12 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
 
     base_url = ""
     if drive_file_id:
-        base_url = f"https://drive.google.com/file/d/{drive_file_id}/view"
+        base_url = _drive_view_url(drive_file_id)
+
+    # 多ページ領収書 PDF のページ単位ディープリンク解決器
+    # （ページ毎に単ページ PDF を分割保存先へアップロードし永続リンク化）
+    resolver = PageUrlResolver(
+        service, base_url, filename, config.SPLIT_PDF_FOLDER_ID, drive_file_id)
 
     total_amount = 0
     vendor_names = []
@@ -185,10 +335,10 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
               f"仕訳: {len(entries)}行")
 
         # 即座に Google Sheets へ書き込み
-        if total_pages > 1 and base_url:
-            source_url = f"{base_url}#page={page_num}"
-        else:
-            source_url = base_url
+        # ページ専用の単ページ PDF へリンク（多ページ時のみ実アップロード、
+        # 単ページ/画像/folder未設定/失敗時は base_url または #page= に劣化）
+        page_bytes = page.get("page_bytes")
+        source_url = resolver.resolve(page_num, total_pages, page_bytes)
         result['uploader'] = uploader_name
         sheets_writer.append_entries(
             employee_name=uploader_name,
