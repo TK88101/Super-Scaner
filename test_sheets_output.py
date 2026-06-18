@@ -62,6 +62,7 @@ def _make_writer():
     writer = SheetsOutputWriter.__new__(SheetsOutputWriter)
     # _get_next_txn_no（line 59）が try 外で参照する属性。欠けると AttributeError
     writer._tab_next_txn = {}
+    writer._tabs_sanitized = set()  # _sanitize_trailing_once が参照する
     return writer
 
 
@@ -318,6 +319,152 @@ class AppendEntriesLowConfidenceTest(unittest.TestCase):
         self.assertIsNotNone(i_idx)
         self.assertIsNotNone(ab_idx)
         self.assertGreater(i_idx, ab_idx)
+
+
+class AppendEntriesTagColumnTest(unittest.TestCase):
+    """U列(タグ)自動記入: 標色行に「赤系/橙系/黄系」を埋め込む（社長要望 6/18）。"""
+
+    TAG_COL = 20  # U列 = MF_HEADERS index 20
+
+    def _run(self, doc_type, entries, entries_extra=None,
+             vendor="店", invoice_num=""):
+        writer = _make_writer()
+        ws = _FakeWorksheet()
+
+        data = {"date": "2026/06/01", "vendor": vendor,
+                "invoice_num": invoice_num, "memo": "", "entries": entries}
+        if entries_extra:
+            data.update(entries_extra)
+
+        with patch.object(SheetsOutputWriter, "_get_or_create_tab",
+                          return_value=ws), \
+             patch.object(SheetsOutputWriter, "_apply_anomaly_highlight",
+                          lambda *a, **k: None), \
+             patch.object(SheetsOutputWriter, "_format_with_retry",
+                          lambda *a, **k: None):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                writer.append_entries("従業員", doc_type, data,
+                                      source_url="http://x")
+        return ws
+
+    def test_clean_row_has_empty_tag(self):
+        # Arrange: 異常なし（vendor有・有効T番号・total一致・置信なし）→ 無標色
+        ws = self._run(DocType.RECEIPT, [_entry(6456)],
+                       {"total_amount": 6456}, invoice_num="T9234567890123")
+        self.assertEqual(ws.appended[0][self.TAG_COL], "")
+
+    def test_single_cell_missing_invoice_tags_yellow(self):
+        # Arrange: T番号空(low=黄, H列単体)。他は正常 → 行タグ「黄系」
+        ws = self._run(DocType.RECEIPT, [_entry(6456)],
+                       {"total_amount": 6456}, invoice_num="")
+        self.assertEqual(ws.appended[0][self.TAG_COL], "黄系")
+
+    def test_total_mismatch_tags_all_rows_red(self):
+        # Arrange: Σ(3000+2870=5870) ≠ 票面6456 → 全行 I列赤 → 全行「赤系」
+        ws = self._run(DocType.RECEIPT, [_entry(3000), _entry(2870)],
+                       {"total_amount": 6456})
+        self.assertEqual([r[self.TAG_COL] for r in ws.appended],
+                         ["赤系", "赤系"])
+
+    def test_low_confidence_tags_all_rows_yellow(self):
+        # Arrange: 低置信(0.50) かつ total一致 → 全行黄 →「黄系」
+        ws = self._run(DocType.RECEIPT, [_entry(5000)],
+                       {"ocr_confidence": 0.50, "total_amount": 5000},
+                       invoice_num="T9234567890123")
+        self.assertEqual(ws.appended[0][self.TAG_COL], "黄系")
+
+    def test_red_overrides_yellow_in_tag(self):
+        # Arrange: 低置信(黄) + total不符(赤) 同居 → タグは「赤系」
+        ws = self._run(DocType.RECEIPT, [_entry(5000)],
+                       {"ocr_confidence": 0.50, "total_amount": 99999},
+                       invoice_num="T9234567890123")
+        self.assertEqual(ws.appended[0][self.TAG_COL], "赤系")
+
+    def test_missing_vendor_tags_orange(self):
+        # Arrange: 取引先空(medium=橙) のみ。total一致・置信なし・T番号あり
+        ws = self._run(DocType.RECEIPT, [_entry(5000)],
+                       {"total_amount": 5000}, vendor="",
+                       invoice_num="T9234567890123")
+        self.assertEqual(ws.appended[0][self.TAG_COL], "橙系")
+
+
+class GridCapacityTest(unittest.TestCase):
+    """自動拡容バグ対策: 事前バッファ確保と空尾行の継承色リセット。"""
+
+    class _GridWS(_FakeWorksheet):
+        def __init__(self, row_count):
+            super().__init__()
+            self.row_count = row_count
+            self.added = 0
+
+        def add_rows(self, n):
+            self.added += n
+            self.row_count += n
+
+    def test_ensure_capacity_grows_when_near_boundary(self):
+        # Arrange: グリッド1000、データ末尾が990に達する見込み
+        from sheets_output import GRID_ROW_BUFFER
+        writer = _make_writer()
+        ws = self._GridWS(1000)
+        # Act
+        writer._ensure_row_capacity(ws, 990)
+        # Assert: 990 + buffer を満たすまで add_rows された
+        self.assertEqual(ws.row_count, 990 + GRID_ROW_BUFFER)
+        self.assertGreater(ws.added, 0)
+
+    def test_ensure_capacity_noop_when_enough_room(self):
+        # Arrange: 余裕十分
+        writer = _make_writer()
+        ws = self._GridWS(5000)
+        # Act
+        writer._ensure_row_capacity(ws, 10)
+        # Assert: 拡容なし
+        self.assertEqual(ws.added, 0)
+        self.assertEqual(ws.row_count, 5000)
+
+    def test_sanitize_clears_empty_tail(self):
+        # Arrange: グリッド2000、データ末尾1005 → 1006..2000 を白に戻す
+        writer = _make_writer()
+        ws = self._GridWS(2000)
+        calls = []
+        with patch.object(SheetsOutputWriter, "_format_with_retry",
+                          lambda self, w, ref, fmt, **k: calls.append(ref)):
+            writer._sanitize_trailing_once(ws, "従業員_領収書", 1005)
+        self.assertEqual(calls, ["A1006:AB2000"])
+
+    def test_sanitize_noop_when_no_tail(self):
+        # Arrange: データがグリッド最下行まで埋まっている
+        writer = _make_writer()
+        ws = self._GridWS(1005)
+        calls = []
+        with patch.object(SheetsOutputWriter, "_format_with_retry",
+                          lambda self, w, ref, fmt, **k: calls.append(ref)):
+            writer._sanitize_trailing_once(ws, "従業員_領収書", 1005)
+        self.assertEqual(calls, [])
+
+    def test_sanitize_runs_only_once_per_tab(self):
+        # Arrange: 同タブを2回呼ぶ → 2回目は no-op（無駄な API を出さない）
+        writer = _make_writer()
+        ws = self._GridWS(2000)
+        calls = []
+        with patch.object(SheetsOutputWriter, "_format_with_retry",
+                          lambda self, w, ref, fmt, **k: calls.append(ref)):
+            writer._sanitize_trailing_once(ws, "従業員_領収書", 1005)
+            writer._sanitize_trailing_once(ws, "従業員_領収書", 1500)
+        # Assert: 初回のみ format。2回目は呼ばれない
+        self.assertEqual(calls, ["A1006:AB2000"])
+
+    def test_capacity_helpers_swallow_errors_on_plain_worksheet(self):
+        # Arrange: row_count/add_rows を持たない素の fake でも例外を投げない
+        writer = _make_writer()
+        ws = _FakeWorksheet()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            writer._ensure_row_capacity(ws, 10)   # row_count 無し → 握り潰す
+            writer._sanitize_trailing_once(ws, "t", 10)  # 同上
+        # Assert: 例外伝播せず（ここまで到達すればOK）
+        self.assertTrue(True)
 
 
 if __name__ == "__main__":

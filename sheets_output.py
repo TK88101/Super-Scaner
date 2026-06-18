@@ -5,6 +5,7 @@ import gspread
 from gspread_formatting import CellFormat, Color, format_cell_range, format_cell_ranges, Border, Borders
 from datetime import datetime, timezone, timedelta
 from doc_types import DocType
+from tag_rules import derive_row_tags, UNRECOGNIZED_TAG
 
 JST = timezone(timedelta(hours=9))
 
@@ -33,6 +34,15 @@ def _severity_color(severity):
     return _SEVERITY_COLORS.get(severity, _SEVERITY_COLORS["low"])
 
 
+# タグ列（U列 = MF_HEADERS index 20）。標色行に「赤系/橙系/黄系」を記入する。
+TAG_COL_INDEX = MF_HEADERS.index("タグ")
+
+# 自動拡容バグ対策（6/18 社長指摘）: append_rows がグリッド境界（既定1000行）を
+# 跨ぐと Google が新規行に直前行の書式を継承し、標色された最終行の色が空尾行へ
+# 伝染する。書き込み前に add_rows で空きバッファを確保し、自動拡容自体を起こさない。
+GRID_ROW_BUFFER = 200
+
+
 def _build_description(doc_type, vendor_name, item_description):
     """摘要文字列を組み立てる。
 
@@ -57,6 +67,7 @@ class SheetsOutputWriter:
         self._ws_cache = {}
         self._tab_has_data = {}
         self._tab_next_txn = {}  # タブごとの取引No
+        self._tabs_sanitized = set()  # 空尾行の継承色を初回清掃済みのタブ
 
     def _cleanup_default_sheet(self):
         """デフォルトの空シート（シート1）を削除"""
@@ -267,9 +278,46 @@ class SheetsOutputWriter:
         transaction_no += 1
 
         if rows:
+            # --- 色判定を書き込み前に確定（色塗りは行番号が要るため後段で実施）---
+            # 低置信(全行黄)と doc 赤(合計不符/規則①, 全行I列赤)を先に検出し、
+            # U列タグ導出と後段の色塗りで共用する（再計算による色とタグの乖離を防ぐ）。
+            # 非 RECEIPT 経路ではこの2つは空のまま → 下の低置信/赤の色塗りは
+            # 自然に no-op になる（per-entry タグは doc_type 不問で後段で付与する）。
+            conf_flags = []
+            red_flags = []
+            if doc_type == DocType.RECEIPT:
+                conf_flags = detect_low_confidence(
+                    entries_data, DOC_LOW_CONFIDENCE_THRESHOLD)
+                # 票面合計照合（[B']）と対象外行の構造異常（規則①）を合流。
+                amount_col = [r[8] for r in rows]      # I列=借方金額
+                tax_type_col = [r[6] for r in rows]    # G列=借方税区分
+                doc_flags = detect_document_anomalies(entries_data, amount_col)
+                # 規則①は真の receipt 限定。bank_transfer/fee_receipt は本体が
+                # 「対象外」かつ高額になり得るため除外（合計照合は total=None で既に
+                # スキップ済み、規則①も doc_category で揃える。codex 指摘）
+                exempt_flags = []
+                if entries_data.get("doc_category") == "receipt":
+                    exempt_flags = detect_outlier_exempt_rows(
+                        amount_col, tax_type_col,
+                        entries_data.get("total_amount"))
+                red_flags = doc_flags + exempt_flags
+
+            # U列(タグ): 標色される行に「赤系/橙系/黄系」を埋め込む（社長要望 6/18）。
+            # タグは「値」なので書式継承の影響を受けず、書き込み時に行データへ同梱する
+            # （別途 API 書き込み不要・自動拡容バグの影響も受けない）。
+            tags = derive_row_tags(
+                len(rows), anomaly_flags_list,
+                doc_low_confidence=bool(conf_flags), doc_red=bool(red_flags))
+            for i, tag in enumerate(tags):
+                rows[i][TAG_COL_INDEX] = tag   # "" = 無標色（既定の空セルと同値）
+
             # 書き込み前のデータを取得（ハイライト位置計算+重複検出用）
             existing_data = ws.get_all_values()
             pre_write_count = len(existing_data)
+
+            # 自動拡容バグ対策: append が境界を跨ぐ前に空きバッファを確保し、
+            # Google の自動拡容（直前行の色を空尾行へ継承）自体を起こさせない。
+            self._ensure_row_capacity(ws, pre_write_count + len(rows))
 
             # 一括書き込み（リトライ付き）
             self._write_with_retry(ws, rows)
@@ -292,17 +340,14 @@ class SheetsOutputWriter:
             # 塗り順は「黄(全行) → per-entry(各セル) → 赤(I列)」: 全行黄を最初に塗り、
             # より高優先度の per-entry 赤橙・doc 赤を後から被せて消さない（codex 指摘）。
             # 領収書限定。独立 try/except（429 リトライ、失敗しても行データは無傷）。
-            if doc_type == DocType.RECEIPT:
-                conf_flags = detect_low_confidence(
-                    entries_data, DOC_LOW_CONFIDENCE_THRESHOLD)
-                if conf_flags:
-                    print(f"🟡 {conf_flags[0]['message']}: {vendor_name}")
-                    try:
-                        self._format_with_retry(
-                            ws, f"A{start_row}:AB{end_row}",
-                            CellFormat(backgroundColor=_severity_color("low")))
-                    except Exception as e:
-                        print(f"⚠️ 低置信ハイライト適用失敗: {e}")
+            if conf_flags:
+                print(f"🟡 {conf_flags[0]['message']}: {vendor_name}")
+                try:
+                    self._format_with_retry(
+                        ws, f"A{start_row}:AB{end_row}",
+                        CellFormat(backgroundColor=_severity_color("low")))
+                except Exception as e:
+                    print(f"⚠️ 低置信ハイライト適用失敗: {e}")
 
             # 異常行のハイライト（書き込み前の行数から位置を正確に算出）
             if anomaly_flags_list:
@@ -313,28 +358,11 @@ class SheetsOutputWriter:
                 except Exception as e:
                     print(f"⚠️ 異常ハイライト適用失敗: {e}")
 
-            # 票面合計とΣ行金額の照合（doc 級）。Gemini の外税換算漏れ・幻覚行・
-            # 行落ちを金額列（I列）の赤ハイライトで可視化する
-            # （6/12 E2E 静默錯 2/28 対策。領収書限定の機能のため他 doc_type では呼ばない）
+            # 票面合計照合[B']+対象外[規則①] → I列を一度だけ赤塗り（重複塗り防止）。
+            # severity=high → 赤（_severity_color の high）。黄(下地)・per-entry の
+            # 後に塗り、I列を最終的に赤にする。上の一括 try/except とは独立（429 リトライ）。
+            # （6/12 E2E 静默錯 2/28 対策。領収書限定の機能）
             if doc_type == DocType.RECEIPT:
-                # 票面合計照合（[B']）と対象外行の構造異常（規則①）を合流し、
-                # I列（金額列）を一度だけ赤塗りする（重複塗り防止）
-                amount_col = [r[8] for r in rows]      # I列=借方金額
-                tax_type_col = [r[6] for r in rows]    # G列=借方税区分
-                doc_flags = detect_document_anomalies(entries_data, amount_col)
-                # 規則①は真の receipt 限定。bank_transfer/fee_receipt は本体が
-                # 「対象外」かつ高額になり得るため除外（合計照合は total=None で既に
-                # スキップ済み、規則①も doc_category で揃える。codex 指摘）
-                exempt_flags = []
-                if entries_data.get("doc_category") == "receipt":
-                    exempt_flags = detect_outlier_exempt_rows(
-                        amount_col, tax_type_col,
-                        entries_data.get("total_amount"))
-                red_flags = doc_flags + exempt_flags
-
-                # 票面合計照合[B']+対象外[規則①] → I列を一度だけ赤塗り（重複塗り防止）。
-                # severity=high → 赤（_severity_color の high）。黄(下地)・per-entry の
-                # 後に塗り、I列を最終的に赤にする。上の一括 try/except とは独立（429 リトライ）。
                 if red_flags:
                     for flag in red_flags:
                         print(f"⚠️ 異常検出: {flag['message']}")
@@ -348,6 +376,11 @@ class SheetsOutputWriter:
                     # 照合カバレッジの可観測性: total_amount 欠損で照合が
                     # 無言で蒸発していないか E2E ログで確認できるようにする
                     print(f"ℹ️ 合計照合スキップ（total_amount なし）: {vendor_name}")
+
+            # 自動拡容バグ対策（兜底）: 既存タブに旧来残った汚れた空尾行を白へ一掃。
+            # 新規伝染は _ensure_row_capacity が防ぐため、ここはタブごと初回1回で足りる
+            # （毎書き込みで全域を塗り直す無駄な API 呼び出しを避ける）。
+            self._sanitize_trailing_once(ws, tab_name, end_row)
 
             print(f"💾 Sheets に {len(rows)} 行追加: {tab_name}")
 
@@ -382,6 +415,46 @@ class SheetsOutputWriter:
                     time.sleep(wait)
                 else:
                     raise
+
+    def _ensure_row_capacity(self, worksheet, needed_last_row):
+        """【主防衛】append が自動拡容を起こさないよう、空きバッファ行を事前確保する。
+
+        Google Sheets は append がグリッド境界を跨ぐと新規行に直前行の書式を
+        継承する（標色された最終行の色が空尾行へ伝染するバグの根因）。add_rows は
+        resize 経由で書式を継承しない素の行を足すため、ここで余裕を持たせておけば
+        append は既存の空行に収まり自動拡容自体が発生しない。これが新規伝染を止める
+        正規の修正。前提: worksheet.row_count が実態と一致すること（単一プロセスで
+        逐次書き込みする本システムでは成立。将来 append を行番号指定 update に
+        置き換えれば自動拡容は原理的に起きず、本メソッドは廃止できる）。
+        失敗しても行データ書き込みは無傷（best-effort）。
+        """
+        try:
+            current = worksheet.row_count
+            target = needed_last_row + GRID_ROW_BUFFER
+            if target > current:
+                worksheet.add_rows(target - current)
+        except Exception as e:
+            print(f"⚠️ 行容量の事前確保に失敗: {e}")
+
+    def _sanitize_trailing_once(self, worksheet, tab_name, last_data_row):
+        """【兜底・冪等】既存タブに旧来残った汚れた空尾行を、タブごと初回1回だけ白へ戻す。
+
+        新規伝染は _ensure_row_capacity（主防衛）が防ぐため、ここは過去の自動拡容で
+        既に汚れたタブの初期清掃のみ担う。毎書き込みで全域を塗り直すのは無駄な API
+        呼び出しなので、プロセス内でタブごと1回に限定する。
+        失敗しても行データは無傷（best-effort）。
+        """
+        if tab_name in self._tabs_sanitized:
+            return
+        try:
+            grid_last_row = worksheet.row_count
+            if grid_last_row > last_data_row:
+                self._format_with_retry(
+                    worksheet, f"A{last_data_row + 1}:AB{grid_last_row}",
+                    CellFormat(backgroundColor=Color(1, 1, 1)))
+            self._tabs_sanitized.add(tab_name)
+        except Exception as e:
+            print(f"⚠️ 空尾行の継承色リセットに失敗: {e}")
 
     @staticmethod
     def _determine_debit_sub_account(debit_account, entry, invoice_num):
@@ -463,8 +536,11 @@ class SheetsOutputWriter:
         row[23] = now_jst            # 作成日時
         row[25] = now_jst            # 最終更新日時
         row[27] = source_url         # 原票URL
+        # 認識不能/部分認識行は常に赤系（U列タグ。人手確認後に削除）
+        row[TAG_COL_INDEX] = UNRECOGNIZED_TAG
 
         pre_write = len(ws.get_all_values())
+        self._ensure_row_capacity(ws, pre_write + 1)
         self._write_with_retry(ws, [row])
         self._tab_next_txn[tab_name] = txn_no + 1
 
@@ -488,6 +564,9 @@ class SheetsOutputWriter:
                 format_cell_range(ws, f"A{actual_row}:AB{actual_row}", fmt_red)
         except Exception as e:
             print(f"⚠️ 認識不能ハイライト適用失敗: {e}")
+
+        # 自動拡容バグ対策（兜底）: 既存タブの汚れた空尾行をタブごと初回1回だけ清掃
+        self._sanitize_trailing_once(ws, tab_name, actual_row)
 
         label = "部分認識" if has_partial else "認識不能"
         print(f"⚠️ {label}ページを記録: {tab_name} (Row {actual_row})")
