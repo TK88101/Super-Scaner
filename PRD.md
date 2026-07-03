@@ -134,8 +134,8 @@
 │  └───────────┘    └──────────────┘    └──────────────┘     │
 │                                                             │
 │  ┌───────────────────┐    ┌──────────────────────┐         │
-│  │anomaly_detector.py│    │scripts/daily_backup.py│         │
-│  │  異常検出模組       │    │  每日備份 (cron)      │         │
+│  │anomaly_detector.py│    │  gas/daily_backup.gs  │         │
+│  │  異常検出模組       │    │  每日備份 (GAS 22:00) │         │
 │  └───────────────────┘    └──────────────────────┘         │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
@@ -189,12 +189,12 @@ sheets_output 寫入 Google Sheets:
     ↓
 原文件移到 Processed 文件夾 → Chatwork 通知
 
-===== 22:00 JST (cron) =====
-daily_backup.py:
-  1. 讀取工作 Sheet 各 tab 數據
-  2. 寫入備份 Sheet 的新 tab (命名: 日期_原tab名)
-  3. 清空工作 Sheet 各 tab (保留表頭)
-  4. 刪除超過 90 天的舊備份 tab
+===== 22:00 JST (GAS time-driven trigger) =====
+gas/daily_backup.gs (Google 服务器执行、PC 無需開機):
+  1. 讀取工作 Sheet 各 tab 數據 (含異常標色背景一併備份)
+  2. 寫入備份 Sheet 的新日期 tab (命名: yyyy-MM-dd)
+  3. 備份成功後刪除工作 Sheet 各 tab (main.py 次回自動再作成)
+  4. 每月 1 日刪除超過 30 天的舊備份 tab
 ```
 
 ---
@@ -302,7 +302,7 @@ AI 輸出的通用科目名自動轉換為 MF 正確名稱:
 | 版本 | 功能 | 狀態 |
 |------|------|------|
 | v1.0 Phase 1-6 | 基礎架構、多文書類型、CSV 輸出 | ✅ 完成 |
-| v1.0 Phase 7 | 生產監控儀表板 | ✅ 完成 |
+| v1.0 Phase 7 | 生產監控儀表板（EC2/Docker 監視、現已隨環境廢棄刪除）| ⚠️ 廢棄 |
 | v1.0 Phase 8 | T番號校驗、API 重試 | ✅ 完成 |
 | **v2.0 Phase 1** | **sheets_output.py + anomaly_detector.py + 科目映射** | ✅ 完成 |
 | **v2.0 Phase 2** | **Cloud Vision OCR + Gemini Text 雙引擎** | ✅ 完成 |
