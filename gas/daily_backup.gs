@@ -109,10 +109,16 @@ function backupAllTabs_() {
 
     currentRow++;
 
-    // Copy data rows (row 6+ from source)
+    // Copy data rows (row 6+ from source), preserving anomaly highlight colors.
+    // 異常標色 (赤/橙/黄系・重複・整行黄) は全て背景色。値と一緒に背景色も
+    // コピーし、翌日社員が色を頼りに作業できるようにする。
     if (dataRowCount > 0) {
-      var data = tab.sheet.getRange(HEADER_ROWS + 1, 1, dataRowCount, TOTAL_COLUMNS).getValues();
-      backupSheet.getRange(currentRow, 1, data.length, TOTAL_COLUMNS).setValues(data);
+      var srcRange = tab.sheet.getRange(HEADER_ROWS + 1, 1, dataRowCount, TOTAL_COLUMNS);
+      var data = srcRange.getValues();
+      var backgrounds = srcRange.getBackgrounds();
+      var destRange = backupSheet.getRange(currentRow, 1, dataRowCount, TOTAL_COLUMNS);
+      destRange.setValues(data);
+      destRange.setBackgrounds(backgrounds);
       currentRow += data.length;
     }
 
