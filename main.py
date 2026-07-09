@@ -23,20 +23,30 @@ import config
 
 # ================= 配置區域 =================
 load_dotenv()
-PROCESSED_FOLDER_ID = os.getenv("PROCESSED_FOLDER_ID")
+# Processed / SPLIT_PDF / 出力シートは全て profiles 経由で解決する。
+# グローバル定数を残すとプロファイル分離を素通りする経路が生まれるため置かない。
 SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE")
 LOCAL_DOWNLOAD_DIR = './temp_downloads'
 
-if not PROCESSED_FOLDER_ID or not SERVICE_ACCOUNT_FILE:
+if not SERVICE_ACCOUNT_FILE:
     print("❌ エラー：.envファイルの設定を確認してください (配置錯誤)")
     exit(1)
 
-if not config.OUTPUT_SPREADSHEET_ID:
-    print("❌ エラー：OUTPUT_SPREADSHEET_ID が設定されていません。")
+# 出力プロファイル読み込み（env が揃ったものだけ有効化される）
+profiles = config.load_profiles()
+if not profiles:
+    print("❌ エラー：有効な出力プロファイルがありません。")
+    print("   .env に OUTPUT_SPREADSHEET_ID と PROCESSED_FOLDER_ID を設定してください。")
     exit(1)
 
 # フォルダマッピング読み込み
-folder_map = config.load_folder_map()
+# 同一フォルダが2プロファイルに割り当てられていたら起動させない（票据の流出防止）
+try:
+    folder_map = config.load_folder_map(profiles)
+except ValueError as e:
+    print(f"❌ エラー：{e}")
+    exit(1)
+
 if not folder_map:
     print("❌ エラー：監視フォルダが設定されていません。")
     print("   .env に FOLDER_RECEIPT_ID 等、または INPUT_FOLDER_ID を設定してください。")
@@ -256,13 +266,18 @@ def move_file(service, file_id, previous_folder_id, new_folder_id):
 
 
 
-def is_duplicate_file(service, md5_checksum):
-    """Processed フォルダ中の重複チェック"""
-    if not md5_checksum:
+def is_duplicate_file(service, md5_checksum, processed_folder_id):
+    """指定された Processed フォルダ中の重複チェック。
+
+    processed_folder_id はプロファイルごとに異なる。グローバル定数を見ると
+    社長専用フォルダへアーカイブ済みの票据を検出できず二重記帳になるため、
+    呼び出し側が必ず対応するプロファイルの値を渡すこと。
+    """
+    if not md5_checksum or not processed_folder_id:
         return False
 
     try:
-        query = f"'{PROCESSED_FOLDER_ID}' in parents and trashed = false"
+        query = f"'{processed_folder_id}' in parents and trashed = false"
         results = _call_with_retry(lambda: service.files().list(
             q=query,
             orderBy='createdTime desc',
@@ -291,11 +306,15 @@ def is_duplicate_file(service, md5_checksum):
 
 
 def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
-                  doc_type=DocType.RECEIPT, drive_file_id=None):
+                  doc_type=DocType.RECEIPT, drive_file_id=None,
+                  split_pdf_folder_id=""):
     """ファイルを処理し、Google Sheets に逐次書き込み、通知を送信する。
 
     process_pipeline がジェネレータなので、1ページ処理→即Sheets書き込み→
     メモリ解放→次ページ の流れでメモリ使用量を最小化する。
+
+    split_pdf_folder_id もプロファイルごとに異なる。共通の分割保存先へ
+    アップロードすると、社長専用シートの原票 URL が全社から閲覧可能になる。
     """
     type_label = DOC_TYPE_CONFIG.get(doc_type, {}).get("label", doc_type)
     filename = os.path.basename(file_path)
@@ -308,7 +327,7 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
     # 多ページ領収書 PDF のページ単位ディープリンク解決器
     # （ページ毎に単ページ PDF を分割保存先へアップロードし永続リンク化）
     resolver = PageUrlResolver(
-        service, base_url, filename, config.SPLIT_PDF_FOLDER_ID, drive_file_id)
+        service, base_url, filename, split_pdf_folder_id, drive_file_id)
 
     total_amount = 0
     vendor_names = []
@@ -427,47 +446,153 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
         return False
 
 
+# シート接続の再試行間隔（秒）。合計 15 秒。
+# sheets_output.SheetsOutputWriter.__init__ 内の open_by_key() は、本リポジトリで
+# 唯一リトライ保護の無い Google 呼び出しだった (main._call_with_retry /
+# sheets_output._write_with_retry がそれ以外を守っている)。保護が無いと、02:00 の
+# 定時再起動が Google の一時的な 503 に当たっただけで、そのプロファイルが次の
+# 再起動まで最長 24 時間沈黙する。
+_SHEET_OPEN_RETRY_DELAYS = [1, 2, 4, 8]
+
+
+def _is_transient_sheet_error(err):
+    """再試行する価値のあるエラーか。
+
+    一時: HTTP 429 / 5xx、ネットワーク断。→ 待てば直る。
+    恒久: HTTP 403 / 404、SpreadsheetNotFound (共有剥奪・シート削除)。
+          → 何度試しても直らないので即諦め、起動を 15 秒無駄にしない。
+    """
+    status = getattr(getattr(err, "response", None), "status_code", None)
+    if status is not None:
+        return status == 429 or 500 <= status < 600
+    return isinstance(err, (ConnectionError, TimeoutError, OSError))
+
+
+def open_writer_with_retry(profile, credentials_file, delays=None):
+    """SheetsOutputWriter を作る。一時エラーのみ指数バックオフで再試行する。
+
+    SheetsOutputWriter の構築は冪等 (open_by_key も空シート削除も再実行安全) な
+    ため、丸ごと再試行してよい。恒久エラーは再試行せず送出し、呼び出し側で
+    そのプロファイルだけを縮退させる。
+    """
+    if delays is None:
+        delays = _SHEET_OPEN_RETRY_DELAYS
+
+    last_err = None
+    for attempt, delay in enumerate([0] + list(delays)):
+        if delay:
+            print(f"   ⏳ {delay}s 後に再試行 ({attempt}/{len(delays)})")
+            time.sleep(delay)
+        try:
+            return SheetsOutputWriter(
+                spreadsheet_id=profile["spreadsheet_id"],
+                credentials_file=credentials_file,
+            )
+        except Exception as e:
+            if not _is_transient_sheet_error(e):
+                raise
+            last_err = e
+            print(f"   ⚠️ シート接続の一時エラー: {e}")
+    raise last_err
+
+
+def build_writers(profiles, credentials_file):
+    """プロファイルごとに SheetsOutputWriter を作る。開けないシートは飛ばす。
+
+    SheetsOutputWriter.__init__ は gc.open_by_key() で実際にネットワークへ出る。
+    社長専用シートは Drive の「アクセス制限」フォルダ内にあり共有設定が手動の
+    ため、共有を外すと開けなくなる。ここで例外を素通しすると健全な共通通道
+    まで巻き添えで落ち、タスクスケジューラが起動クラッシュループに入る。
+    load_profiles() の env 欠落降格と同じ粒度で、シート単位でも縮退させる。
+
+    一時エラーは open_writer_with_retry が吸収するので、ここまで来るのは
+    恒久エラーか、再試行を使い切った一時エラーのみ。
+
+    Returns: {profile_key: writer}。全滅なら空 dict（呼び出し側が exit を判断）。
+    """
+    writers = {}
+    for profile_key, profile in profiles.items():
+        try:
+            writers[profile_key] = open_writer_with_retry(profile, credentials_file)
+            print(f"✅ Google Sheets 接続完了 [{profile['label']}]: "
+                  f"...{profile['spreadsheet_id'][-5:]}")
+        except Exception as e:
+            print(f"⚠️ [{profile['label']}] シートを開けません: {e}")
+            print("   -> このプロファイルを無効化して継続します。"
+                  "共有設定(SA がコンテンツ管理者か)を確認してください。")
+    return writers
+
+
+def filter_active_folders(folder_map, writers):
+    """writer を作れなかったプロファイルの入力フォルダを監視対象から外す。"""
+    return {fid: entry for fid, entry in folder_map.items()
+            if entry[1] in writers}
+
+
 def main():
     print("🚀 Super Scaner 自動化システム起動！(Sheets出力版)")
-    print(f"📂 監視フォルダ数: {len(folder_map)}")
-    for fid, dtype in folder_map.items():
-        label = DOC_TYPE_CONFIG.get(dtype, {}).get("label", dtype)
-        print(f"   - {label}: ...{fid[-5:]}")
-    print("-" * 30)
 
     service = get_drive_service()
 
-    # Google Sheets 出力ライター初期化
-    sheets_writer = SheetsOutputWriter(
-        spreadsheet_id=config.OUTPUT_SPREADSHEET_ID,
-        credentials_file=SERVICE_ACCOUNT_FILE,
-    )
-    print(f"✅ Google Sheets 接続完了: ...{config.OUTPUT_SPREADSHEET_ID[-5:]}")
+    # Google Sheets 出力ライター初期化（プロファイルごとに1インスタンス）
+    # SheetsOutputWriter は 1 インスタンス = 1 スプレッドシート。取引No も
+    # タブ単位で算出されるため、プロファイル間で番号が混ざることはない。
+    writers = build_writers(profiles, SERVICE_ACCOUNT_FILE)
+    if not writers:
+        print("❌ エラー：どの出力シートにも接続できませんでした。")
+        exit(1)
+
+    active_folder_map = filter_active_folders(folder_map, writers)
+    if not active_folder_map:
+        # 接続できたプロファイルに入力フォルダが1つも無い状態。ループに入ると
+        # ドットを打ち続けるだけで、外からは正常稼働と区別がつかない
+        # (Chatwork 通知は廃止済みで監視手段が無い)。落として気付かせる。
+        print("❌ エラー：監視可能な入力フォルダがありません。")
+        print("   接続できたシートのプロファイルに入力フォルダが設定されていません。")
+        exit(1)
+
+    print("-" * 30)
+    print(f"📂 監視フォルダ数: {len(active_folder_map)} / "
+          f"有効プロファイル数: {len(writers)}")
+    for profile_key in writers:
+        profile = profiles[profile_key]
+        print(f"   [{profile['label']}] → シート ...{profile['spreadsheet_id'][-5:]}")
+        for fid, (dtype, pkey) in active_folder_map.items():
+            if pkey != profile_key:
+                continue
+            label = DOC_TYPE_CONFIG.get(dtype, {}).get("label", dtype)
+            print(f"      - {label}: ...{fid[-5:]}")
+    print("-" * 30)
 
     while True:
         try:
             found_any = False
 
-            for input_folder_id, doc_type in folder_map.items():
+            for input_folder_id, (doc_type, profile_key) in active_folder_map.items():
                 files = list_files(service, input_folder_id)
 
                 if not files:
                     continue
 
+                profile = profiles[profile_key]
+                writer = writers[profile_key]
+                processed_folder_id = profile["processed_folder_id"]
+
                 found_any = True
                 type_label = DOC_TYPE_CONFIG.get(doc_type, {}).get("label", doc_type)
-                print(f"\n\n🔎 [{type_label}] 新しいファイルを検出しました！")
+                print(f"\n\n🔎 [{profile['label']}/{type_label}] "
+                      f"新しいファイルを検出しました！")
 
                 for file in files:
                     file_id = file['id']
                     file_name = file['name']
                     md5 = file.get('md5Checksum')
 
-                    # 1. 防重檢測
-                    if is_duplicate_file(service, md5):
+                    # 1. 防重檢測（同一プロファイルのアーカイブ内のみを見る）
+                    if is_duplicate_file(service, md5, processed_folder_id):
                         print(f"⚠️ 重複アップロードを検出: {file_name}")
                         print("   -> 処理をスキップしてアーカイブします")
-                        move_file(service, file_id, input_folder_id, PROCESSED_FOLDER_ID)
+                        move_file(service, file_id, input_folder_id, processed_folder_id)
                         print("=" * 30)
                         continue
 
@@ -490,16 +615,17 @@ def main():
                     local_path = download_file(service, file_id, file_name)
 
                     # PDF 間分割線 + 取引No リセット
-                    sheets_writer.start_new_file(uploader_name, doc_type, file_name)
+                    writer.start_new_file(uploader_name, doc_type, file_name)
 
                     success = process_file(
-                        service, sheets_writer, local_path,
+                        service, writer, local_path,
                         uploader_name, chat_id,
-                        doc_type=doc_type, drive_file_id=file_id
+                        doc_type=doc_type, drive_file_id=file_id,
+                        split_pdf_folder_id=profile["split_pdf_folder_id"],
                     )
 
                     if success:
-                        move_file(service, file_id, input_folder_id, PROCESSED_FOLDER_ID)
+                        move_file(service, file_id, input_folder_id, processed_folder_id)
                     else:
                         print("⚠️ ファイル処理失敗。")
 
@@ -507,8 +633,9 @@ def main():
                         os.remove(local_path)
                         print("🧹 一時ファイルを削除しました")
 
-                    # 取引No を Sheets に書き戻す
-                    sheets_writer.flush()
+                    # 取引No はタブの A 列から都度算出するため書き戻し不要。
+                    # flush() は将来の後処理フック用に呼び出しだけ残す。
+                    writer.flush()
 
                     print("=" * 30)
 

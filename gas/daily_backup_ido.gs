@@ -1,7 +1,12 @@
 // ============================================================
-// Super Scaner - Daily Backup & Clear (GAS)
-// Deploy: MF_Import_Data > Extensions > Apps Script
+// Super Scaner - Daily Backup & Clear (GAS) — 井戸会計事務所（社長専用）
+// Deploy: SuperScaner_Internal/井戸会計事務所/MF_Import_Data > 拡張機能 > Apps Script
 // Run setupTriggers() once to register automated triggers
+//
+// 重要: 必ず automation@ido-office.fukuoka.jp で配置すること。
+//   対象シートは Drive の「アクセス制限」フォルダ内にあり、共有ドライブの
+//   管理者と直接追加されたユーザーしか開けない。時間主導型トリガーは配置者の
+//   権限で走るため、閲覧権の無いアカウントで配置すると毎晩静かに失敗する。
 //
 // ⚠ 同期必須: 本ファイルのロジックは daily_backup.gs / daily_backup_ido.gs /
 //   daily_backup_rental.gs の3本で完全に同一。差分は先頭コメントと
@@ -10,8 +15,8 @@
 //    コード共有には Apps Script Library が必要だが、手動配置の運用には過剰と判断)
 // ============================================================
 
-const SOURCE_SS_ID = '1-cIp_TEGbUE3Z-j45ApXewTPCB1X_O32yI5bekqHhn4';
-const BACKUP_SS_ID = '1K8sTStUjWmrM9SQUlxcupMIswtff6pb3jyAsm0gfhIo';
+const SOURCE_SS_ID = '1B0VOt4tDnp4zYwcs_3XnY0S2sPQXQ9uVkCUPoEDjhzc';
+const BACKUP_SS_ID = '14P7AW-kJUBniWDfj2iM9aeLwnM54trvAQPU07KQc5hk';
 const TOTAL_COLUMNS = 28;
 const RETENTION_DAYS = 30;
 const TIMEZONE = 'Asia/Tokyo';

@@ -5,9 +5,9 @@ import os
 from doc_types import DocType, ENV_FOLDER_MAP
 
 # === 出力先 Google Spreadsheet ID ===
+# 分割 PDF / Processed フォルダは load_profiles() 経由で取得する（下部参照）。
 OUTPUT_SPREADSHEET_ID = os.getenv("OUTPUT_SPREADSHEET_ID", "")
 BACKUP_SPREADSHEET_ID = os.getenv("BACKUP_SPREADSHEET_ID", "")
-SPLIT_PDF_FOLDER_ID = os.getenv("SPLIT_PDF_FOLDER_ID", "")
 
 # === OCR 戦略設定 ===
 OCR_STRATEGY = os.getenv("OCR_STRATEGY", "C")
@@ -148,25 +148,102 @@ SUPPORTED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.heic', '.pdf']
 SCAN_INTERVAL = 3
 
 
-def load_folder_map():
+# === 出力プロファイル ===
+# 「どの入力フォルダに入れた票据を、どのスプレッドシートへ書き、
+#   どこへアーカイブするか」を束ねた単位。
+#   default : 全社共有 (SuperScaner_Root 配下)
+#   ido     : 社長専用 (SuperScaner_Internal/井戸会計事務所 配下)
+#   rental  : 社長専用 (SuperScaner_Internal/レンタル経理部 配下)
+# ido / rental は Google Drive の「アクセス制限」フォルダ内にあり、
+# 社長・夫人・SA・共有ドライブ管理者のみが閲覧できる。
+PROFILE_DEFAULT = "default"
+
+# key → {prefix: env 変数名の接頭辞, label: 起動ログ用の表示名}
+# 会社を1社増やす際に触るのはこの1箇所だけ（env 変数名は接頭辞から自動導出）。
+PROFILES_META = {
+    PROFILE_DEFAULT: {"prefix": "",        "label": "共通"},
+    "ido":           {"prefix": "IDO_",    "label": "井戸会計事務所"},
+    "rental":        {"prefix": "RENTAL_", "label": "株式会社レンタル経理部"},
+}
+
+
+def load_profiles() -> dict:
     """
-    從環境變量構建 {folder_id: doc_type} 映射表。
-    支持新的多文件夾模式 (FOLDER_RECEIPT_ID 等) 和
-    舊的單文件夾模式 (INPUT_FOLDER_ID → 默認 receipt)。
+    有効な出力プロファイルのみを {key: 設定dict} で返す。
+
+    有効条件は OUTPUT_SPREADSHEET_ID と PROCESSED_FOLDER_ID が両方揃うこと。
+    片方でも欠けたプロファイルは黙って除外する — 本番 Windows PC の .env
+    更新漏れで git pull 後にボット全体が停止し、全社の記帳が止まるのを防ぐ。
+    SPLIT_PDF_FOLDER_ID は任意 (未設定なら PageUrlResolver が
+    base_url#page=N へ降格する)。
     """
+    profiles = {}
+    for key, meta in PROFILES_META.items():
+        prefix = meta["prefix"]
+        spreadsheet_id = os.getenv(f"{prefix}OUTPUT_SPREADSHEET_ID", "")
+        processed_folder_id = os.getenv(f"{prefix}PROCESSED_FOLDER_ID", "")
+        if not spreadsheet_id or not processed_folder_id:
+            continue
+
+        profiles[key] = {
+            "label": meta["label"],
+            "spreadsheet_id": spreadsheet_id,
+            "processed_folder_id": processed_folder_id,
+            "split_pdf_folder_id": os.getenv(f"{prefix}SPLIT_PDF_FOLDER_ID", ""),
+        }
+    return profiles
+
+
+def load_folder_map(profiles: dict = None) -> dict:
+    """
+    從環境變量構建 {folder_id: (doc_type, profile_key)} 映射表。
+
+    有効なプロファイルの入力フォルダのみを収集する。無効なプロファイルの
+    フォルダを拾うと、書き込み先シートが存在せず処理が落ちる。
+
+    支持新的多文件夾模式 (FOLDER_RECEIPT_ID / IDO_FOLDER_RECEIPT_ID 等) 和
+    舊的單文件夾模式 (INPUT_FOLDER_ID → 默認 receipt, default プロファイル)。
+
+    Raises:
+        ValueError: 同一フォルダ ID が複数の (プロファイル, 文書タイプ) に
+            割り当てられている場合。黙って後勝ちさせると、社長専用の票据が
+            共通シートへ書き込まれる（＝アクセス制限の意味が消える）。
+    """
+    if profiles is None:
+        profiles = load_profiles()
+
     folder_map = {}
 
-    # 新模式: 讀取每種文書類型的專用文件夾 ID
-    for env_key, doc_type in ENV_FOLDER_MAP.items():
-        folder_id = os.getenv(env_key)
-        if folder_id:
-            folder_map[folder_id] = doc_type
+    def claim(folder_id, doc_type, profile_key):
+        """フォルダ ID を1つの (doc_type, profile) に排他的に割り当てる。"""
+        if folder_id in folder_map:
+            prev_doc, prev_profile = folder_map[folder_id]
+            raise ValueError(
+                f"入力フォルダ ID が重複しています: {folder_id}\n"
+                f"  「{prev_profile} / {prev_doc}」と「{profile_key} / {doc_type}」が"
+                f"同じフォルダを指しています。\n"
+                f"  .env を確認してください。このまま起動すると、社長専用の票据が"
+                f"共通シートへ書き込まれる恐れがあります。"
+            )
+        folder_map[folder_id] = (doc_type, profile_key)
 
-    # 向後兼容: 如果新模式沒有配置任何文件夾，
-    # 則使用 INPUT_FOLDER_ID 作為領收書文件夾
-    if not folder_map:
+    # 新模式: プロファイル × 文書タイプ ごとの専用フォルダ ID
+    for profile_key in profiles:
+        prefix = PROFILES_META[profile_key]["prefix"]
+        for env_key, doc_type in ENV_FOLDER_MAP.items():
+            folder_id = os.getenv(f"{prefix}{env_key}")
+            if folder_id:
+                claim(folder_id, doc_type, profile_key)
+
+    # 向後兼容: default に新模式のフォルダが1つも無い場合のみ、
+    # INPUT_FOLDER_ID を領収書フォルダとして扱う。
+    # default 自体が無効なら legacy も拾わない (書き込み先が無いため)。
+    default_has_folders = any(
+        profile_key == PROFILE_DEFAULT for _, profile_key in folder_map.values()
+    )
+    if PROFILE_DEFAULT in profiles and not default_has_folders:
         legacy_id = os.getenv("INPUT_FOLDER_ID")
         if legacy_id:
-            folder_map[legacy_id] = DocType.RECEIPT
+            claim(legacy_id, DocType.RECEIPT, PROFILE_DEFAULT)
 
     return folder_map

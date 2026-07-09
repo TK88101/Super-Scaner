@@ -23,7 +23,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 # 実 .env が無い環境(CI 等)でも import できるよう、未設定のものだけ補完する。
 # （python-dotenv の load_dotenv は既存 os.environ を上書きしないので、
 #   実 .env がある場合はそちらの値が優先される。）
-os.environ.setdefault("PROCESSED_FOLDER_ID", "test_processed_folder")
+DEFAULT_PROCESSED_FOLDER = "test_processed_folder"
+os.environ.setdefault("PROCESSED_FOLDER_ID", DEFAULT_PROCESSED_FOLDER)
 os.environ.setdefault("SERVICE_ACCOUNT_FILE", "test_sa.json")
 os.environ.setdefault("OUTPUT_SPREADSHEET_ID", "test_spreadsheet")
 os.environ.setdefault("FOLDER_RECEIPT_ID", "test_receipt_folder")
@@ -129,34 +130,57 @@ class IsDuplicateFileSharedDriveTest(unittest.TestCase):
         # Arrange
         service = _make_service_with_list([{"md5Checksum": "abc"}])
         # Act
-        main.is_duplicate_file(service, "abc")
+        main.is_duplicate_file(service, "abc", "PROC_X")
         # Assert
         kwargs = service.files.return_value.list.call_args.kwargs
         self.assertIs(kwargs.get("supportsAllDrives"), True)
         self.assertIs(kwargs.get("includeItemsFromAllDrives"), True)
         self.assertEqual(kwargs.get("pageSize"), 200)
-        # Processed フォルダ ID をクエリ対象にしている
-        self.assertIn(main.PROCESSED_FOLDER_ID, kwargs.get("q", ""))
+        # 渡された Processed フォルダ ID をクエリ対象にしている
+        self.assertIn("PROC_X", kwargs.get("q", ""))
+
+    def test_queries_the_given_folder_not_the_global_constant(self):
+        """プロファイルごとに Processed が異なる。
+
+        グローバル定数を見に行くと、社長専用フォルダへアーカイブ済みの票据が
+        共通 Processed に無いため「重複でない」と誤判定され、二重記帳になる。
+        """
+        # Arrange
+        service = _make_service_with_list([])
+        # Act: 社長専用プロファイルの Processed を渡す
+        main.is_duplicate_file(service, "abc", "IDO_PROCESSED_FOLDER")
+        # Assert: 渡した方だけを見る。共通(default)の Processed は参照しない。
+        query = service.files.return_value.list.call_args.kwargs.get("q", "")
+        self.assertIn("IDO_PROCESSED_FOLDER", query)
+        self.assertNotIn(DEFAULT_PROCESSED_FOLDER, query)
 
     def test_returns_true_on_md5_match(self):
         # Arrange
         service = _make_service_with_list(
             [{"md5Checksum": "xxx"}, {"md5Checksum": "target"}])
         # Act / Assert
-        self.assertTrue(main.is_duplicate_file(service, "target"))
+        self.assertTrue(main.is_duplicate_file(service, "target", "PROC_X"))
 
     def test_returns_false_on_no_match(self):
         # Arrange
         service = _make_service_with_list(
             [{"md5Checksum": "xxx"}, {"md5Checksum": "yyy"}])
         # Act / Assert
-        self.assertFalse(main.is_duplicate_file(service, "target"))
+        self.assertFalse(main.is_duplicate_file(service, "target", "PROC_X"))
 
     def test_returns_false_for_empty_checksum_without_api_call(self):
         # Arrange
         service = MagicMock()
         # Act / Assert: md5 が None なら即 False、API は呼ばない
-        self.assertFalse(main.is_duplicate_file(service, None))
+        self.assertFalse(main.is_duplicate_file(service, None, "PROC_X"))
+        service.files.return_value.list.assert_not_called()
+
+    def test_returns_false_for_empty_folder_without_api_call(self):
+        # Arrange: アーカイブ先が無いプロファイルは load_profiles が弾くが、
+        # 万一到達しても全件を「重複」と誤判定して無言スキップしないこと。
+        service = MagicMock()
+        # Act / Assert
+        self.assertFalse(main.is_duplicate_file(service, "abc", ""))
         service.files.return_value.list.assert_not_called()
 
     def test_swallows_exception_and_returns_false(self):
@@ -166,7 +190,212 @@ class IsDuplicateFileSharedDriveTest(unittest.TestCase):
             Exception("boom")
         # Act / Assert
         with redirect_stdout(io.StringIO()):
-            self.assertFalse(main.is_duplicate_file(service, "abc"))
+            self.assertFalse(main.is_duplicate_file(service, "abc", "PROC_X"))
+
+
+def _transient_error(status=503):
+    """gspread.APIError 相当（response.status_code を持つ）の一時エラー。"""
+    err = Exception(f"HTTP {status}")
+    err.response = MagicMock(status_code=status)
+    return err
+
+
+class TransientSheetErrorTest(unittest.TestCase):
+    """再試行すべきエラーと、諦めるべきエラーの切り分け。
+
+    恒久エラー(共有剥奪=404/403)まで再試行すると起動が 15 秒無駄に伸びる。
+    逆に一時エラー(429/5xx)を再試行しないと、02:00 の定時再起動が Google の
+    一瞬の不調に当たっただけで、そのプロファイルが次の再起動まで最長 24 時間
+    沈黙する。
+    """
+
+    def test_5xx_is_transient(self):
+        for status in (500, 502, 503, 599):
+            self.assertTrue(main._is_transient_sheet_error(_transient_error(status)))
+
+    def test_429_rate_limit_is_transient(self):
+        self.assertTrue(main._is_transient_sheet_error(_transient_error(429)))
+
+    def test_403_permission_denied_is_permanent(self):
+        self.assertFalse(main._is_transient_sheet_error(_transient_error(403)))
+
+    def test_404_not_found_is_permanent(self):
+        self.assertFalse(main._is_transient_sheet_error(_transient_error(404)))
+
+    def test_spreadsheet_not_found_is_permanent(self):
+        import gspread.exceptions
+        err = gspread.exceptions.SpreadsheetNotFound("gone")
+        self.assertFalse(main._is_transient_sheet_error(err))
+
+    def test_network_errors_are_transient(self):
+        for err in (ConnectionError(), TimeoutError(), OSError("unreachable")):
+            self.assertTrue(main._is_transient_sheet_error(err))
+
+    def test_plain_exception_is_permanent(self):
+        self.assertFalse(main._is_transient_sheet_error(Exception("boom")))
+
+
+class OpenWriterWithRetryTest(unittest.TestCase):
+    """open_by_key はリポジトリ内で唯一リトライ保護が無かった Google 呼び出し。"""
+
+    PROFILE = {"label": "井戸会計事務所", "spreadsheet_id": "ss_ido",
+               "processed_folder_id": "p_i", "split_pdf_folder_id": ""}
+
+    def test_transient_error_is_retried_until_success(self):
+        # Arrange: 最初の2回は 503、3回目で成功
+        attempts = []
+
+        def factory(spreadsheet_id, credentials_file):
+            attempts.append(spreadsheet_id)
+            if len(attempts) < 3:
+                raise _transient_error(503)
+            return MagicMock()
+
+        # Act
+        with patch("main.SheetsOutputWriter", side_effect=factory), \
+                patch("main.time.sleep") as mock_sleep, \
+                redirect_stdout(io.StringIO()):
+            writer = main.open_writer_with_retry(self.PROFILE, "sa.json")
+
+        # Assert: 3 回試行して成功、間に 2 回スリープ
+        self.assertIsNotNone(writer)
+        self.assertEqual(3, len(attempts))
+        self.assertEqual(2, mock_sleep.call_count)
+
+    def test_permanent_error_is_not_retried(self):
+        # Arrange: 共有剥奪 = 恒久エラー
+        attempts = []
+
+        def factory(spreadsheet_id, credentials_file):
+            attempts.append(spreadsheet_id)
+            raise _transient_error(404)
+
+        # Act / Assert: 1 回で諦めて送出（15 秒待たない）
+        with patch("main.SheetsOutputWriter", side_effect=factory), \
+                patch("main.time.sleep") as mock_sleep, \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaises(Exception):
+                main.open_writer_with_retry(self.PROFILE, "sa.json")
+
+        self.assertEqual(1, len(attempts))
+        mock_sleep.assert_not_called()
+
+    def test_raises_after_retries_are_exhausted(self):
+        # Arrange: ずっと 503
+        with patch("main.SheetsOutputWriter", side_effect=lambda **kw: (_ for _ in ()).throw(_transient_error(503))), \
+                patch("main.time.sleep"), \
+                redirect_stdout(io.StringIO()):
+            # Act / Assert
+            with self.assertRaises(Exception) as ctx:
+                main.open_writer_with_retry(self.PROFILE, "sa.json", delays=[1, 1])
+
+        self.assertIn("503", str(ctx.exception))
+
+    def test_no_delays_means_single_attempt(self):
+        attempts = []
+
+        def factory(spreadsheet_id, credentials_file):
+            attempts.append(1)
+            raise _transient_error(503)
+
+        with patch("main.SheetsOutputWriter", side_effect=factory), \
+                patch("main.time.sleep"), redirect_stdout(io.StringIO()):
+            with self.assertRaises(Exception):
+                main.open_writer_with_retry(self.PROFILE, "sa.json", delays=[])
+
+        self.assertEqual(1, len(attempts))
+
+
+class BuildWritersTest(unittest.TestCase):
+    """1つのプロファイルのシートが開けなくても、残りは動き続けること。
+
+    load_profiles() は env 欠落を黙って降格させ「本番の .env 更新漏れで
+    全社の記帳が止まる」のを防いでいる。しかし writer 生成は
+    gc.open_by_key() という実ネットワーク呼び出しを伴うため、受限フォルダの
+    共有設定を誤って外すと ido/rental が開けず、例外が main() を貫いて
+    健全な default まで道連れになる。タスクスケジューラが 1 分後に再起動 →
+    起動クラッシュループ。Chatwork 通知は廃止済みで監視手段が無く、
+    この停止は「今日は誰も票据を上げなかった」と見分けがつかない。
+    """
+
+    PROFILES = {
+        "default": {"label": "共通", "spreadsheet_id": "ss_default",
+                    "processed_folder_id": "p_d", "split_pdf_folder_id": ""},
+        "ido": {"label": "井戸会計事務所", "spreadsheet_id": "ss_ido",
+                "processed_folder_id": "p_i", "split_pdf_folder_id": ""},
+    }
+
+    def test_builds_one_writer_per_profile(self):
+        # Arrange / Act
+        with patch("main.SheetsOutputWriter") as mock_writer, \
+                redirect_stdout(io.StringIO()):
+            writers = main.build_writers(self.PROFILES, "sa.json")
+        # Assert
+        self.assertEqual({"default", "ido"}, set(writers))
+        self.assertEqual(mock_writer.call_count, 2)
+
+    def test_one_unopenable_sheet_does_not_kill_the_others(self):
+        # Arrange: ido のシートだけ開けない（共有剥奪 / 削除を模す）
+        def factory(spreadsheet_id, credentials_file):
+            if spreadsheet_id == "ss_ido":
+                raise Exception("SpreadsheetNotFound")
+            return MagicMock()
+        # Act
+        with patch("main.SheetsOutputWriter", side_effect=factory), \
+                redirect_stdout(io.StringIO()):
+            writers = main.build_writers(self.PROFILES, "sa.json")
+        # Assert: default は生き残る
+        self.assertEqual({"default"}, set(writers))
+
+    def test_returns_empty_when_every_sheet_fails(self):
+        # Arrange / Act
+        with patch("main.SheetsOutputWriter", side_effect=Exception("boom")), \
+                redirect_stdout(io.StringIO()):
+            writers = main.build_writers(self.PROFILES, "sa.json")
+        # Assert: 呼び出し側が exit(1) を判断できるよう空 dict を返す
+        self.assertEqual({}, writers)
+
+    def test_failure_is_reported_not_swallowed_silently(self):
+        # Arrange
+        buf = io.StringIO()
+        # Act
+        with patch("main.SheetsOutputWriter", side_effect=Exception("boom")), \
+                redirect_stdout(buf):
+            main.build_writers(self.PROFILES, "sa.json")
+        # Assert: ラベルと原因が標準出力に出る（無言の縮退は禁止）
+        out = buf.getvalue()
+        self.assertIn("共通", out)
+        self.assertIn("井戸会計事務所", out)
+        self.assertIn("boom", out)
+
+
+class FilterActiveFoldersTest(unittest.TestCase):
+    """writer が作れなかったプロファイルの入力フォルダは監視対象から外す。
+
+    外し忘れると主ループが writers[profile_key] で KeyError を出す。
+    """
+
+    FOLDER_MAP = {
+        "f_default": ("receipt", "default"),
+        "f_ido": ("receipt", "ido"),
+        "f_rental": ("receipt", "rental"),
+    }
+
+    def test_drops_folders_whose_profile_has_no_writer(self):
+        # Arrange / Act
+        active = main.filter_active_folders(self.FOLDER_MAP, {"default": object()})
+        # Assert
+        self.assertEqual({"f_default": ("receipt", "default")}, active)
+
+    def test_keeps_everything_when_all_profiles_have_writers(self):
+        # Arrange
+        writers = {"default": object(), "ido": object(), "rental": object()}
+        # Act / Assert
+        self.assertEqual(self.FOLDER_MAP,
+                         main.filter_active_folders(self.FOLDER_MAP, writers))
+
+    def test_returns_empty_when_no_writers(self):
+        self.assertEqual({}, main.filter_active_folders(self.FOLDER_MAP, {}))
 
 
 class UploadFileTest(unittest.TestCase):
