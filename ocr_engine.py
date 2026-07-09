@@ -1457,6 +1457,39 @@ ENTRY_BUILDERS = {
 }
 
 
+def _build_doc_result(doc_type, raw_data, entries):
+    """非領収書（請求書系・給与明細）の result dict を組み立てる。
+
+    entries が空なら必ず `_unrecognized` を立てる。これを怠ると
+    sheets_output.append_entries が1行も書かずに return し、main は
+    count=1 / error_pages=0 で Success 判定 → 原票がアーカイブされ、
+    明細ゼロのまま誰も気づかない（無音のデータ欠落）。
+
+    `_page_error` ではなく `_unrecognized` を使う理由: `_page_error` だと
+    count==error_pages で Failed 判定 → ファイル保持 → 明細を持たない書類
+    （封筒・挨拶状等）が毎回再試行される無限ループに入る。占位行を1行だけ
+    書いてアーカイブし、U列の赤タグで人手確認を促す。
+    """
+    vendor = raw_data.get("vendor", "")
+    if doc_type == DocType.SALARY_SLIP:
+        vendor = raw_data.get("employee_name", "")
+
+    unrecognized = not entries
+    if unrecognized:
+        print("⚠️ 有効な仕訳エントリが見つかりません → 認識不能として記録")
+
+    return {
+        "doc_type": doc_type,
+        "date": raw_data.get("date"),
+        "vendor": vendor,
+        "invoice_num": raw_data.get("invoice_num", ""),
+        # 認識不能行の摘要は _write_unrecognized_row に決めさせる（領収書経路と同じ）
+        "memo": "" if unrecognized else raw_data.get("memo", ""),
+        "entries": entries,
+        "_unrecognized": unrecognized,
+    }
+
+
 def _normalize_receipt_results(
     raw_data: object,
     prefix: str = "",
@@ -1748,22 +1781,17 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                 if raw_data:
                     builder = ENTRY_BUILDERS.get(doc_type)
                     if builder:
-                        entries = builder(raw_data)
-                        vendor = raw_data.get("vendor", "")
-                        if doc_type == DocType.SALARY_SLIP:
-                            vendor = raw_data.get("employee_name", "")
                         yield {
-                            "result": {
-                                "doc_type": doc_type,
-                                "date": raw_data.get("date"),
-                                "vendor": vendor,
-                                "invoice_num": raw_data.get("invoice_num", ""),
-                                "memo": raw_data.get("memo", ""),
-                                "entries": entries,
-                            },
+                            "result": _build_doc_result(
+                                doc_type, raw_data, builder(raw_data)),
                             "page_num": 1,
                             "total_pages": 1,
                         }
+                    else:
+                        # 単ページ経路と同じく必ず記録する。無言で yield 0 件だと
+                        # main が count==0 → Failed → ファイル保持 → 毎回再試行、
+                        # という無限ループの原因が追えなくなる。
+                        print(f"⚠️ エントリビルダーが未登録: {doc_type}")
                 else:
                     print("⚠️ AIの応答がJSONではありませんでした")
                 return
@@ -1823,21 +1851,8 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
             print(f"⚠️ エントリビルダーが未登録: {doc_type}")
             return
 
-        entries = builder(raw_data)
-
-        vendor = raw_data.get("vendor", "")
-        if doc_type == DocType.SALARY_SLIP:
-            vendor = raw_data.get("employee_name", "")
-
         yield {
-            "result": {
-                "doc_type": doc_type,
-                "date": raw_data.get("date"),
-                "vendor": vendor,
-                "invoice_num": raw_data.get("invoice_num", ""),
-                "memo": raw_data.get("memo", ""),
-                "entries": entries,
-            },
+            "result": _build_doc_result(doc_type, raw_data, builder(raw_data)),
             "page_num": 1,
             "total_pages": 1,
         }
