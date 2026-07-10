@@ -13,7 +13,8 @@ try:
 except ImportError:
     vision = None
 from dotenv import load_dotenv
-from doc_types import DocType, DOC_TYPE_CONFIG
+from doc_types import (DocType, DOC_TYPE_CONFIG, DOC_TYPE_TAB_SUFFIX,
+                       ENV_FOLDER_MAP)
 from receipt_aggregation import (
     KEIYUZEI_DEBIT_ACCOUNT,
     TOTAL_MISMATCH_TOLERANCE_YEN,
@@ -1455,6 +1456,41 @@ ENTRY_BUILDERS = {
     DocType.SALES_INVOICE: _build_entries_from_sales_invoice,
     DocType.SALARY_SLIP: _build_entries_from_salary_slip,
 }
+
+
+def _validate_doc_type_registries(doc_types=None, registries=None):
+    """全 DocType が各登録表に漏れなく登録済みかを import 時に検査する。
+
+    登録漏れは起動時エラーにならず、運用中の静かな事故としてしか顕在化しない:
+    ENTRY_BUILDERS 漏れ → 1件も yield せず count==0 → Failed → ファイル保持
+    → 3秒ごとの再試行で Gemini を無限に焼く。PROMPTS 漏れ → 同じ無限再試行
+    ループ（Gemini 消費なしだがフォルダが永久に詰まる）。DOC_TYPE_TAB_SUFFIX
+    漏れ → 「領収書」タブへの静かな誤書き込み。ENV_FOLDER_MAP 漏れ →
+    フォルダが監視されず新タイプが静かに不活性。真値来源は DocType.ALL
+    （CLAUDE.md の同期チェックリストの機械可読版）。
+    """
+    doc_types = DocType.ALL if doc_types is None else doc_types
+    if registries is None:
+        registries = {
+            "PROMPTS": PROMPTS,
+            "ENTRY_BUILDERS": ENTRY_BUILDERS,
+            "DOC_TYPE_CONFIG": DOC_TYPE_CONFIG,
+            "DOC_TYPE_TAB_SUFFIX": DOC_TYPE_TAB_SUFFIX,
+            # ENV_FOLDER_MAP は {環境変数名: DocType} なので values 側で照合
+            "ENV_FOLDER_MAP": set(ENV_FOLDER_MAP.values()),
+        }
+    problems = []
+    for name, table in registries.items():
+        missing = [dt for dt in doc_types if dt not in table]
+        if missing:
+            problems.append(f"{name} 未登録: {missing}")
+    if problems:
+        raise RuntimeError(
+            "DocType 登録表に漏れがあります — " + " / ".join(problems) +
+            "（新文書タイプ追加時は CLAUDE.md の同期チェックリスト参照）")
+
+
+_validate_doc_type_registries()
 
 
 def _build_doc_result(doc_type, raw_data, entries):

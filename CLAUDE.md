@@ -66,7 +66,9 @@ PaddleOCR 先抽文本，再按 `config.OCR_STRATEGY` (默认 "C") 路由：
 7. `tag_rules.py`: 异常 severity → U 列标签 (赤系/橙系/黄系)
 
 ### 文书类型（`doc_types.py`）
-`DocType` 四类：receipt / purchase_invoice / sales_invoice / salary_slip。各类有专属 Gemini prompt (`ocr_engine.PROMPTS`)、专属 `_build_entries_from_*` 仕訳构造、专属默认科目。新增文书类型需同步：DocType 常量、DOC_TYPE_CONFIG、ENV_FOLDER_MAP、PROMPTS、_build_entries_from_*、DOC_TYPE_TAB_SUFFIX。
+`DocType` 四类：receipt / purchase_invoice / sales_invoice / salary_slip。各类有专属 Gemini prompt (`ocr_engine.PROMPTS`)、专属 `_build_entries_from_*` 仕訳构造、专属默认科目。新增文书类型需同步：DocType 常量、DOC_TYPE_CONFIG、ENV_FOLDER_MAP、PROMPTS、`_build_entries_from_*`、**`ocr_engine.ENTRY_BUILDERS`**、DOC_TYPE_TAB_SUFFIX。
+
+**`ENTRY_BUILDERS` 极易漏**：它是 `DocType → _build_entries_from_*` 的分发表 (`ocr_engine.py`)。写了 builder 函数却不注册进表，等于没写。历史危害：漏注册当时不会在启动时报错——`ENTRY_BUILDERS.get(doc_type)` 返回 `None` → 一行都不 yield → `main.process_file` 数到 `count==0` → 判 Failed → **保留文件不归档** → 3 秒后再次扫到 → 无限重试，每圈烧一次 Gemini 调用。现由 `ocr_engine._validate_doc_type_registries` 在 import 时对 `DocType.ALL` 校验五张注册表（PROMPTS / ENTRY_BUILDERS / DOC_TYPE_CONFIG / DOC_TYPE_TAB_SUFFIX / ENV_FOLDER_MAP），漏一处启动即 RuntimeError（配套测试 `test_doc_type_registries.py`）。
 
 ### 多文件夹监听（`config.load_folder_map`）
 `.env` 按文书类型配多个文件夹 ID (`FOLDER_RECEIPT_ID` 等)，映射为 `{folder_id: doc_type}`。兼容旧的单文件夹 `INPUT_FOLDER_ID` (默认 receipt)。上传者身份从 Drive `lastModifyingUser` email → `config.EMPLOYEE_MAP` 解析。
