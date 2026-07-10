@@ -281,17 +281,15 @@ class UnrecognizedReachesSheetRowTest(unittest.TestCase):
         self.assertEqual(row[5], "テスト商事")
         self.assertEqual(row[27], "http://origin/x.pdf")
 
-    def test_without_unrecognized_flag_nothing_is_written(self):
-        """characterization テスト: sheets_output の「危険な」現状を記録する。
+    def test_without_unrecognized_flag_placeholder_is_written(self):
+        """防御ガード導入済み: 無標記の空 entries でも占位行が書かれる。
 
-        これは是認された仕様ではない。無標記の空 entries を渡すと 1 行も
-        書かれず静かに戻る = データ欠落の着弾点そのもの。安全網は
-        「producer 側が決してこの形を作らない」ことだけであり、それは
-        YieldInvariantTest が保証している。将来 append_entries 側に
-        防御ガード（無標記の空 entries も占位行を書く / 例外を投げる）を
-        入れるなら、本テストは反転させること。
+        旧 characterization テスト（無標記なら 1 行も書かれない = データ
+        欠落の着弾点）の反転版。append_entries 側が最終防衛として占位行を
+        書くため、producer がフラグを立て忘れても無音欠落しない。
+        producer 側の保証（YieldInvariantTest）と二重防御になる。
         """
-        # Arrange: 修正前の result 形（_unrecognized 無し・明細ゼロ）を再現
+        # Arrange: フラグ立て忘れの result 形（_unrecognized 無し・明細ゼロ）
         buggy = {"doc_type": DocType.PURCHASE_INVOICE, "date": "2026-07-09",
                  "vendor": "テスト商事", "invoice_num": "", "memo": "",
                  "entries": []}
@@ -299,10 +297,10 @@ class UnrecognizedReachesSheetRowTest(unittest.TestCase):
         # Act
         written = _append_via_real_writer(buggy)
 
-        # Assert: 1 行も書かれない = これが Success 判定と結びつくと原票が
-        # 明細ゼロのままアーカイブされる。修正がこの形を生まないことは
-        # InvoiceEmptyItemsTest が保証する。
-        self.assertEqual(written, [])
+        # Assert: 赤タグ付き占位行が 1 行書かれ、人手確認へ可視化される
+        self.assertEqual(len(written), 1)
+        self.assertEqual(written[0][TAG_COL_INDEX], UNRECOGNIZED_TAG)
+        self.assertEqual(written[0][5], "テスト商事")
 
 
 class InvoiceGeminiFailureTest(unittest.TestCase):

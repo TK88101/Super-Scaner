@@ -467,5 +467,82 @@ class GridCapacityTest(unittest.TestCase):
         self.assertTrue(True)
 
 
+class AppendEntriesSilentLossGuardTest(unittest.TestCase):
+    """仕訳ゼロページの無音データ欠落防止（占位行への兜底）。
+
+    上流が `_unrecognized` を立て忘れた entries=[]、および全 entry が金額
+    0/None で書き込み行が残らないケースは、従来 1 行も書かずに return し、
+    main は Success 判定 → 原票アーカイブ → 誰も気づかない欠落になっていた。
+    どちらも認識不能の占位行（赤タグ）を書くことを固定する。
+    """
+
+    def _run(self, data):
+        """append_entries を fake ws で実行し、占位行呼び出しと ws を返す。"""
+        writer = _make_writer()
+        ws = _FakeWorksheet()
+        placeholder_calls = []
+
+        def fake_unrecognized(self, worksheet, tab_name, entries_data,
+                              source_url):
+            placeholder_calls.append((tab_name, entries_data, source_url))
+
+        with patch.object(SheetsOutputWriter, "_get_or_create_tab",
+                          return_value=ws), \
+             patch.object(SheetsOutputWriter, "_write_unrecognized_row",
+                          fake_unrecognized), \
+             patch.object(SheetsOutputWriter, "_apply_anomaly_highlight",
+                          lambda self, w, r, f: None), \
+             patch.object(SheetsOutputWriter, "_format_with_retry",
+                          lambda self, w, ref, fmt, max_retries=5: None):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                writer.append_entries("従業員", DocType.RECEIPT, data,
+                                      source_url="http://x")
+        return placeholder_calls, ws, buf.getvalue()
+
+    @staticmethod
+    def _data(entries, **extra):
+        base = {"date": "", "vendor": "", "invoice_num": "", "memo": "",
+                "entries": entries}
+        base.update(extra)
+        return base
+
+    def test_missing_unrecognized_flag_still_writes_placeholder(self):
+        # Arrange: entries=[] かつ _unrecognized 無し（上流のフラグ漏れを模す）
+        # Act
+        calls, ws, out = self._run(self._data([]))
+        # Assert: 無音 return せず占位行を1回書く（通常行は書かない）
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(ws.appended, [])
+        self.assertIn("認識不能として記録", out)
+
+    def test_unrecognized_flag_writes_placeholder(self):
+        # Arrange: 既存経路（_unrecognized=True）の挙動維持
+        # Act
+        calls, ws, _ = self._run(self._data([], _unrecognized=True))
+        # Assert
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(ws.appended, [])
+
+    def test_all_zero_amount_entries_write_placeholder(self):
+        # Arrange: entries はあるが全行 金額0/None → rows が空になるケース
+        entries = [_entry(0), {"amount": None, "debit_account": "備品・消耗品費",
+                               "description": "商品", "credit_account": "未払金"}]
+        # Act
+        calls, ws, out = self._run(self._data(entries))
+        # Assert: 通常行ゼロ + 占位行1回 + 可観測ログ
+        self.assertEqual(ws.appended, [])
+        self.assertEqual(len(calls), 1)
+        self.assertIn("認識不能として記録", out)
+
+    def test_valid_entries_do_not_write_placeholder(self):
+        # Arrange: 有効金額があれば従来通り通常行のみ
+        # Act
+        calls, ws, _ = self._run(self._data([_entry(1000)]))
+        # Assert
+        self.assertEqual(len(ws.appended), 1)
+        self.assertEqual(calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()
