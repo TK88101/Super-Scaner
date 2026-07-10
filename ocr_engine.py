@@ -1725,8 +1725,26 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                         continue
 
                     if not page_raw_data:
+                        # 無声 skip 禁止: yield しないと部分失敗時に main が
+                        # error_pages=0 → Success 判定 → 原票アーカイブで
+                        # このページのデータが無音欠落する（例外経路と同扱い）
                         failed_pages += 1
                         print(f"{prefix}⚠️ AIの応答がJSONではありませんでした")
+                        yield {
+                            "result": {
+                                "date": "",
+                                "vendor": "",
+                                "invoice_num": "",
+                                "memo": "AI応答のJSON解析失敗",
+                                "entries": [],
+                                "_unrecognized": True,
+                                "_page_error": True,
+                            },
+                            "page_num": idx,
+                            "total_pages": total,
+                            "page_bytes": page_data,
+                        }
+                        gc.collect()
                         continue
 
                     # ── 封筒・非領収書ページ検出（コードレベル強制フィルタ）──
