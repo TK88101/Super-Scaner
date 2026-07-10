@@ -456,25 +456,66 @@ def _extract_date_from_ocr(ocr_text):
 
     # パターン1: 2026年1月27日, 2026年 1月27日（火）, 2026年01月10日
     # 宣伝文（終了/有効期限/まで/開始）や納期限の日付を除外し、取引日を優先
+    # 請求書の支払期日は取引日ではない（Session 16 統一逐頁化で多頁請求書が
+    # 本経路に新規露出したため追加。多欄レイアウトは OCR 読み順が不定で、
+    # 支払期限が発行日より先に読まれると誤って仕訳日付を上書きしてしまう）
     _skip_keywords = ["終了", "有効期限", "まで", "開始", "お知らせ", "変更",
                       "ご利用ください", "ポイント", "カード", "キャンペーン",
                       "納期限", "纳期限", "提出期限", "届出期限"]
+    # 支払期日系語彙は対称窓（前後50文字）ではなく「日付の前」窓のみで判定する。
+    # 日本の請求書は「発行日 2026年3月1日 支払期限 2026年3月31日」のように
+    # 発行日が支払期限より先に書かれるのが定石（ラベル→日付の順）。対称窓の
+    # ままだと発行日側の後方50文字に「支払期限」が入ってしまい発行日まで
+    # 誤ってスキップされ、全滅後のフォールバックで支払期限日付を誤採用して
+    # しまう（codex review 発見）。前方窓のみにすることで、支払期限自身の
+    # 直前ラベルは引き続き検知しつつ、先に書かれた発行日は巻き込まない。
+    _due_date_prefix_keywords = ["支払期限", "支払期日", "お支払期限", "お支払期日",
+                                 "振込期限", "振込期日"]
+    # フォールバック候補プール: _skip_keywords（対称窓）で skip された日付は
+    # 従来通りフォールバック対象に残す（receipt 生産調校済みの既存挙動）。
+    # 一方 _due_date_prefix_keywords（支払期限等）で skip された日付は
+    # 取引日ではないと判定済みなので、プールから完全に除外する（codex Round 3
+    # 発見: 従来は matches_p1[-1] がフィルタ前の生マッチ一覧を見ていたため、
+    # OCR テキストに支払期限しか無いケースで支払期限日付がそのまま
+    # フォールバック採用され、Gemini の正しい発行日を上書きしていた）。
     matches_p1 = list(re.finditer(r'(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', ocr_text))
+    fallback_pool_p1 = []
+    prev_end_p1 = 0  # 直前マッチの終端。前方窓が前の日付のラベルまで
+    # 誤って跨がないよう、prefix 窓の起点を prev_end で切り詰める
+    # （「支払期限 A 発行日 B」で B の前方窓に A のラベルが混入し
+    # B まで誤って支払期日扱いされるのを防ぐ）。
     for m in matches_p1:
         ctx = ocr_text[max(0, m.start()-50):min(len(ocr_text), m.end()+50)]
         if any(kw in ctx for kw in _skip_keywords):
+            fallback_pool_p1.append(m)
+            prev_end_p1 = m.end()
+            continue
+        ctx_prefix = ocr_text[max(0, m.start()-50, prev_end_p1):m.start()]
+        if any(kw in ctx_prefix for kw in _due_date_prefix_keywords):
+            prev_end_p1 = m.end()
             continue
         return f"{m.group(1)}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
-    if matches_p1:
-        m = matches_p1[-1]
+    if fallback_pool_p1:
+        m = fallback_pool_p1[-1]
         return f"{m.group(1)}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
 
     # パターン2: 26年 1月14日 (西暦下2桁) or 8年 1月7日 (令和1桁)
     # 納期限等の非取引日を除外し、発行日・取引日を優先
+    # （支払期日系語彙の前方窓判定はパターン1と同一の理由で一貫して適用する）
+    # パターン1 と同一方針: due_date 系は skip されたら完全に除外、
+    # 対称窓 skip 系は従来通りフォールバックプールに残す。
     matches_p2 = list(re.finditer(r'(?<!\d)(\d{1,2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日', ocr_text))
+    fallback_pool_p2 = []
+    prev_end_p2 = 0  # パターン1と同一理由の前方窓切り詰め
     for m in matches_p2:
         ctx = ocr_text[max(0, m.start()-50):min(len(ocr_text), m.end()+50)]
         if any(kw in ctx for kw in _skip_keywords):
+            fallback_pool_p2.append(m)
+            prev_end_p2 = m.end()
+            continue
+        ctx_prefix = ocr_text[max(0, m.start()-50, prev_end_p2):m.start()]
+        if any(kw in ctx_prefix for kw in _due_date_prefix_keywords):
+            prev_end_p2 = m.end()
             continue
         year = int(m.group(1))
         if year <= 10:
@@ -482,8 +523,8 @@ def _extract_date_from_ocr(ocr_text):
         elif year <= 99:
             year = 2000 + year
         return f"{year}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
-    if matches_p2:
-        m = matches_p2[-1]
+    if fallback_pool_p2:
+        m = fallback_pool_p2[-1]
         year = int(m.group(1))
         if year <= 10:
             year = 2018 + year
@@ -1641,6 +1682,55 @@ def _route_ocr_strategy(
     return raw_data, ocr_text, ocr_conf
 
 
+def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix=""):
+    """1ページ分の解析結果を doc_type 別に整形して result dict を yield する。
+
+    process_pipeline の「PDF 逐頁ループ」と「単ページ PDF/画像（尾段）」は
+    以前どちらも _apply_ocr_overrides → doc_type 別ルーティング → result dict
+    生成、という同じ整形ロジックを逐字コピーで持っており、2 箇所平行メンテ
+    による漂移リスクを抱えていた（CLAUDE.md に記録されている ENTRY_BUILDERS
+    未登録事故と同族——片方だけ直して片方を直し忘れる類の事故）。本関数へ
+    一本化し、呼び出し側は page_num/total_pages/page_bytes 等のページメタ
+    情報を付与してラップするだけにする。
+
+    封筒/非領収書ページ判定 (_is_envelope_page) はループ側のみの関心事のため
+    ここには含めない（尾段には元々その判定が存在しない——挙動を変えない）。
+
+    Yields:
+        dict: result dict そのもの（page_num 等は含まない。呼び出し側が付与）
+    """
+    _apply_ocr_overrides(raw_data, ocr_text, prefix)
+
+    if doc_type == DocType.RECEIPT:
+        page_results = _normalize_receipt_results(
+            raw_data, prefix=prefix, ocr_confidence=ocr_conf)
+        if not page_results:
+            print(f"{prefix}⚠️ 有効な仕訳エントリが見つかりません → 認識不能として記録")
+            p_date, p_vendor = _extract_partial_data(raw_data)
+            yield {
+                "date": p_date,
+                "vendor": p_vendor,
+                "invoice_num": "",
+                "memo": "",
+                "entries": [],
+                "_unrecognized": True,
+            }
+            return
+        for entry in page_results:
+            yield entry
+        return
+
+    # ── 非領収書（請求書系・給与明細）: builder 適用 ──
+    builder = ENTRY_BUILDERS.get(doc_type)
+    if not builder:
+        # DocType.ALL 全件が import 時に _validate_doc_type_registries
+        # で検査済みのため到達しないはずだが、防御的に記録だけして進む。
+        print(f"{prefix}⚠️ エントリビルダーが未登録: {doc_type}")
+        return
+
+    yield _build_doc_result(doc_type, raw_data, builder(raw_data))
+
+
 def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, start_page=1):
     """
     文書を分析し、仕訳データを逐次 yield するジェネレータ。
@@ -1677,8 +1767,13 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
 
         mime_type = _get_mime_type(file_path)
 
-        # ── 領収書 PDF: 1ページずつ yield（各ページ独立）──
-        if doc_type == DocType.RECEIPT and mime_type == "application/pdf":
+        # ── PDF: 1ページずつ yield（各ページ独立、全文書タイプ共通）──
+        # Session 16 以前は非領収書 PDF のみ「全ページ OCR テキストを結合し
+        # 1回だけ Gemini を呼ぶ」分岐が別にあったが、大型 PDF で出力が
+        # MAX_TOKENS に達し JSON が途中切断される生産事故が発生した。
+        # 「1冊まるごと1レスポンス」を出力させる設計自体が原因のため、
+        # 対症療法ではなく全文書タイプをこの逐頁分岐に統一して根絶する。
+        if mime_type == "application/pdf":
             page_gen = _split_pdf_pages(file_path)
             first_page = next(page_gen, None)
             if first_page is not None:
@@ -1748,36 +1843,21 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                         continue
 
                     # ── 封筒・非領収書ページ検出（コードレベル強制フィルタ）──
-                    if _is_envelope_page(ocr_text, page_raw_data):
+                    # Session 16 裁決: この判定の構造キーワード（「領収」「請求書」
+                    # 「合計」等）は領収書向けに調整されたヒューリスティックであり、
+                    # 給与明細等の非領収書ページ（短文の明細ページ等）に誤爆すると
+                    # skip（yield されない）→ count==0 → Failed → 無限リトライ、
+                    # あるいは無音のページ欠落を引き起こす。よって RECEIPT に限定
+                    # する。非領収書の実際の封筒/送付状ページは _build_doc_result
+                    # の _unrecognized 占位行で可視化・アーカイブされるため兜は残る。
+                    if doc_type == DocType.RECEIPT and _is_envelope_page(ocr_text, page_raw_data):
                         print(f"{prefix}📨 封筒/非領収書ページを検出、スキップします")
                         continue
 
-                    # OCR テキストから日付・T番号を抽出し Gemini 結果を上書き
-                    _apply_ocr_overrides(page_raw_data, ocr_text, prefix)
-
-                    page_results = _normalize_receipt_results(
-                        page_raw_data, prefix=prefix, ocr_confidence=ocr_conf)
-                    if not page_results:
-                        print(f"{prefix}⚠️ 有効な仕訳エントリが見つかりません → 認識不能として記録")
-                        p_date, p_vendor = _extract_partial_data(page_raw_data)
-                        yield {
-                            "result": {
-                                "date": p_date,
-                                "vendor": p_vendor,
-                                "invoice_num": "",
-                                "memo": "",
-                                "entries": [],
-                                "_unrecognized": True,
-                            },
-                            "page_num": idx,
-                            "total_pages": total,
-                            "page_bytes": page_data,
-                        }
-                        yielded += 1
-                        gc.collect()
-                        continue
-
-                    for entry in page_results:
+                    # OCR オーバーライド → doc_type別ルーティング → result dict 整形
+                    # は _yield_page_results に一本化済み（尾段と共通ロジック）
+                    for entry in _yield_page_results(
+                            doc_type, page_raw_data, ocr_text, ocr_conf, prefix=prefix):
                         yield {
                             "result": entry,
                             "page_num": idx,
@@ -1796,61 +1876,9 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                     print("⚠️ PDF分割解析でも有効結果を取得できませんでした")
                 return
 
-        # ── 非領収書 PDF: 逐ページ OCR → 合併テキスト → 1回 Gemini ──
-        if mime_type == "application/pdf":
-            page_gen = _split_pdf_pages(file_path)
-            first_page = next(page_gen, None)
-            if first_page is not None:
-                total = first_page["total_pages"]
-                print(f"📄 多ページPDF: {total}ページを逐次OCR→統合解析します")
-                all_ocr_texts = []
-                for pg in itertools.chain([first_page], page_gen):
-                    # 再開指定時、対象ページ未満はスキップ
-                    if pg["page_num"] < start_page:
-                        continue
-                    prefix = f"[p{pg['page_num']}] "
-                    pg_text, _ = _ocr_with_paddleocr(pg["data"], "application/pdf")
-                    all_ocr_texts.append(pg_text)
-                    print(f"{prefix}OCR完了 ({len(pg_text)}文字)")
-                    gc.collect()
-
-                combined_ocr = "\n---PAGE BREAK---\n".join(all_ocr_texts)
-                del all_ocr_texts
-
-                with open(file_path, "rb") as f:
-                    file_data = f.read()
-                if ocr_strategy == "C":
-                    raw_data = _call_gemini_cross_validate(combined_ocr, file_data, mime_type, prompt)
-                elif ocr_strategy == "B":
-                    raw_data = _call_gemini_cross_validate(combined_ocr, file_data, mime_type, prompt)
-                else:
-                    raw_data = _call_gemini_text(combined_ocr, prompt)
-                del file_data
-                gc.collect()
-
-                if not raw_data:
-                    print("🔄 フォールバック: Gemini Vision で再試行")
-                    raw_data = _call_gemini(file_path, prompt)
-
-                if raw_data:
-                    builder = ENTRY_BUILDERS.get(doc_type)
-                    if builder:
-                        yield {
-                            "result": _build_doc_result(
-                                doc_type, raw_data, builder(raw_data)),
-                            "page_num": 1,
-                            "total_pages": 1,
-                        }
-                    else:
-                        # 単ページ経路と同じく必ず記録する。無言で yield 0 件だと
-                        # main が count==0 → Failed → ファイル保持 → 毎回再試行、
-                        # という無限ループの原因が追えなくなる。
-                        print(f"⚠️ エントリビルダーが未登録: {doc_type}")
-                else:
-                    print("⚠️ AIの応答がJSONではありませんでした")
-                return
-
         # ── 単ページ PDF / 画像ファイル: 従来通り処理 ──
+        # 複数ページ PDF は上の逐頁分岐で必ず処理・return 済み。ここに到達するのは
+        # 画像ファイル、または _split_pdf_pages が何も返さない単ページ PDF のみ。
         raw_data = None
         ocr_text = ""
         with open(file_path, "rb") as f:
@@ -1869,47 +1897,15 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
             print("⚠️ AIの応答がJSONではありませんでした")
             return
 
-        # OCR テキストから日付・T番号を抽出し Gemini 結果を上書き
-        _apply_ocr_overrides(raw_data, ocr_text)
-
-        # ── 領収書処理（単ページ PDF / 画像）──
-        if doc_type == DocType.RECEIPT:
-            results = _normalize_receipt_results(
-                raw_data, ocr_confidence=ocr_conf)
-            if not results:
-                p_date, p_vendor = _extract_partial_data(raw_data)
-                yield {
-                    "result": {
-                        "date": p_date,
-                        "vendor": p_vendor,
-                        "invoice_num": "",
-                        "memo": "",
-                        "entries": [],
-                        "_unrecognized": True,
-                    },
-                    "page_num": 1,
-                    "total_pages": 1,
-                }
-                return
-            for entry in results:
-                yield {
-                    "result": entry,
-                    "page_num": 1,
-                    "total_pages": 1,
-                }
-            return
-
-        # ── 通常パス（他の文書タイプ、単ページ / 画像）──
-        builder = ENTRY_BUILDERS.get(doc_type)
-        if not builder:
-            print(f"⚠️ エントリビルダーが未登録: {doc_type}")
-            return
-
-        yield {
-            "result": _build_doc_result(doc_type, raw_data, builder(raw_data)),
-            "page_num": 1,
-            "total_pages": 1,
-        }
+        # OCR オーバーライド → doc_type別ルーティング → result dict 整形
+        # は _yield_page_results に一本化済み（PDF 逐頁ループと共通ロジック）。
+        # 封筒判定は元々この経路には無かったため呼ばない（挙動を変えない）。
+        for entry in _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf):
+            yield {
+                "result": entry,
+                "page_num": 1,
+                "total_pages": 1,
+            }
 
     except Exception as e:
         print(f"❌ 解析失敗: {e}")

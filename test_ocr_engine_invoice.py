@@ -1,16 +1,34 @@
 """ocr_engine の非領収書（請求書系）多ページ PDF 分岐の単体テスト。
 
-この分岐（ocr_engine.process_pipeline 内「非領収書 PDF」節）は全ページの OCR
-テキストを結合し 1 回だけ Gemini を呼ぶ。領収書分岐と違い、結果が空だったとき
-に `_unrecognized` / `_page_error` のどちらも立てていなかったため、
+Session 16 更新: 旧「非領収書 PDF」分岐（全ページの OCR テキストを結合し
+1 回だけ Gemini を呼ぶ）は、大型 PDF で出力が MAX_TOKENS に達し JSON が
+途中切断される生産事故を起こしたため全廃した。現在は領収書分岐と同じ
+「1 ページ = 1 Gemini 呼び出し」に統一されている（詳細は
+test_ocr_engine_invoice_pipeline.py）。本ファイルの `_run_pipeline` は
+その逐頁分岐を `_route_ocr_strategy` レベルでモックして通す形に改めた。
+
+本ファイルが固定する不変条件（逐頁化後も維持）:
 
   Gemini が正常な JSON を返したが明細 0 件 → entries=[] のまま yield
-    → main.process_file は count=1 / error_pages=0 と数える
+    → main.process_file は count>0 / error_pages=0 と数える
     → sheets_output.append_entries は entries=[] かつ _unrecognized 無しで
        1 行も書かずに静かに return
     → count>0 なので「Success」通知 + 原票アーカイブ
 
-という無音のデータ欠落が起きていた。本テストはその判定を固定する。
+という無音のデータ欠落が起きないこと。
+
+Session 16 重複覆蓋收斂: test_ocr_engine_invoice_pipeline.py 新設に伴い、
+以下は重複のため本ファイルから削除し、断言の欠落なく新檔へ引き継いだ
+（詳細は各削除箇所を参照）:
+  - InvoiceHappyPathTest（多頁独立 yield 場面 → 新檔
+    EachPageYieldedIndependentlyTest.test_two_pages_each_yield_own_result）
+  - InvoiceGeminiFailureTest.test_no_raw_data_yields_page_error_for_every_page
+    （vision.call_count==2 断言は新檔
+    PartialPageFailureTest.test_all_pages_fail_yields_all_page_errors へ移設）
+  - InvoiceEmptyItemsTest.test_empty_items_marks_unrecognized（新檔
+    EmptyEntriesMarkedUnrecognizedWithoutPageErrorTest で完全カバー済み）
+本ファイルは単頁 PDF/画像経路・実物 writer 経路・横断不変式など
+新檔がカバーしない固有シナリオのみを残す。
 
 ocr_engine は paddleocr / google.generativeai / pdf2image 等の重依存を
 import するため venv311 で実行する:
@@ -31,14 +49,16 @@ import ocr_engine
 from doc_types import DocType
 from sheets_output import SheetsOutputWriter, TAG_COL_INDEX
 from tag_rules import UNRECOGNIZED_TAG
+# Session 16 重複覆蓋收斂: _empty_invoice_raw は本ファイルと
+# test_ocr_engine_invoice_pipeline.py の両方で個別維持されていたため漂移
+# （date が "2026/07/09" と "2026-07-09" に分岐）した。単一定義に収斂し、
+# 新檔から import する。
+from test_ocr_engine_invoice_pipeline import _empty_invoice_raw
 
 
-def _empty_invoice_raw():
-    """明細ゼロの Gemini 応答（正常な JSON だが items が空）。
-
-    共有 dict を使い回すとテストが相互汚染しうるので、毎回新しく作る。
-    """
-    return {"date": "2026-07-09", "vendor": "テスト商事", "items": []}
+# 封筒/送付状/裏面メモ判定 (_is_envelope_page) に落ちないよう「請求書」構造
+# キーワードを含める（短文 + 構造キーワード無しは裏面メモ扱いで無条件 skip される）
+_VALID_OCR_TEXT = "請求書 テスト商事 合計10,000円 振込"
 
 
 def _two_pdf_pages():
@@ -54,45 +74,44 @@ def _two_pdf_pages():
 
 
 def _run_pipeline(gemini_raw, doc_type=DocType.PURCHASE_INVOICE):
-    """非領収書 PDF 分岐を通し、yield された結果を全件返す。
+    """非領収書 PDF 分岐（逐頁化後）を通し、yield された結果を全件返す。
 
-    gemini_raw: _call_gemini_cross_validate の戻り値（None なら Vision 兜底も失敗扱い）
+    Session 16 逐頁化により本分岐は領収書分岐と同じくページ単位で
+    `_route_ocr_strategy` を呼ぶため、直接それをモックする。
+    gemini_raw を両ページに同一適用し（None なら両ページとも一次経路失敗、
+    Vision 兜底 `_call_gemini_bytes` も失敗扱い）、旧テストの「1回の
+    Gemini 応答」という前提を「各ページが同じ応答を受け取った」場合に
+    読み替える。
     """
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(b"%PDF-1.4 dummy")
         path = tmp.name
 
+    route = [(gemini_raw, _VALID_OCR_TEXT, 0.95), (gemini_raw, _VALID_OCR_TEXT, 0.95)]
+
     try:
         with mock.patch.object(ocr_engine, "_split_pdf_pages",
                                return_value=_two_pdf_pages()), \
-             mock.patch.object(ocr_engine, "_ocr_with_paddleocr",
-                               return_value=("OCRテキスト", 0.95)), \
-             mock.patch.object(ocr_engine, "_call_gemini_cross_validate",
-                               return_value=gemini_raw), \
-             mock.patch.object(ocr_engine, "_call_gemini",
+             mock.patch.object(ocr_engine, "_route_ocr_strategy",
+                               side_effect=route), \
+             mock.patch.object(ocr_engine, "_call_gemini_bytes",
                                return_value=None) as vision:
-            pages = list(ocr_engine.process_pipeline(
-                path, doc_type=doc_type, ocr_strategy="C"))
+            with redirect_stdout(io.StringIO()):
+                pages = list(ocr_engine.process_pipeline(
+                    path, doc_type=doc_type, ocr_strategy="C"))
         return pages, vision
     finally:
         os.unlink(path)
 
 
 class InvoiceEmptyItemsTest(unittest.TestCase):
-    """Gemini が JSON を返したが明細 0 件のケース。"""
+    """Gemini が JSON を返したが明細 0 件のケース。
 
-    def test_empty_items_marks_unrecognized(self):
-        # Arrange: 正常な JSON だが items が空（Gemini の抽出漏れ / 明細無し書類）
-        raw = _empty_invoice_raw()
-
-        # Act
-        pages, _ = _run_pipeline(raw)
-
-        # Assert: 1 件 yield され、_unrecognized が立っている
-        # （立っていないと sheets_output が 1 行も書かずに Success になる）
-        self.assertEqual(len(pages), 1)
-        self.assertTrue(pages[0]["result"].get("_unrecognized"))
-        self.assertEqual(pages[0]["result"]["entries"], [])
+    Session 16 重複覆蓋收斂: test_empty_items_marks_unrecognized は
+    test_ocr_engine_invoice_pipeline.py の
+    EmptyEntriesMarkedUnrecognizedWithoutPageErrorTest で完全カバーされる
+    ため削除した。全零金額・vendor traceability は本ファイル固有のため残す。
+    """
 
     def test_all_zero_amount_items_marks_unrecognized(self):
         # Arrange: items はあるが全て amount=0 → builder が全件 continue し entries=[]
@@ -106,8 +125,9 @@ class InvoiceEmptyItemsTest(unittest.TestCase):
         pages, _ = _run_pipeline(raw)
 
         # Assert
-        self.assertEqual(len(pages), 1)
-        self.assertTrue(pages[0]["result"].get("_unrecognized"))
+        self.assertEqual(len(pages), 2)
+        for page in pages:
+            self.assertTrue(page["result"].get("_unrecognized"))
 
     def test_unrecognized_result_carries_vendor_for_traceability(self):
         # Arrange: 明細は取れなかったが vendor は読めている
@@ -118,30 +138,12 @@ class InvoiceEmptyItemsTest(unittest.TestCase):
 
         # Assert: 占位行から原票を辿れるよう vendor / date は保持する
         self.assertEqual(pages[0]["result"]["vendor"], "テスト商事")
-        self.assertEqual(pages[0]["result"]["date"], "2026-07-09")
+        self.assertEqual(pages[0]["result"]["date"], "2026/07/09")
 
 
-class InvoiceHappyPathTest(unittest.TestCase):
-    """明細が取れた通常ケースは従来通り（回帰保護）。"""
-
-    def test_valid_items_yield_entries_without_unrecognized(self):
-        # Arrange
-        raw = {
-            "date": "2026-07-09",
-            "vendor": "テスト商事",
-            "payment_method": "振込",
-            "items": [{"description": "備品", "amount": 1000, "tax_rate": 0.10}],
-        }
-
-        # Act
-        pages, _ = _run_pipeline(raw)
-
-        # Assert
-        self.assertEqual(len(pages), 1)
-        result = pages[0]["result"]
-        self.assertFalse(result.get("_unrecognized"))
-        self.assertEqual(len(result["entries"]), 1)
-        self.assertEqual(result["entries"][0]["amount"], 1000)
+# Session 16 重複覆蓋收斂: InvoiceHappyPathTest（多頁独立 yield 場面）は
+# test_ocr_engine_invoice_pipeline.py の EachPageYieldedIndependentlyTest.
+# test_two_pages_each_yield_own_result で完全カバーされるため削除した。
 
 
 def _run_single_page_pipeline(gemini_raw, suffix=".jpg",
@@ -303,21 +305,11 @@ class UnrecognizedReachesSheetRowTest(unittest.TestCase):
         self.assertEqual(written[0][5], "テスト商事")
 
 
-class InvoiceGeminiFailureTest(unittest.TestCase):
-    """Gemini が JSON を返さないケースは従来通り「何も yield しない」。
-
-    main.process_file 側で count==0 → Failed → ファイル保持 → 次回再試行、
-    という既存の正しい挙動を壊さないことを固定する。
-    """
-
-    def test_no_raw_data_yields_nothing(self):
-        # Arrange: cross_validate も Vision 兜底も失敗
-        # Act
-        pages, vision = _run_pipeline(None)
-
-        # Assert: 1 件も yield しない（= count 0 → Failed → 原票は保持される）
-        self.assertEqual(pages, [])
-        vision.assert_called_once()
+# Session 16 重複覆蓋收斂: InvoiceGeminiFailureTest.
+# test_no_raw_data_yields_page_error_for_every_page は削除した。
+# vision.call_count==2 の断言は test_ocr_engine_invoice_pipeline.py の
+# PartialPageFailureTest.test_all_pages_fail_yields_all_page_errors へ
+# 移設済み（断言を失わずに引き継ぐ）。
 
 
 class YieldInvariantTest(unittest.TestCase):

@@ -49,6 +49,8 @@ def _valid_receipt_raw():
 
 # 封筒/メモ判定 (_is_envelope_page) に落ちないよう構造キーワードを含める
 _VALID_OCR_TEXT = "領収書 テスト店 合計1,100円 現金"
+# 封筒キーワードのみ・金額関連キーワード無し → _is_envelope_page が True を返す
+_ENVELOPE_OCR_TEXT = "〒100-0001 東京都千代田区 御中"
 
 
 def _two_pdf_pages():
@@ -150,6 +152,31 @@ class JsonParseFailurePageVisibilityTest(unittest.TestCase):
 
         # Assert: 失敗宣言の前に Vision 兜底を必ず試している
         vision.assert_called_once_with(b"%PDF-p1", "application/pdf", mock.ANY)
+
+
+class ReceiptEnvelopePageStillSkippedTest(unittest.TestCase):
+    """Session 16 裁決: 封筒フィルタ (_is_envelope_page) は
+    doc_type == DocType.RECEIPT 限定に変更されたが、RECEIPT 自体の既存挙動
+    （封筒/送付状ページは skip=yield されない）は維持されなければならない。
+
+    このテストは将来 RECEIPT 限定の条件を誤って剥がしてしまう回帰を防ぐ
+    ガードであり、封筒フィルタの適用範囲を狭めた際に領収書側の挙動まで
+    一緒に変えてしまわないようにする。
+    """
+
+    def test_envelope_page_is_not_yielded_for_receipt(self):
+        # Arrange: p1=封筒（金額関連キーワード無し）/ p2=正常な領収書
+        route = [
+            (_valid_receipt_raw(), _ENVELOPE_OCR_TEXT, 0.9),
+            (_valid_receipt_raw(), _VALID_OCR_TEXT, 0.95),
+        ]
+
+        # Act
+        pages, _ = _run_receipt_pipeline(route)
+
+        # Assert: p1 は yield されず（RECEIPT では従来通り skip）、p2 のみ残る
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0]["page_num"], 2)
 
 
 if __name__ == "__main__":
