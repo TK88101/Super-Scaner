@@ -386,3 +386,41 @@ max_amount戦略の負額混在コメント。未対処(意図的): tax_amount �
 - git 身份: global に TK88101 <47910451+TK88101@users.noreply.github.com> を設定。
   未 push の 2 commit(旧 e3b815b/f9852c6 → 新 4f0988d/e611262)は作者を書き換え済み。
   origin/main 上の 825a8b4 以前は未変更のまま。
+
+=== Session 14 (2026-07-10) ===
+
+[完了]
+- ENTRY_BUILDERS 防呆 → _validate_doc_type_registries に一般化(DocType.ALL を真値来源に
+  PROMPTS/ENTRY_BUILDERS/DOC_TYPE_CONFIG/DOC_TYPE_TAB_SUFFIX/ENV_FOLDER_MAP の5表を
+  import 時検査、漏れ即 RuntimeError)。テスト test_doc_type_registries.py。
+- sheets_output.py append_entries: 書ける行ゼロ(空 entries / 全行金額0)は必ず認識不能
+  占位行(赤タグ)を書く統一ガード。無音データ欠落の最終防衛。旧 characterization テスト反転。
+- 占位行摘要の memo 乗っ取り遮断: memo 通過は _unrecognized 明示 producer のみ
+  (_write_unrecognized_row 内部でゲート)。
+- test_sheets_output.py: 5クラス重複の _run を _run_append_entries に統合
+  (patch_highlight / patch_unrecognized / capture_written)。
+- CLAUDE.md: Chatwork 廃止を明記(会社決定。notifier.py/send_notification は死コード)。
+- 全て main へ FF マージ & push 済み(825a8b4..bb1e2db)。テスト 269 本 OK。
+- 生産 mini PC は未 pull — 次回人手デプロイで反映。
+
+[次 session の課題: Session 12 の 8頁 PDF 事故]
+1. 即修可(確認不要・TDD): 領収書多頁 PDF 経路で JSON 解析失敗ページが無声 skip
+   (yield しない)。ocr_engine.py の「⚠️ AIの応答がJSONではありませんでした」直後の
+   continue(領収書分岐内, failed_pages インクリメント箇所)。部分失敗時は main が
+   Success 判定→該当頁のデータが無音欠落。修法: :1674 付近の例外経路と同じく
+   _page_error 付き result を yield(全敗→Failed 保持の語義は不変、部分敗→占位行可視化)。
+2. 真因確認待ち: mini PC コンソールで対象ファイル再試行時の
+   「finish_reason=MAX_TOKENS」ログを確認(診断ログは main に反映済み)。
+   または該当 8頁 PDF を local_test.py --only-file で再現。
+   確認後の対策候補: max_output_tokens 32768→65536(flash 上限は要公式確認) /
+   截断検出時に思考予算を絞って1回だけ再試行(SDK対応要調査, TBD)。
+3. ユーザー裁定待ち: 確定性失敗(APIは正常応答だが内容不能)も現状は無限再試行。
+   Chatwork 廃止後この無限ループはコンソール以外から不可視。
+   「同一ファイル N 回失敗で歸檔+全頁占位行」への変更是非。
+
+[遺留 P2(全て任意の磨き, 挙動影響なし)]
+- テスト harness: fake 注入スタイル不統一(_write_with_retry のみ MagicMock) /
+  written[0][18] のマジックナンバー / patch_unrecognized+capture_written 同時指定の防呆 assert。
+- _unrecognized を memo 特権の判据に使うのは代理キー(理想は専用 _placeholder_memo)。
+- _FakeWorksheet/_make_writer が test_ocr_engine_invoice.py と重複。
+- notifier.py + main.py の send_notification 3箇所は死コード — 削除するかはユーザー判断待ち。
