@@ -520,10 +520,16 @@ class SheetsOutputWriter:
 
 
     def _write_unrecognized_row(self, ws, tab_name, entries_data, source_url):
-        """認識不能/部分認識ページの占位行を書き込み、ハイライト適用"""
+        """認識不能/部分認識ページの占位行を書き込み、ハイライト適用。
+
+        摘要は標準ラベル（date/vendor の有無で選択）。memo を通すのは
+        _unrecognized を明示した producer（main の部分エラー占位行等）だけ —
+        兜底経路で Gemini の memo が標準ラベルを乗っ取らないよう遮断する。
+        """
         date = entries_data.get("date", "") or ""
         vendor = entries_data.get("vendor", "") or ""
-        memo_override = entries_data.get("memo") or ""
+        memo_override = ((entries_data.get("memo") or "")
+                         if entries_data.get("_unrecognized") else "")
         has_partial = bool(date or vendor)
 
         now_jst = datetime.now(JST).strftime("%Y/%m/%d %H:%M")

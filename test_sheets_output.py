@@ -8,7 +8,7 @@ import io
 import os
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -73,38 +73,77 @@ def _entry(amount, account="備品・消耗品費", tax_type="課対仕入10%"):
             "description": "商品", "credit_account": "未払金"}
 
 
+def _run_append_entries(doc_type, data, patch_highlight=True,
+                        patch_unrecognized=False, capture_written=False):
+    """append_entries を fake ws で流す共通ハーネス（各テスト類の _run が委譲）。
+
+    call_log に ("entry", row, flags)（_apply_anomaly_highlight）と
+    ("doc", cell_ref, fmt)（_format_with_retry）を時系列で記録する。
+    patch_highlight=False は _apply_anomaly_highlight を実物のまま通す
+    （低置信テスト等、実経路の塗り順を検証するケース用）。注意: その場合
+    ("entry", ...) は記録されず、実物の塗りは fake ws 相手に握り潰される
+    （append_entries 内の try/except）ため call_log からは見えない。
+    capture_written=True は _write_with_retry / _ensure_row_capacity を
+    差し替え、実際に書かれた行を written へ捕捉する（_write_unrecognized_row
+    は実物のまま通る → 占位行の中身を検証するケース用）。
+
+    Returns: (call_log, ws, stdout_text, placeholder_calls, written)
+    """
+    writer = _make_writer()
+    ws = _FakeWorksheet()
+    call_log = []
+    placeholder_calls = []
+    written = []
+
+    def fake_apply_highlight(self, worksheet, row, flags):
+        call_log.append(("entry", row, flags))
+
+    def fake_format_with_retry(self, worksheet, cell_ref, fmt,
+                               max_retries=5):
+        call_log.append(("doc", cell_ref, fmt))
+
+    def fake_unrecognized(self, worksheet, tab_name, entries_data,
+                          source_url):
+        placeholder_calls.append((tab_name, entries_data, source_url))
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(
+            SheetsOutputWriter, "_get_or_create_tab", return_value=ws))
+        stack.enter_context(patch.object(
+            SheetsOutputWriter, "_format_with_retry",
+            fake_format_with_retry))
+        if patch_highlight:
+            stack.enter_context(patch.object(
+                SheetsOutputWriter, "_apply_anomaly_highlight",
+                fake_apply_highlight))
+        if patch_unrecognized:
+            stack.enter_context(patch.object(
+                SheetsOutputWriter, "_write_unrecognized_row",
+                fake_unrecognized))
+        if capture_written:
+            stack.enter_context(patch.object(
+                SheetsOutputWriter, "_ensure_row_capacity"))
+            stack.enter_context(patch.object(
+                SheetsOutputWriter, "_write_with_retry",
+                side_effect=lambda w, rows: written.extend(rows)))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            writer.append_entries("従業員", doc_type, data,
+                                  source_url="http://x")
+    return call_log, ws, buf.getvalue(), placeholder_calls, written
+
+
 class AppendEntriesTotalMismatchTest(unittest.TestCase):
     """[B'] doc 級照合 → 金額列（I列）赤ハイライト。"""
 
     def _run(self, doc_type, entries, entries_extra=None):
         """append_entries を fake ws で実行し、call log と ws を返す。"""
-        writer = _make_writer()
-        ws = _FakeWorksheet()
-        call_log = []
-
-        def fake_apply_highlight(self, worksheet, row, flags):
-            call_log.append(("entry", row, flags))
-
-        def fake_format_with_retry(self, worksheet, cell_ref, fmt,
-                                   max_retries=5):
-            call_log.append(("doc", cell_ref, fmt))
-
         data = {"date": "2026/06/01", "vendor": "店", "invoice_num": "",
                 "memo": "", "entries": entries}
         if entries_extra:
             data.update(entries_extra)
-
-        with patch.object(SheetsOutputWriter, "_get_or_create_tab",
-                          return_value=ws), \
-             patch.object(SheetsOutputWriter, "_apply_anomaly_highlight",
-                          fake_apply_highlight), \
-             patch.object(SheetsOutputWriter, "_format_with_retry",
-                          fake_format_with_retry):
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                writer.append_entries("従業員", doc_type, data,
-                                      source_url="http://x")
-        return call_log, ws, buf.getvalue()
+        call_log, ws, out, _, _ = _run_append_entries(doc_type, data)
+        return call_log, ws, out
 
     def test_total_mismatch_highlights_amount_column_range(self):
         # Arrange: 2 entries (3000+2870=5870)、票面6456 → 不一致
@@ -166,34 +205,13 @@ class AppendEntriesOutlierExemptTest(unittest.TestCase):
     """規則①: 対象外行の構造異常 → I列赤（合計照合と同経路で合流）。"""
 
     def _run(self, entries, entries_extra=None):
-        writer = _make_writer()
-        ws = _FakeWorksheet()
-        call_log = []
-
-        def fake_apply_highlight(self, worksheet, row, flags):
-            call_log.append(("entry", row, flags))
-
-        def fake_format_with_retry(self, worksheet, cell_ref, fmt,
-                                   max_retries=5):
-            call_log.append(("doc", cell_ref, fmt))
-
         data = {"date": "2026/06/01", "vendor": "焼鳥の六角堂",
                 "invoice_num": "", "memo": "", "entries": entries,
                 "doc_category": "receipt"}
         if entries_extra:
             data.update(entries_extra)
-
-        with patch.object(SheetsOutputWriter, "_get_or_create_tab",
-                          return_value=ws), \
-             patch.object(SheetsOutputWriter, "_apply_anomaly_highlight",
-                          fake_apply_highlight), \
-             patch.object(SheetsOutputWriter, "_format_with_retry",
-                          fake_format_with_retry):
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                writer.append_entries("従業員", DocType.RECEIPT, data,
-                                      source_url="http://x")
-        return call_log, ws, buf.getvalue()
+        call_log, ws, out, _, _ = _run_append_entries(DocType.RECEIPT, data)
+        return call_log, ws, out
 
     def test_rokkakudo_hallucination_highlights_amount_column(self):
         # Arrange: 六角堂（課税7,310 + 対象外90,000）。Σ=票面=97,310 で
@@ -252,28 +270,14 @@ class AppendEntriesLowConfidenceTest(unittest.TestCase):
     """規則②: 低置信整票 → 全行（A:AB）黄、I列赤の後に置く。"""
 
     def _run(self, entries, entries_extra=None):
-        writer = _make_writer()
-        ws = _FakeWorksheet()
-        call_log = []
-
-        def fake_format_with_retry(self, worksheet, cell_ref, fmt,
-                                   max_retries=5):
-            call_log.append(("doc", cell_ref, fmt))
-
+        # _apply_anomaly_highlight は実物を通す（実経路の塗り順を検証するため）
         data = {"date": "2026/06/01", "vendor": "店",
                 "invoice_num": "", "memo": "", "entries": entries}
         if entries_extra:
             data.update(entries_extra)
-
-        with patch.object(SheetsOutputWriter, "_get_or_create_tab",
-                          return_value=ws), \
-             patch.object(SheetsOutputWriter, "_format_with_retry",
-                          fake_format_with_retry):
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                writer.append_entries("従業員", DocType.RECEIPT, data,
-                                      source_url="http://x")
-        return call_log, ws, buf.getvalue()
+        call_log, ws, out, _, _ = _run_append_entries(
+            DocType.RECEIPT, data, patch_highlight=False)
+        return call_log, ws, out
 
     def test_low_confidence_paints_full_row_yellow(self):
         # Arrange: ocr_confidence=0.60 < 0.85 閾値
@@ -328,24 +332,11 @@ class AppendEntriesTagColumnTest(unittest.TestCase):
 
     def _run(self, doc_type, entries, entries_extra=None,
              vendor="店", invoice_num=""):
-        writer = _make_writer()
-        ws = _FakeWorksheet()
-
         data = {"date": "2026/06/01", "vendor": vendor,
                 "invoice_num": invoice_num, "memo": "", "entries": entries}
         if entries_extra:
             data.update(entries_extra)
-
-        with patch.object(SheetsOutputWriter, "_get_or_create_tab",
-                          return_value=ws), \
-             patch.object(SheetsOutputWriter, "_apply_anomaly_highlight",
-                          lambda *a, **k: None), \
-             patch.object(SheetsOutputWriter, "_format_with_retry",
-                          lambda *a, **k: None):
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                writer.append_entries("従業員", doc_type, data,
-                                      source_url="http://x")
+        _, ws, _, _, _ = _run_append_entries(doc_type, data)
         return ws
 
     def test_clean_row_has_empty_tag(self):
@@ -478,27 +469,9 @@ class AppendEntriesSilentLossGuardTest(unittest.TestCase):
 
     def _run(self, data):
         """append_entries を fake ws で実行し、占位行呼び出しと ws を返す。"""
-        writer = _make_writer()
-        ws = _FakeWorksheet()
-        placeholder_calls = []
-
-        def fake_unrecognized(self, worksheet, tab_name, entries_data,
-                              source_url):
-            placeholder_calls.append((tab_name, entries_data, source_url))
-
-        with patch.object(SheetsOutputWriter, "_get_or_create_tab",
-                          return_value=ws), \
-             patch.object(SheetsOutputWriter, "_write_unrecognized_row",
-                          fake_unrecognized), \
-             patch.object(SheetsOutputWriter, "_apply_anomaly_highlight",
-                          lambda self, w, r, f: None), \
-             patch.object(SheetsOutputWriter, "_format_with_retry",
-                          lambda self, w, ref, fmt, max_retries=5: None):
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                writer.append_entries("従業員", DocType.RECEIPT, data,
-                                      source_url="http://x")
-        return placeholder_calls, ws, buf.getvalue()
+        _, ws, out, placeholder_calls, _ = _run_append_entries(
+            DocType.RECEIPT, data, patch_unrecognized=True)
+        return placeholder_calls, ws, out
 
     @staticmethod
     def _data(entries, **extra):
@@ -542,6 +515,33 @@ class AppendEntriesSilentLossGuardTest(unittest.TestCase):
         # Assert
         self.assertEqual(len(ws.appended), 1)
         self.assertEqual(calls, [])
+
+    def test_zero_amount_placeholder_uses_standard_label_not_gemini_memo(self):
+        # Arrange: 全行金額0 かつ Gemini が memo を返しているケース。
+        # 摘要ラベルは _write_unrecognized_row の標準文言であるべきで、
+        # Gemini の memo が占位行の摘要を乗っ取ってはいけない
+        # （memo 通過は _unrecognized を明示した producer だけの特権）。
+        data = self._data([_entry(0)], date="2026/06/01", vendor="店",
+                          memo="Geminiが返した任意の要約テキスト")
+        # Act: _write_unrecognized_row は実物を通す（written で捕捉）
+        _, _, _, _, written = _run_append_entries(
+            DocType.RECEIPT, data, capture_written=True)
+        # Assert: 占位行1行、摘要は標準ラベル（date/vendor 有 → 部分認識）
+        self.assertEqual(len(written), 1)
+        self.assertEqual(written[0][18], "⚠ 部分認識（金額なし）")
+
+    def test_flagged_unrecognized_keeps_producer_memo(self):
+        # Arrange: main の部分エラー占位行など、_unrecognized を明示した
+        # producer の memo は従来通り摘要へ通す（挙動維持の固定）
+        data = self._data([], _unrecognized=True,
+                          memo="⚠ ページ処理エラー 2/8頁 手動再スキャン要")
+        # Act
+        _, _, _, _, written = _run_append_entries(
+            DocType.RECEIPT, data, capture_written=True)
+        # Assert
+        self.assertEqual(len(written), 1)
+        self.assertEqual(written[0][18],
+                         "⚠ ページ処理エラー 2/8頁 手動再スキャン要")
 
 
 if __name__ == "__main__":
