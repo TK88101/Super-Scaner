@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目领域
 
-Super Scaner 是企业级会计凭证自动化机器人。流程：监听 Google Drive 上传的发票/收据 (PDF/图片) → PaddleOCR + Gemini 双引擎识别 → 结构化为日本会计仕訳 → 写入 Google Sheets (MoneyForward 导入格式) → 原票归档 + Chatwork 通知。产出对接 MoneyForward 记账，面向井戸会計事務所类客户。
+Super Scaner 是企业级会计凭证自动化机器人。流程：监听 Google Drive 上传的发票/收据 (PDF/图片) → PaddleOCR + Gemini 双引擎识别 → 结构化为日本会计仕訳 → 写入 Google Sheets (MoneyForward 导入格式) → 原票归档。产出对接 MoneyForward 记账，面向井戸会計事務所类客户。
+
+**Chatwork 已废弃**（公司决定不使用）：`notifier.py` 与 `main.py` 的 `send_notification` 调用是死代码残留（无 token 时不发送）。任何评审/修复/新功能不得把 Chatwork 当作现行功能；是否删除残留代码由用户决定。
 
 代码内多语言混杂：注释/日志多为日文 (面向最终用户) 与繁中。新增代码沿用同文件的语言风格。
 
@@ -90,7 +92,7 @@ Drive 原生预览忽略 `#page=N`，故每页拆成单页 PDF 上传到 `SPLIT_
 
 ### 备份（GAS）
 - `gas/daily_backup.gs`: 22:00 JST 在 Google 服务器跑，聚合全 tab → `MF_Backup`，无需 PC 开机（有自己的时间触发器，独立于 main.py，与 monitoring 删除互不影响）。`scripts/daily_backup.py` 是已被取代的 Python cron 版（保留参考，勿在生产运行）。
-- 旧的 `monitoring/` 监控子系统与 `gas/dashboard.gs` 仪表板监控的是 EC2 Docker 容器 `scan-bot`，随 EC2/Docker 环境废弃而删除（现行为公司 Windows 迷你 PC 本地常驻，无容器可监控；机器人是否正常运行改由 Chatwork 通知观测）。
+- 旧的 `monitoring/` 监控子系统与 `gas/dashboard.gs` 仪表板监控的是 EC2 Docker 容器 `scan-bot`，随 EC2/Docker 环境废弃而删除（现行为公司 Windows 迷你 PC 本地常驻，无容器可监控；Chatwork 通知亦已废弃，目前没有自动化运行监控手段，靠人工查看控制台/表格产出确认）。
 
 ## 约束（项目特定）
 
