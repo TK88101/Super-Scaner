@@ -292,3 +292,97 @@ max_amount戦略の負額混在コメント。未対処(意図的): tax_amount �
 - テスト: 新 tag_rules 16 + sheets_output 拡充(タグ列5種・容量/清掃)。212 passed(monitoring除)。
 - 残余: ①境界修復は単測+codex源码印証のみ、未跑真実跨1000行場景 → 測試表で1000+行灌入し
   空尾行が継承色を持たぬこと終確認推奨。②上線: mini PC git pull + Stop/Start-ScheduledTask。
+
+=== Session 12 (2026-06-19) — 上游 Xenomorph「直送」上线 + 首次端到端实测 bug(只建表头无明细) ===
+状态: 信息交接（本 session 在 Xenomorph 项目侧调试，把跨项目情况+代码级诊断同步过来；本 session 时点本仓库代码未改动）。
+※後日追記(2026-07-10): 下記 (b) 族の設計缺口は Session 13 で修正済み(commit e611262)。
+  ただし本件 8 頁実測はファイルが input に残存 ⇒ (a) 族であり、**本件の真因は未解明のまま**。
+  [未完了TODO][1](真因特定, MAX_TOKENS 疑い) と [2]②(分块/逐页 Gemini) は依然オープン。
+诊断方式: 5-agent 工作流并行追踪 main.py/sheets_output.py/ocr_engine.py + 对抗式反验证(行号已核对)。
+
+[上游来源已变化] Xenomorph(GAS 分类 App) 新增「Super Scannerへ直送」并正式部署(@28，6/19 上线)：
+- 员工把某分类多页合并成 1 个 PDF，直传本项目监控的 Drive 子文件夹，靠 3 秒轮询自动 OCR，无 webhook。
+  ≤20MB 直送、>20MB 由 Xenomorph 端先压缩再送。
+- ⚠️ 上传身份 = automation@ido-office.fukuoka.jp(Xenomorph 以「自分」执行)。本项目 main.py 读到的
+  lastModifyingUser = automation@(非员工本人)。若 config.EMPLOYEE_MAP 无 automation@ → uploader_name
+  回退 displayName(实测="automation")、chat_id=None → 不给具体某人发 Chatwork；Sheet 页签 = automation_支払請求書。
+
+[首次端到端实测] 8 页 PDF / 分类「支払請求書」/ ~1.7MB(未压缩) / 文件名 支払請求書_8枚_<日期>_233748.pdf。
+- 送达成功：本项目「支払請求書」input 文件夹确实收到该 8 页 PDF。
+- BUG: MF_Import_Data 的 automation_支払請求書 页签建出来了(凡例 1-4 行 + 表头第 5 行)，第 6 行起完全空白。
+- 已确认硬事实: 该 PDF 此刻仍留在 input 文件夹、未移到 Processed。
+
+[根因(代码级，已反验证) — 关键: INVOICE 走「合并单次调用」分支，与 RECEIPT 逐页分支不同]
+- 支払請求書 doc_type = PURCHASE_INVOICE != RECEIPT → 跳过逐页 RECEIPT 分支(ocr_engine.py:1612 门控)，
+  走「非領収書」分支(ocr_engine.py:1713-1769)：8 页 PaddleOCR(1720-1728)→拼文本→读 1.7MB PDF→
+  **一次性 Gemini 调用(1736，strategy C 交叉验证)**→Vision 兜底(1746)→_build_entries_from_purchase_invoice
+  (1306-1343) **最多 yield 一个结果**。
+- start_new_file() 在 OCR 之前调用(main.py:493)，是唯一建页签+凡例+表头的地方(idempotent，复用 tab 时
+  不重写凡例/表头 sheets_output.py:109/112-118) → 表头存在 ≠ 写入成功，只证明跑到了第 5 步。
+- ⚠️ 重要订正(我先前口径错误): 「entries 空」有两种命运，不都是 Failed/保留：
+  (a) raw_data=None(两次调用都解析不出 JSON) → 分支打印 JSON 警告(1768)、yield 0 个 → main.py count==0 →
+      Failed → **文件保留 input**、通知=「AIによる解析に失敗しました」。
+  (b) JSON 解析出来但 items=[] 或金额全 0 → 仍 yield 1 个空结果(1755，无 _unrecognized) → count==1 →
+      **走 Success 分支(main.py:394-417)、文件被移到 Processed**、通知=Success。
+  → **本次文件仍在 input ⇒ 落在 (a) 族**：那次合并单调用没产出可解析 JSON。
+- INVOICE 分支(不同于 RECEIPT)失败时**不写任何占位/_unrecognized 行、也不发 _page_error** → 失败=完全静默
+  (空表)，甚至 (b) 还会误报 Success。这是设计缺口。
+
+[最可疑(file-in-input 收窄后，按可能性)]
+① MAX_TOKENS 截断(高)：8 页发票要在一次 JSON 里返回全部明细，gemini-2.5-flash 的 max_output_tokens=32768
+   与思考预算共享(ocr_engine.py:127-133)，溢出→finish_reason=MAX_TOKENS(2)→response.text 抛 ValueError(347-349)
+   →extract_json=None→raw_data=None。**最强控制台特征 = 「⚠️ Gemini応答のJSON解析失敗 (finish_reason=MAX_TOKENS, 思考≈Ntok)」(356-359)**，随后 1768 通用警告。鉴别: 换更少页数的发票能正常写行。
+② Gemini 两次都解析不出(高)：仅见「⚠️ AIの応答がJSONではありませんでした」(1768)。
+③ pipeline 内吞掉异常(中)：「❌ 解析失敗:」(1846)。INVOICE 分支的逐页 PaddleOCR(1720-1728)无 per-page
+   try/except，某页崩溃/OOM/重试后再抛(106-122) → 静默空生成器、文件保留、每 3 秒重检重跑。
+④ 主循环未捕获异常(中)：「❌ システムエラー:」(main.py:523) + 每 5 秒重启。
+⑤ 还在跑/慢(中)：8 页 CPU 串行 PaddleOCR + 一次 1.7MB Gemini(含 1/4/10/30s 退避) 实际可能 2-6 分钟；
+   截图若在上传后几分钟内拍，空表是正常中间态。
+⑥ 服务没在跑(低)：空表是更早测试残骸、本次根本没被轮询(无该文件名的检测日志)。GEMINI_API_KEY 缺失会在
+   import 崩(84-85)，但 .env 实有 39 字符 key，排除「缺 key 崩溃」；其他原因(关机/被杀/网络)仍可能。
+
+[未完了TODO]
+[1] mini PC 控制台按上面①~⑥的精确日志特征定位本次 8 页 INVOICE 失败的真因(优先看是否 finish_reason=MAX_TOKENS)。
+[2] 修复方向: ①INVOICE 分支失败时写占位/失败行(对齐 RECEIPT 逐页兜底)，杜绝静默空表与「空 items 误报 Success」；
+    ②对 8 页大发票分块/逐页调 Gemini，避免一次 all-or-nothing；③解析失败时记录 finish_reason/原始响应。
+[3] automation@ 是否进 EMPLOYEE_MAP 的决策(通知/署名归属)。
+[4] 复现: 拿这个 Xenomorph 合并出的 8 页 PDF 喂 local_test.py，对比本项目自产 PDF 结构差异。
+
+=== Session 13 (2026-07-10) — Session 12 (b) 族「空 items 误报 Success」を修正 (commit e611262) ===
+状态: 代码已改并 commit(未 push)。261 passed(+12)。分支 feat/internal-profile。
+
+[修好了什么]
+- Session 12 [根因] の (b) 族: Gemini が正常な JSON を返したが items=[] / 金額全0 → entries=[] を
+  **無標記のまま yield** → sheets_output.append_entries(200-206) が 1 行も書かず静かに return →
+  main.process_file は count=1 / error_pages=0 → **Success 判定 + 原票アーカイブ**。無音のデータ欠落。
+- 修正: `ocr_engine._build_doc_result(doc_type, raw_data, entries)` を新設。entries が空なら必ず
+  `_unrecognized` を立て、U列赤タグ + 原票URL 付きの占位行を 1 行書かせる。
+- **穴は 2 箇所あった**: 多ページ PDF 分岐だけでなく「単ページ PDF / 画像」の通常パス(旧1849)にも
+  同じ無標記 yield があった。請求書を撮影した画像は実運用で頻出。レビューで検出し両方塞いだ。
+- `_page_error` ではなく `_unrecognized` を使う: `_page_error` だと count==error_pages で Failed →
+  ファイル保持 → 明細を持たない書類(封筒等)が毎回再試行される無限ループに入るため。
+- 多ページ分岐の builder 未登録時が無言だったのでログ追加(挙動不変)。
+- CLAUDE.md「新增文书类型需同步」清单に ENTRY_BUILDERS を追記(漏らすと builder=None →
+  count==0 → Failed → 毎周期再試行 + Gemini 課金、という別の無限ループに落ちる)。
+
+[修していない — 誤読注意]
+- **Session 12 の 8 頁実測そのものは直っていない**。あの件はファイルが input に残存 ⇒ (a) 族
+  (raw_data=None, 両方の Gemini 呼び出しが JSON を返さず) であり、count==0 → Failed → ファイル保持。
+  これは元から「正しい挙動」で、今回の修正対象外。真因(①MAX_TOKENS 截断が最有力)は未特定。
+- [未完了TODO][1](mini PC コンソールで finish_reason を確認) と [2]②(8頁大請求書の分块/逐页 Gemini)
+  は依然オープン。今回の修正は「失敗が静かに成功に化ける」のを止めただけで、失敗自体は減らない。
+
+[テスト] test_ocr_engine_invoice.py 新設(12件)。
+- YieldInvariantTest: 入力形状3(多頁PDF/画像/単頁PDF) × 文書タイプ3 を横断し「空 entries の yield は
+  必ず標記を持つ」不変条件を直接主張。形状ごとの個別テストでは「列挙し忘れた経路」を守れない
+  (今回まさにそれで単ページ側を見落とした)。
+- UnrecognizedReachesSheetRowTest: sheets_output をモックせず実物の append_entries を駆動し、
+  赤タグ占位行が実際に書かれることを着弾点で実証。
+- 修正を git stash で戻して RED を確認済み(不変条件テストは 9 subTest 全て失敗)。
+
+[次の判断待ち]
+- 真の急所は sheets_output.py:205(無標記の空 entries で無言 return)。そこに防御ガードを置けば
+  全 producer の穴を一括で塞げる。共有の Sheets 書き込み経路に触れるため別 session で対応予定。
+- git 身份: global に TK88101 <47910451+TK88101@users.noreply.github.com> を設定。
+  未 push の 2 commit(旧 e3b815b/f9852c6 → 新 4f0988d/e611262)は作者を書き換え済み。
+  origin/main 上の 825a8b4 以前は未変更のまま。
