@@ -458,3 +458,64 @@ max_amount戦略の負額混在コメント。未対処(意図的): tax_amount �
 2. ユーザー裁定待ち: 確定性失敗の無限再試行を「同一ファイル N 回失敗で
    歸檔+全頁占位行」に変えるか(Chatwork 廃止後コンソール以外不可視)。
 3. automation@ を EMPLOYEE_MAP に入れるかの決策(Session 12 TODO[3], 未裁定)。
+
+=== Session 16 (2026-07-10) — 全文書タイプPDF逐頁化統一・8頁PDF事故の設計的根絶 (commit 2744dee) ===
+状态: main へ FF マージ & push 済み(bb1e2db..2744dee)。290 本全綠 + 実票回帰一致。
+分支 feat/internal-profile は削除済み(マージ済みのため)。生産 mini PC 未 pull。
+
+[ユーザー裁定(本 session の起点)]
+- 8頁PDF事故(Session 12, MAX_TOKENS 切断疑い)の真因調査は打ち切り、
+  「全文書タイプの PDF を領収書式の逐頁分割に統一、合併分岐は全廃」を決定。
+  対症療法ではなく事故の載体コードごと削除する方針。
+- 既知の取捨(ユーザー承認済み): 真の跨頁単張請求書(明細跨頁・合計末頁)は
+  逐頁化で中間頁が紅標占位行になり人工処理に回る。自動拼合はしない。
+  頻発するなら将来「延続頁合併」機構を検討。
+
+[修好了什么]
+- process_pipeline: 逐頁分岐を全 doc_type に適用(条件から RECEIPT 限定を撤去)、
+  「非領収書 PDF: 逐ページOCR→合併テキスト→1回Gemini」分岐(~53行)を整段削除。
+  MAX_TOKENS 切断の温床そのものが消滅。
+- _yield_page_results 新設: 逐頁ループと単頁尾段で逐字重複していた
+  「OCRオーバーライド→doc_type分流→result整形」を一本化(漂移リスク根絶)。
+- 封筒フィルタ(_is_envelope_page)を RECEIPT 限定化: 領収書向けヒューリスティック
+  が給与明細等の短文頁に誤爆すると無声skip→無限リトライ/無音欠落するため。
+  非領収書の封筒/送付状頁は _unrecognized 紅標占位行で可視化兜底。
+- _extract_date_from_ocr 日付防護(3段迭代, codex と辯論の産物):
+  ①支払期限/支払期日/振込期限系6語を skip 対象に追加
+  ②対称窓だと「発行日 3/1 支払期限 3/31」の常見排版で発行日まで誤爆
+    → due 系語彙のみ「日付前方窓」判定に分離(原対称窓詞表は一字不動)
+  ③skip された due 日付が fallback(matches[-1])から復活するのを遮断
+    (fallback 池から除外。OCR に支払期限しか無い場合は Gemini 日付を保持)
+  + 前方窓を直前マッチ終端で切詰め(跨日付滲漏防止)。
+
+[プロセス記録: fable5→sonnet5→simcodex 協作フロー初運用]
+- Fable5 が任務清単・裁決、Sonnet5 sub-agent が TDD 編碼、/simcodex 3輪
+  (simplify 4視角並行 + codex review)で交叉排査、Fable5 が意見裁決・辯論。
+- codex 実績: R1 封筒誤爆(採納)、R2 対称窓の常見排版反例(codex 辯論勝ち)、
+  R3 fallback 復活穴(採納)、終審「問題なし」全綠。
+- 駁回した意見: 跨頁請求書問題の再議(ユーザー既裁定)、テスト runner 統合
+  (両檔のモデルが本質的に異なり適配層が負収益)、納秒級の dict 査找 hoist。
+
+[テスト] 290 本全綠(基準273 → 新設 test_ocr_engine_invoice_pipeline.py 21本
+  + receipt 側封筒ガード等、重複覆蓋3本は収斂削除)。
+  実票回帰: 税区分テスト6頁PDF(領収書)で重構前後の出力完全一致
+  (9仕訳行・税区分・金額・日付とも。人工基準は当日目視照合済み)。
+
+[環境修復(重要)] 本 Mac に poppler 未導入だったことが発覚(pdftoppm 不在)。
+  → これまでの本地 PDF テストは全頁 PaddleOCR 失敗で純 Vision 兜底だった
+  (戦略Cの交叉験証・OCR日付/T番号オーバーライドが実質無効)。
+  brew install poppler 26.07.0 で修復、精度差の実例も確認
+  (税抜/税込の誤り: 純Vision は p4 で 13,440/650 と税抜額を誤採用していた)。
+  ⚠️ 生産 Windows mini PC の poppler 導入状況は次回登録時に要確認
+  (未導入なら生産も純 Vision で走っている可能性)。
+
+[次 session の課題]
+1. 生産デプロイ: mini PC で git pull(main) + 再起動。あわせて poppler
+   (Windows 版)の有無を確認。上線後最初の多頁支払請求書の処理結果を
+   コンソール/表格で目視確認(請求書経路は mock テストのみで実票未検証)。
+2. LocalTest_領収書 tab に検証3輪分27行が累積 → 手動削除可。
+3. 遺留裁定(Session 14 から継続): 確定性失敗の無限再試行を
+   「N回失敗で歸檔+全頁占位行」に変えるか / automation@ を EMPLOYEE_MAP に
+   入れるか。逐頁化で切断起因の無限リトライは大幅減の見込みだが語義は残存。
+4. P2 遺留: 新檔 _valid_invoice_raw の date 預設値 "2026-07-09"(連字符)は
+   fixture 風格不一致のみ(全テスト date 非断言で無実害)。
