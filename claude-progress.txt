@@ -424,3 +424,37 @@ max_amount戦略の負額混在コメント。未対処(意図的): tax_amount �
 - _unrecognized を memo 特権の判据に使うのは代理キー(理想は専用 _placeholder_memo)。
 - _FakeWorksheet/_make_writer が test_ocr_engine_invoice.py と重複。
 - notifier.py + main.py の send_notification 3箇所は死コード — 削除するかはユーザー判断待ち。
+
+=== Session 15 (2026-07-10) — Session 14 課題1「領収書多頁PDF JSON解析失敗の無声skip」修正 (commit e2b3e06) ===
+状态: 代码已改并 commit(未 push)。273 passed(+4)。分支 feat/internal-profile。
+
+[修好了什么]
+- Session 14 [次 session の課題] 1 (即修可・確認不要): 領収書多ページ PDF 分岐
+  (ocr_engine.process_pipeline の RECEIPT×PDF 節) で、page_raw_data=None
+  (Gemini 応答が JSON でない + Vision 兜底も失敗) のとき failed_pages++ と
+  print だけで yield せず continue していた。部分失敗時 main.process_file が
+  error_pages=0 → Success 判定 → 原票アーカイブ → 該当ページのデータ無音欠落。
+- 修正: 同分岐の例外経路(ページ処理エラー)と同じく `_page_error` +
+  `_unrecognized` 付き占位 result を yield (page_bytes 保持で原票リンク可)。
+  全敗時は count==error_pages → Failed → ファイル保持(従来の count==0 →
+  Failed と同値)。部分敗時は赤タグ占位行が可視化され原票は歸檔。
+- ⚠️ これは 8頁 PDF 事故そのものの修正ではない: あの事故は支払請求書
+  (非領収書分岐)で真因未解明。本件は事故調査の代码走読で見つけた
+  同族の連帯穴(領収書側)を塞いだもの。invoice 側の 2 穴は S13/S14 修正済み
+  → 「失敗が静かに成功に化ける」族はこれで全経路クローズ。
+
+[テスト] test_ocr_engine_receipt_pipeline.py 新設(4件)。
+- 部分失敗で失敗ページに _page_error が立つ / 全敗で全ページ _page_error
+  (Failed 保持語義の同値性) / page_bytes 保持 / Vision 兜底が失敗宣言前に
+  呼ばれる(回帰保護)。RED(3敗)確認後に修正で GREEN。全量 273 本 OK。
+
+[次 session の課題: 8頁 PDF 事故の真因解明(Session 12 由来, 依然オープン)]
+1. mini PC コンソールで対象ファイル再試行時の「finish_reason=MAX_TOKENS」
+   ログを確認(診断ログは main に反映済み)。または該当 8頁 PDF を
+   local_test.py --only-file で本地再現。
+   確認後の対策候補: max_output_tokens 32768→65536(flash 上限は要公式確認) /
+   截断検出時に思考予算を絞って1回だけ再試行(SDK 対応要調査, TBD) /
+   8頁大請求書の分块/逐页 Gemini 呼び出し。
+2. ユーザー裁定待ち: 確定性失敗の無限再試行を「同一ファイル N 回失敗で
+   歸檔+全頁占位行」に変えるか(Chatwork 廃止後コンソール以外不可視)。
+3. automation@ を EMPLOYEE_MAP に入れるかの決策(Session 12 TODO[3], 未裁定)。
