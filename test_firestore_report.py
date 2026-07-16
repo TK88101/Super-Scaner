@@ -11,7 +11,7 @@ transaction_runner=lambda body: body(fake_txn) 繞過真實 SDK transactional �
 import os
 import sys
 import unittest
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -67,9 +67,6 @@ class FakeTransaction:
     def __init__(self):
         self.set_call_count = 0
 
-    def get(self, doc_ref):
-        return doc_ref.get()
-
     def set(self, doc_ref, data):
         doc_ref.set(data)
         self.set_call_count += 1
@@ -88,6 +85,27 @@ class FakeFirestoreClient:
         if name == "alerts":
             return FakeCollection(self.alerts_store)
         raise ValueError(f"未知 collection: {name}")
+
+
+class _ExplodingCollection:
+    """set() が必ず失敗する alerts collection ダブル（旁路失敗の隔離検証用）。"""
+
+    def document(self, doc_id):
+        return _ExplodingDocRef()
+
+
+class _ExplodingDocRef:
+    def set(self, data):
+        raise RuntimeError("boom")
+
+
+class ExplodingAlertClient(FakeFirestoreClient):
+    """alerts への書込だけ必ず失敗する fake client。jobs 側は正常動作。"""
+
+    def collection(self, name):
+        if name == "alerts":
+            return _ExplodingCollection()
+        return super().collection(name)
 
 
 class CountingTransactionRunner:
@@ -183,6 +201,11 @@ class ReportPostedTest(unittest.TestCase):
         self.assertIn("file-xyz", client.alerts_store)
         self.assertEqual(len(client.alerts_store), 1)
         self.assertEqual(runner.run_count, 1)
+        # 事務內觀測值須隨 alert 帶出（裁決線索自包含）
+        alert = client.alerts_store["file-xyz"]
+        self.assertEqual(alert["observed_epoch"], 2)
+        self.assertEqual(alert["expected_epoch"], 1)
+        self.assertTrue(result.alert_delivered)
 
     def test_unexpected_state_rejected_with_alert(self):
         # Arrange: job 現態為 ROUTED（非 POSTING_IN_PROGRESS）
@@ -197,6 +220,7 @@ class ReportPostedTest(unittest.TestCase):
         self.assertEqual(result.reason, "unexpected_state")
         self.assertEqual(txn.set_call_count, 0)
         self.assertIn("file-4", client.alerts_store)
+        self.assertEqual(client.alerts_store["file-4"]["observed_state"], "ROUTED")
 
     def test_unexpected_state_without_source_file_id_falls_back_to_job_id(self):
         # Arrange: job 文檔缺 source_file_id 字段 → alert doc ID 退用 job_id
@@ -224,6 +248,33 @@ class ReportPostedTest(unittest.TestCase):
         self.assertIn("missing-job", client.alerts_store)
         self.assertEqual(txn.set_call_count, 0)
         self.assertEqual(runner.run_count, 1)
+
+    def test_alert_write_failure_does_not_mask_rejected_result(self):
+        # Altitude review 採納: alert 旁路失敗不得綁架已定案的裁決結果——
+        # 不拋例外、以 alert_delivered=False 旗標回傳（防呼叫方誤判「回報失敗」而無限重跑）
+        client = ExplodingAlertClient()
+        txn = FakeTransaction()
+        runner = CountingTransactionRunner(txn)
+        reporter = FirestoreReporter(client, transaction_runner=runner)
+        _seed_job(client, "job-13", current_state="ROUTED", lease_epoch=1, source_file_id="file-13")
+
+        result = reporter.report_posted("job-13", lease_epoch=1)
+
+        self.assertEqual(result.outcome, ReportOutcome.REJECTED)
+        self.assertEqual(result.reason, "unexpected_state")
+        self.assertFalse(result.alert_delivered)
+        self.assertEqual(txn.set_call_count, 0)
+        self.assertEqual(runner.run_count, 1)
+
+    def test_report_alert_extra_key_collision_raises(self):
+        # 程序錯誤守衛: alert_extra 與 alert 核心欄位鍵衝突 → ValueError（fail fast）
+        reporter, client, txn, runner = _make_reporter()
+        _seed_job(client, "job-12", current_state="ROUTED", lease_epoch=1, source_file_id="file-12")
+        with self.assertRaises(ValueError):
+            reporter._report(
+                "job-12", STATE_POSTED, lease_epoch=1,
+                patch={}, alert_extra={"reason": "shadow"},
+            )
 
     def test_missing_lease_epoch_field_defaults_to_zero(self):
         # 邊界: job 文檔缺 lease_epoch 字段 → 按預設 0 處理
@@ -263,6 +314,37 @@ class ReportDeadLetterTest(unittest.TestCase):
         self.assertEqual(last_error["message"], error["message"])
         self.assertIn("at", last_error)
 
+    def test_dead_letter_rejected_alert_carries_attempted_error(self):
+        # Altitude review 補測: dead_letter 被拒（過期 epoch）時，SS 判死的業務理由
+        # （attempted_error）必須進 alert，供控制面/人工裁決；job 文檔不變。
+        # Arrange
+        reporter, client, txn, runner = _make_reporter()
+        original = _seed_job(
+            client, "job-11", current_state=STATE_POSTING_IN_PROGRESS,
+            lease_epoch=2, source_file_id="file-11",
+        )
+        before = dict(original)
+        error = {
+            "stage": "POST",
+            "error_class": "NON_RETRYABLE",
+            "message": "PDF は壊れているか暗号化されています",
+        }
+
+        # Act
+        result = reporter.report_dead_letter("job-11", lease_epoch=1, error=error)
+
+        # Assert
+        self.assertEqual(result.outcome, ReportOutcome.REJECTED)
+        self.assertEqual(result.reason, "stale_lease_epoch")
+        self.assertEqual(client.jobs_store["job-11"], before)
+        self.assertEqual(txn.set_call_count, 0)
+        alert = client.alerts_store["file-11"]
+        self.assertEqual(alert["kind"], "transition_rejected")
+        self.assertEqual(alert["attempted_error"]["error_class"], "NON_RETRYABLE")
+        self.assertEqual(alert["attempted_error"]["stage"], "POST")
+        self.assertEqual(alert["attempted_error"]["message"], error["message"])
+        self.assertEqual(runner.run_count, 1)
+
     def test_dead_letter_invalid_error_class_raises_value_error_zero_writes(self):
         # 邊界: RETRYABLE / UNKNOWN / 缺鍵(含空 dict) 一律 ValueError、零寫入
         reporter, client, txn, runner = _make_reporter()
@@ -272,6 +354,7 @@ class ReportDeadLetterTest(unittest.TestCase):
             {"stage": "POST", "error_class": "UNKNOWN", "message": "m"},
             {"stage": "POST", "error_class": "GARBAGE", "message": "m"},  # 未知値
             {"stage": "POST", "error_class": "NON_RETRYABLE"},  # message 缺
+            {"stage": "POST", "error_class": "NON_RETRYABLE", "message": 123},  # message 非 str
             {},  # 空 dict
         ]
         for bad_error in bad_errors:
@@ -281,6 +364,20 @@ class ReportDeadLetterTest(unittest.TestCase):
                     reporter.report_dead_letter("job-8", lease_epoch=1, error=bad_error)
                 self.assertEqual(txn.set_call_count, 0)
                 self.assertEqual(len(client.alerts_store), 0)
+
+
+    def test_dead_letter_message_truncated_to_cap(self):
+        # 邊界: 超長自由文本硬性截斷（跨倉共享 collection 的最後防線）
+        reporter, client, txn, runner = _make_reporter()
+        _seed_job(client, "job-14", current_state=STATE_POSTING_IN_PROGRESS, lease_epoch=1)
+        error = {"stage": "POST", "error_class": "NON_RETRYABLE", "message": "x" * 5000}
+
+        result = reporter.report_dead_letter("job-14", lease_epoch=1, error=error)
+
+        self.assertEqual(result.outcome, ReportOutcome.APPLIED)
+        stored = client.jobs_store["job-14"]["last_error"]["message"]
+        self.assertEqual(len(stored), 1000)  # 含後綴恰等於上限
+        self.assertTrue(stored.endswith("…[截斷]"))
 
 
 class UtcTimestampTest(unittest.TestCase):

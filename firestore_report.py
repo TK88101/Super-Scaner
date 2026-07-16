@@ -29,16 +29,13 @@ REJECTED 語意（重要）：本模組每次呼叫恰執行一次 Firestore 事
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, TypeVar
 
 from google.cloud import firestore
-
-logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
@@ -47,13 +44,16 @@ STATE_POSTING_IN_PROGRESS = "POSTING_IN_PROGRESS"
 STATE_POSTED = "POSTED"
 STATE_DEAD_LETTER = "DEAD_LETTER"
 ACTOR_SUPER_SCANER = "super_scaner"
-ERROR_CLASSES = {"RETRYABLE", "NON_RETRYABLE", "UNKNOWN"}
 
-# report_dead_letter(error=...) 必含三鍵（契約 §3.2 事故排障最小欄位集）
+# report_dead_letter(error=...) 必含三鍵（契約 §3.2 事故排障最小欄位集）——
+# 校驗與 error_fields 抽取共用的單一真相源
 _DEAD_LETTER_ERROR_REQUIRED_KEYS = frozenset({"stage", "error_class", "message"})
 
-# state_history 條目白名單制：僅此三鍵，不得夾帶客戶名/金額等敏感字段
-_STATE_HISTORY_KEYS = ("state", "at", "by")
+# last_error / alert 內自由文本的硬性長度上限（跨倉共享 collection 的最後防線；
+# 語意級脫敏——客戶名/金額/文件名禁入——仍是呼叫方責任，basic-design/03 §3）。
+# 截斷後含後綴的總長恰等於上限（下游按此上限建 schema 不會收到超長值）。
+_MESSAGE_MAX_LEN = 1000
+_TRUNCATION_SUFFIX = "…[截斷]"
 
 
 class ReportOutcome(Enum):
@@ -67,20 +67,27 @@ class ReportOutcome(Enum):
 
 @dataclass(frozen=True)
 class ReportResult:
-    """report_posted / report_dead_letter 的回傳值（不可變）。"""
+    """report_posted / report_dead_letter 的回傳值（不可變）。
+
+    alert_delivered：REJECTED 時 alert 是否成功落檔。False＝alert 寫入失敗
+    （已列印診斷），但 job 文檔的裁決結果本身已定、不受影響——呼叫方不得
+    因此重試寫賬；是否補報 alert 由呼叫方/控制面政策決定。
+    """
 
     outcome: ReportOutcome
     job_id: str
     reason: str | None = None
+    alert_delivered: bool = True
 
 
 @dataclass(frozen=True)
 class _TransactionOutcome:
-    """事務 body 的內部回傳型別：把裁決結果與寫 alert 所需線索（source_file_id）
-    一起帶出事務邊界（alert 依契約在事務外寫，見 _report）。"""
+    """事務 body 的內部回傳型別：把裁決結果與寫 alert 所需線索（source_file_id
+    ＋事務內觀測值 observed）一起帶出事務邊界（alert 依契約在事務外寫，見 _report）。"""
 
     result: ReportResult
     source_file_id: str | None = None
+    observed: Mapping[str, Any] | None = None
 
 
 def _utcnow() -> datetime:
@@ -92,7 +99,8 @@ def _validate_dead_letter_error(error: Mapping[str, Any]) -> None:
     """report_dead_letter 的 error 參數校驗（fail fast，零寫入）。
 
     契約 §3.2：SS→DEAD_LETTER 僅限 NON_RETRYABLE（損壞/加密/空白等不可重試錯誤）；
-    RETRYABLE/UNKNOWN 一律視為呼叫方誤用，直接 ValueError，不寫任何 Firestore 文檔。
+    其他一切值（RETRYABLE/UNKNOWN/未知值）一律視為呼叫方誤用，直接 ValueError，
+    不寫任何 Firestore 文檔——單一判等即可覆蓋，毋須另設合法值枚舉。
     """
     missing = _DEAD_LETTER_ERROR_REQUIRED_KEYS - set(error.keys())
     if missing:
@@ -100,11 +108,12 @@ def _validate_dead_letter_error(error: Mapping[str, Any]) -> None:
             f"report_dead_letter: error 缺少必要鍵 {sorted(missing)}"
             f"（需含 {sorted(_DEAD_LETTER_ERROR_REQUIRED_KEYS)}）"
         )
-    error_class = error["error_class"]
-    if error_class not in ERROR_CLASSES:
+    if not isinstance(error["message"], str):
         raise ValueError(
-            f"report_dead_letter: error_class={error_class!r} 不在合法集合 {sorted(ERROR_CLASSES)}"
+            f"report_dead_letter: message 必須是 str（收到 {type(error['message']).__name__}）"
+            "——自由文本以外的型別禁入 last_error/alert"
         )
+    error_class = error["error_class"]
     if error_class != "NON_RETRYABLE":
         raise ValueError(
             "report_dead_letter: 契約 §3.2 規定 SS→DEAD_LETTER 僅限 NON_RETRYABLE，"
@@ -139,15 +148,18 @@ class FirestoreReporter:
         )
 
     def _default_transaction_runner(self, body: Callable[[Any], _T]) -> _T:
-        """SDK 預設事務路徑（對齊 firestore_store.py `_run_txn`）。"""
+        """SDK 預設事務路徑（對齊 firestore_store.py `_run_txn`）。
+
+        每次呼叫重建 wrapper 是刻意為之：SDK 的 _Transactional 持有 current_id/
+        retry_id 等可變狀態，共享單一實例在並發下是足槍；參照實裝 _run_txn 亦同型。
+        """
         txn = self._client.transaction()
 
         @firestore.transactional
         def _wrapped(transaction: Any) -> _T:
             return body(transaction)
 
-        result: _T = _wrapped(txn)
-        return result
+        return _wrapped(txn)
 
     def _job_doc(self, job_id: str) -> Any:
         return self._client.collection(self._jobs_collection).document(job_id)
@@ -167,19 +179,37 @@ class FirestoreReporter:
         error 必含 stage/error_class/message 三鍵且 error_class=="NON_RETRYABLE"
         （契約 §3.2），否則 ValueError、零寫入（_validate_dead_letter_error 先行校驗，
         校驗失敗時連事務都不會開啟）。
+
+        時戳語義（刻意雙軌，與控制面 mark_failed 同型——呼叫方自帶 error 時戳）：
+        last_error.at＝SS 觀測到錯誤的時刻（進事務前蓋章）；updated_at /
+        state_history[].at＝流轉提交時刻（事務 body 內蓋章）。兩者本是不同事件，
+        SDK 對 Aborted 的重試可使後者晚於前者，屬預期行為而非偏差。
+
+        本次回報若被拒（REJECTED），error 內容以 attempted_error 併入 alert——
+        控制面/人工裁決時可得知 SS 當初為何要判死（僅技術字段；message 由呼叫方
+        負責不夾帶客戶名/金額/文件名，日誌白名單 basic-design/03 §3）。
         """
         _validate_dead_letter_error(error)
         now = _utcnow()
+        # last_error 與 attempted_error 共用同一組三鍵，以必含鍵集合為單一真相源派生
+        error_fields: dict[str, Any] = {
+            k: error[k] for k in sorted(_DEAD_LETTER_ERROR_REQUIRED_KEYS)
+        }
+        if len(error_fields["message"]) > _MESSAGE_MAX_LEN:
+            capped = error_fields["message"][: _MESSAGE_MAX_LEN - len(_TRUNCATION_SUFFIX)]
+            error_fields = {**error_fields, "message": capped + _TRUNCATION_SUFFIX}
         patch: dict[str, Any] = {
             "error_class": error["error_class"],
-            "last_error": {
-                "stage": error["stage"],
-                "error_class": error["error_class"],
-                "message": error["message"],
-                "at": now,
-            },
+            "last_error": {**error_fields, "at": now},
         }
-        return self._report(job_id, STATE_DEAD_LETTER, lease_epoch=lease_epoch, patch=patch)
+        alert_extra: dict[str, Any] = {"attempted_error": error_fields}
+        return self._report(
+            job_id,
+            STATE_DEAD_LETTER,
+            lease_epoch=lease_epoch,
+            patch=patch,
+            alert_extra=alert_extra,
+        )
 
     def _report(
         self,
@@ -188,23 +218,34 @@ class FirestoreReporter:
         *,
         lease_epoch: int,
         patch: Mapping[str, Any],
+        alert_extra: Mapping[str, Any] | None = None,
     ) -> ReportResult:
         """共通讀-校-寫路徑（report_posted / report_dead_letter 都走此處）。
 
         事務內完成讀取 + 四項校驗（存在性 / 幂等 / 狀態 / epoch）+ 寫入；REJECTED
         情形下的 alert 寫入刻意放在事務**外**執行——alert 落哪個文檔 ID 需要 job 的
         source_file_id 欄位，讀出即可離開事務邊界，沒有理由把它綁進同一個事務。
+        alert_extra＝呼叫方附帶的裁決上下文（僅技術字段），REJECTED 時併入 alert
+        payload——上下文由知情層（呼叫方）提供、組裝由本層負責。
         本方法對每次呼叫恰呼叫一次 self._transaction_runner（不重試，見模組 docstring）。
         """
         doc_ref = self._job_doc(job_id)
-        serialized_patch = dict(patch)
+
+        def _rejected(
+            reason: str,
+            source_file_id: str | None = None,
+            observed: Mapping[str, Any] | None = None,
+        ) -> _TransactionOutcome:
+            return _TransactionOutcome(
+                ReportResult(ReportOutcome.REJECTED, job_id, reason=reason),
+                source_file_id=source_file_id,
+                observed=observed,
+            )
 
         def body(transaction: Any) -> _TransactionOutcome:
             snap = doc_ref.get(transaction=transaction)
             if not snap.exists:
-                return _TransactionOutcome(
-                    ReportResult(ReportOutcome.REJECTED, job_id, reason="job_not_found")
-                )
+                return _rejected("job_not_found")
             data: dict[str, Any] = snap.to_dict() or {}
             source_file_id = data.get("source_file_id")
             current_state = data.get("current_state")
@@ -214,60 +255,87 @@ class FirestoreReporter:
                 return _TransactionOutcome(ReportResult(ReportOutcome.ALREADY_DONE, job_id))
 
             if current_state != STATE_POSTING_IN_PROGRESS:
-                return _TransactionOutcome(
-                    ReportResult(ReportOutcome.REJECTED, job_id, reason="unexpected_state"),
-                    source_file_id=source_file_id,
+                # 事務內觀測值隨結果帶出——alert 須自帶「實際卡在哪」的裁決線索
+                return _rejected(
+                    "unexpected_state", source_file_id,
+                    observed={"observed_state": current_state},
                 )
 
             actual_epoch = int(data.get("lease_epoch", 0))
             if actual_epoch != lease_epoch:
-                return _TransactionOutcome(
-                    ReportResult(ReportOutcome.REJECTED, job_id, reason="stale_lease_epoch"),
-                    source_file_id=source_file_id,
+                return _rejected(
+                    "stale_lease_epoch", source_file_id,
+                    observed={"observed_epoch": actual_epoch, "expected_epoch": lease_epoch},
                 )
 
             now = _utcnow()
-            new_data: dict[str, Any] = {**data, **serialized_patch}
+            # 全文檔 set（讀-改-寫）是刻意為之：與控制面參照實裝 transition() 同型。
+            # 勿改成 update()+ArrayUnion——ArrayUnion 帶去重語義，違反契約
+            # 「state_history 只追加」；且回報頻度低（每 job 一次）、文檔小，
+            # >200 條歷史本身即対賬報警線（契約 §2）。
+            new_data: dict[str, Any] = {**data, **patch}
             new_data["current_state"] = to_state
             new_data["updated_at"] = now
             new_data["attempt_count"] = 0  # F27：跨階段流轉歸零
             history = list(data.get("state_history") or [])
-            history.append(dict(zip(_STATE_HISTORY_KEYS, (to_state, now, ACTOR_SUPER_SCANER))))
+            # state_history 條目白名單制：恰此三鍵，不得夾帶客戶名/金額等敏感字段
+            history.append({"state": to_state, "at": now, "by": ACTOR_SUPER_SCANER})
             new_data["state_history"] = history
             transaction.set(doc_ref, new_data)
             return _TransactionOutcome(ReportResult(ReportOutcome.APPLIED, job_id))
 
         outcome = self._transaction_runner(body)
 
+        # 診斷輸出走倉庫慣例的 print（生產監控＝人工盯控制台；全倉未配置 logging，
+        # logger.info 在預設 WARNING level 下不可見）。輸出僅限技術字段白名單。
         if outcome.result.outcome is ReportOutcome.REJECTED:
-            alert_id = (
-                job_id
-                if outcome.result.reason == "job_not_found"
-                else (outcome.source_file_id or job_id)
-            )
-            self.write_alert(
-                alert_id,
-                {"job_id": job_id, "reason": outcome.result.reason, "state": to_state},
-            )
-            logger.warning(
-                "回報被拒 job_id=%s reason=%s state=%s",
-                job_id,
-                outcome.result.reason,
-                to_state,
-            )
+            # job_not_found 時 body 不附 source_file_id → 自然退用 job_id 作 alert 鍵
+            alert_id = outcome.source_file_id or job_id
+            payload: dict[str, Any] = {
+                "kind": "transition_rejected",  # 與 F20「無 id 文件」上報的判別欄
+                "job_id": job_id,
+                "reason": outcome.result.reason,
+                "state": to_state,
+            }
+            for extra in (outcome.observed, alert_extra):
+                if not extra:
+                    continue
+                overlap = set(payload) & set(extra)
+                if overlap:
+                    # 程序錯誤守衛：附加欄位覆蓋既有欄位＝呼叫方 bug，fail fast
+                    raise ValueError(f"_report: alert 附加欄位鍵衝突 {sorted(overlap)}")
+                payload = {**payload, **extra}
+            result = outcome.result
+            try:
+                self.write_alert(alert_id, payload)
+            except Exception as exc:
+                # alert 是從屬旁路：其失敗不得綁架已定案的裁決結果（防止呼叫方誤判
+                # 「回報失敗」而無限重跑整件——ENTRY_BUILDERS 事故同型）。失敗以
+                # 旗標回傳＋列印，交呼叫方/控制面政策處置，不靜默。
+                print(
+                    f"alert 寫入失敗（裁決結果不受影響） alert_id={alert_id} "
+                    f"error_type={type(exc).__name__}"
+                )
+                result = replace(result, alert_delivered=False)
+            print(f"回報被拒 job_id={job_id} reason={outcome.result.reason} state={to_state}")
+            return result
         elif outcome.result.outcome is ReportOutcome.APPLIED:
-            logger.info("回報成功 job_id=%s state=%s", job_id, to_state)
+            print(f"回報成功 job_id={job_id} state={to_state}")
         else:
-            logger.info("目標態已達成，冪等忽略 job_id=%s state=%s", job_id, to_state)
+            print(f"目標態已達成、冪等忽略 job_id={job_id} state={to_state}")
 
         return outcome.result
 
     def write_alert(self, alert_id: str, payload: Mapping[str, Any]) -> None:
         """寫入 `alerts/{alert_id}`（覆蓋語意，一次 `set()`；文檔 ID 天然冪等鍵）。
 
-        不可變風格：呼叫方傳入的 payload 先淺拷貝再補時戳/actor 欄位，絕不就地
-        修改呼叫方的 dict。
+        覆蓋語義的已知窗口（TBD 升級中，B1 不代拍）：同一 alert_id 先後因**不同**
+        原因被拒時，後寫覆蓋前寫、早先線索丟失。alerts 集合是跨倉共享 schema
+        （控制面後續建讀取面），追加式改造屬契約層決策——已隨 B1 匯報升級趙裁決；
+        在此之前維持契約既定的最小覆蓋語義（F20：文檔 ID 天然冪等）。
+
+        不可變風格：spread 展開本身即產生新 dict，絕不就地修改呼叫方的 payload。
         """
-        enriched: dict[str, Any] = {**dict(payload), "at": _utcnow(), "by": ACTOR_SUPER_SCANER}
+        enriched: dict[str, Any] = {**payload, "at": _utcnow(), "by": ACTOR_SUPER_SCANER}
         self._alert_doc(alert_id).set(enriched)
-        logger.info("alert 已寫入 alert_id=%s", alert_id)
+        print(f"alert 已寫入 alert_id={alert_id}")
