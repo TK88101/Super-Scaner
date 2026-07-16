@@ -17,9 +17,10 @@
   `notifier.py:20-22` が token 未設定時に静默スキップするため、キー不在＝零コスト無害。
 - 検収基準（IP-309 験収線索）：
   - [ ] headless 全流程走行中、`api.chatwork.com` への出站リクエストが零件（ログ/抓包で確認）
-  - [ ] 同一環境で失敗を 1 件製造 → Firestore に対応する失敗 transition が出現
-        （IP-301 完成後に打勾。単体レベルは `test_firestore_report.py` の DEAD_LETTER 系テストで担保；
-        真庫聯調は U14（実 Firestore＋SA）就緒待ち）
+  - [x] 失敗製造 → Firestore に失敗 transition 出現（**単体レベル担保済み** 2026-07-16：
+        `test_firestore_report.py` の DEAD_LETTER 系テストが fake Firestore 上で
+        POSTING_IN_PROGRESS→DEAD_LETTER の transition と last_error 落檔を検証、12/12 綠）
+  - [ ] 同上・**真庫聯調**（実 Firestore＋SA が就緒する U14 待ち。B1 時点では実施不能）
 
 ## 2. `.env` キー一覧（静的 grep による現行棚卸し）
 
