@@ -76,7 +76,7 @@ PaddleOCR 先抽文本，再按 `config.OCR_STRATEGY` (默认 "C") 路由：
 `.env` 按文书类型配多个文件夹 ID (`FOLDER_RECEIPT_ID` 等)，映射为 `{folder_id: doc_type}`。兼容旧的单文件夹 `INPUT_FOLDER_ID` (默认 receipt)。上传者身份从 Drive `lastModifyingUser` email → `config.EMPLOYEE_MAP` 解析。
 
 ### Sheets 输出（`sheets_output.py`）
-按 `员工名_文书类型后缀` 自动分 Tab。每行 28 列 (MF 标准 27 + 原票 URL)。A1-A4 写高亮凡例。异常单元格按 severity 标色 (`_apply_anomaly_highlight`)。取引No 在 `_config` tab 管理，`flush()` 回写。**1000 行边界**：`_ensure_row_capacity` 自动扩容，注意历史 bug 是扩容时颜色会传染到空尾行 (`_sanitize_trailing_once` 处理)。
+按 `员工名_文书类型后缀` 自动分 Tab。每行 28 列 (MF 标准 27 + 原票 URL)。A1-A4 写高亮凡例。异常单元格按 severity 标色 (`_apply_anomaly_highlight`)。取引No＝进程内存 dict `_tab_next_txn` 管理，冷启动时扫该 Tab A 列 max+1 重建（`sheets_output.py:84-101`）；`flush()` 是兼容保留的 no-op，无任何回写；`_config` tab 只存在于 GAS 侧（`gas/daily_backup.gs`），Python 运行路径无此概念（2026-07-16 盘点纠正；读取点全量清单见 `feature/sandevistan-headless` 分支的 `docs/headless-sheets-read-audit.md`）。**1000 行边界**：`_ensure_row_capacity` 自动扩容，注意历史 bug 是扩容时颜色会传染到空尾行 (`_sanitize_trailing_once` 处理)。
 
 ### 多页 PDF 精密链接（`main.PageUrlResolver`）
 Drive 原生预览忽略 `#page=N`，故每页拆成单页 PDF 上传到 `SPLIT_PDF_FOLDER_ID` 并链到单独文件。冪等：单页文件名嵌入源 PDF file id，重跑/崩溃恢复时先查询既存页复用，避免重复增殖。失败时安全降级回 `base_url#page=N`。
