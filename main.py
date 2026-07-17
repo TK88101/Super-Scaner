@@ -229,7 +229,7 @@ def list_files(service, folder_id):
         #   個人 My Drive でもこの2フラグは無害なので常時付与し両対応にする。
         supportsAllDrives=True,
         includeItemsFromAllDrives=True,
-        fields="nextPageToken, files(id, name, lastModifyingUser, md5Checksum)"
+        fields="nextPageToken, files(id, name, lastModifyingUser, md5Checksum, properties)"
     ).execute())
     return results.get('files', [])
 
