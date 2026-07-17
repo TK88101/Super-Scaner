@@ -1,4 +1,3 @@
-import functools
 import os
 import sys
 import time
@@ -280,38 +279,38 @@ def move_file(service, file_id, previous_folder_id, new_folder_id):
 
 
 def _init_headless_reporter():
-    """main() 起動段の reporter 構築を切り出す（IP-303 接線ヘルパー抽出＝
-    可測化。新增行80%鉄律）。
+    """HEADLESS_MODE 起動時の Firestore reporter を構築する。
 
-    UI 版（HEADLESS_MODE 未設定）では reporter を作らず None を返す（既存挙動
-    に一切影響しない）。HEADLESS_MODE だが QUARANTINE_FOLDER_ID 未設定は
-    fail fast のため print + exit(1) を保つ（起動時に気付かせる）。
+    UI 版（HEADLESS_MODE 未設定）では reporter を作らず None を返す。
+    HEADLESS_MODE だが QUARANTINE_FOLDER_ID 未設定は起動時に print + exit(1)
+    する（fail fast）。
     """
-    if not config.HEADLESS_MODE:
+    if not config.headless_mode():
         return None
-    if not config.QUARANTINE_FOLDER_ID:
-        print("❌ エラー：HEADLESS_MODE には QUARANTINE_FOLDER_ID の設定が必須です。")
+    missing = config.validate_headless_config()
+    if missing:
+        print(f"❌ エラー：HEADLESS_MODE には次のキーの設定が必須です: {', '.join(missing)}")
         exit(1)
     return firestore_report.build_reporter_from_env()
 
 
-def _headless_intake_gate(service, file, input_folder_id, reporter) -> bool:
-    """main() ファイル循環内の入口守衛接線を切り出す（IP-303 接線ヘルパー抽出
-    ＝可測化。新增行80%鉄律）。
+def _headless_intake_gate(service, file, input_folder_id, reporter, alerted=None) -> bool:
+    """監視フォルダ入口守衛（IP-303）を1ファイルに適用する。
 
-    非 HEADLESS_MODE では常に True（副作用なし、既存 UI 版挙動を保つ）。
-    functools.partial を使う理由＝呼び出し時点の file/input_folder_id を
-    束縛するため（呼び出し元の for ループでの遅延束縛問題を避ける）。
+    非 HEADLESS_MODE では常に True（副作用なし）。HEADLESS_MODE では
+    intake_guard.handle_intake の裁決結果（続行可＝True／隔離済み・保留＝
+    False）をそのまま返す。alerted は main() が持つ拒絶件記憶層（進程内快取）
+    をそのまま handle_intake へ橋渡しするだけで、ここでは中身に関知しない。
     """
-    if not config.HEADLESS_MODE:
+    if not config.headless_mode():
         return True
     return intake_guard.handle_intake(
         file,
         get_job=reporter.get_job,
         write_alert=reporter.write_alert,
-        move_to_quarantine=functools.partial(
-            _move_file_raw, service, file["id"], input_folder_id,
-            config.QUARANTINE_FOLDER_ID),
+        move_to_quarantine=lambda: _move_file_raw(
+            service, file["id"], input_folder_id, config.quarantine_folder_id()),
+        alerted=alerted,
     )
 
 
@@ -597,6 +596,11 @@ def main():
     # 一切影響しない。
     reporter = _init_headless_reporter()
 
+    # 拒絶件記憶層（IP-303、進程内快取）: alert 送達済みだが move が未完了の
+    # file_id を憶えておき、次輪で check_intake/get_job/write_alert を
+    # 再実行させない（Firestore 無界重打の防止）。プロセス再起動で自然に消える。
+    quarantine_alerted: dict[str, str] = {}
+
     active_folder_map = filter_active_folders(folder_map, writers)
     if not active_folder_map:
         # 接続できたプロファイルに入力フォルダが1つも無い状態。ループに入ると
@@ -647,7 +651,9 @@ def main():
                     # base posting_id を検証する。無 posting_id / job 不一致件
                     # はここで隔離夾へ退避し、以降の処理（Sheets 書込含む）へ
                     # 進ませない。
-                    if not _headless_intake_gate(service, file, input_folder_id, reporter):
+                    if not _headless_intake_gate(
+                            service, file, input_folder_id, reporter,
+                            alerted=quarantine_alerted):
                         print("=" * 30)
                         continue
 

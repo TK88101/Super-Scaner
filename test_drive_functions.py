@@ -76,6 +76,24 @@ class ListFilesSharedDriveTest(unittest.TestCase):
         self.assertEqual(main.list_files(service, "F"), [])
 
 
+class ListFilesFieldsTest(unittest.TestCase):
+    """main.list_files が properties を含む fields で Drive API を呼ぶこと。
+
+    交棒契約の base posting_id は Drive 公開 properties に載る（v0.10 定名）。
+    list の fields にこれを含めないと properties が一切返らず、入口守衛
+    （check_intake/resolve_posting_id）が機能しない
+    （Drive API は明示指定したフィールドしか返さない仕様のため）。
+    """
+
+    def test_fields_include_properties(self):
+        service = _make_service_with_list([])
+
+        main.list_files(service, "FOLDER_X")
+
+        kwargs = service.files.return_value.list.call_args.kwargs
+        self.assertIn("properties", kwargs.get("fields", ""))
+
+
 class DownloadFileSharedDriveTest(unittest.TestCase):
     """download_file が get_media に supportsAllDrives を渡すこと。"""
 

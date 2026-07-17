@@ -289,45 +289,207 @@ class HandleIntakeTest(unittest.TestCase):
             set(payload.keys()), {"kind", "file_id", "reason", "posting_id"})
 
 
-class HeadlessModeConfigTest(unittest.TestCase):
-    """config.HEADLESS_MODE の env 解析（IP-303 入口守衛の有効化フラグ）。"""
+class HandleIntakeAlertedMemoTest(unittest.TestCase):
+    """handle_intake の alerted（進程内快取）: 拒絶件記憶層（Firestore 無界重打
+    の防止）。alerted は file_id → 拒絶 reason の進程内快取で、呼び出し方
+    （main() 循環）がライフサイクルを持つ。"""
 
-    def tearDown(self):
-        # 他テストへの汚染防止: 常に実環境で再 reload して復元
-        importlib.reload(config)
+    def _make_calls(self):
+        calls = {"get_job": 0, "alert": [], "move": []}
 
-    def test_headless_mode_true_when_env_is_one(self):
+        def get_job(job_id):
+            calls["get_job"] += 1
+            return None
+
+        def write_alert(alert_id, payload):
+            calls["alert"].append((alert_id, payload))
+
+        def move_to_quarantine():
+            calls["move"].append(True)
+
+        return calls, get_job, write_alert, move_to_quarantine
+
+    def test_memo_hit_skips_check_intake_and_only_retries_move(self):
+        file = {"id": "f1"}
+        calls, get_job, write_alert, move_to_quarantine = self._make_calls()
+        alerted = {"f1": "no_posting_id"}
+
+        result = handle_intake(
+            file, get_job=get_job, write_alert=write_alert,
+            move_to_quarantine=move_to_quarantine, alerted=alerted,
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(0, calls["get_job"])
+        self.assertEqual([], calls["alert"])
+        self.assertEqual([True], calls["move"])
+
+    def test_memo_hit_and_move_succeeds_removes_key_and_returns_false(self):
+        file = {"id": "f1"}
+        calls, get_job, write_alert, move_to_quarantine = self._make_calls()
+        alerted = {"f1": "no_posting_id"}
+
+        result = handle_intake(
+            file, get_job=get_job, write_alert=write_alert,
+            move_to_quarantine=move_to_quarantine, alerted=alerted,
+        )
+
+        self.assertFalse(result)
+        self.assertNotIn("f1", alerted)
+
+    def test_memo_hit_and_move_fails_keeps_key(self):
+        file = {"id": "f1"}
+        alerted = {"f1": "no_posting_id"}
+
+        def get_job(job_id):
+            raise AssertionError("get_job must not be called on memo hit")
+
+        def write_alert(alert_id, payload):
+            raise AssertionError("write_alert must not be called on memo hit")
+
+        def move_to_quarantine():
+            raise RuntimeError("move boom")
+
+        result = handle_intake(
+            file, get_job=get_job, write_alert=write_alert,
+            move_to_quarantine=move_to_quarantine, alerted=alerted,
+        )
+
+        self.assertFalse(result)
+        self.assertIn("f1", alerted)
+        self.assertEqual("no_posting_id", alerted["f1"])
+
+    def test_full_path_alert_success_move_failure_records_reason_in_memo(self):
+        file = {"id": "f1"}  # no_posting_id
+        store = FakeJobStore({})
+        alerted: dict = {}
+
+        def write_alert(alert_id, payload):
+            pass
+
+        def move_to_quarantine():
+            raise RuntimeError("move boom")
+
+        result = handle_intake(
+            file, get_job=store.get_job, write_alert=write_alert,
+            move_to_quarantine=move_to_quarantine, alerted=alerted,
+        )
+
+        self.assertFalse(result)
+        self.assertEqual("no_posting_id", alerted.get("f1"))
+
+    def test_full_path_alert_and_move_both_succeed_key_not_left_in_memo(self):
+        file = {"id": "f1"}  # no_posting_id
+        store = FakeJobStore({})
+        alerted: dict = {}
+
+        result = handle_intake(
+            file, get_job=store.get_job, write_alert=lambda *a: None,
+            move_to_quarantine=lambda: None, alerted=alerted,
+        )
+
+        self.assertFalse(result)
+        self.assertNotIn("f1", alerted)
+
+    def test_alert_failure_does_not_touch_memo(self):
+        file = {"id": "f1"}  # no_posting_id
+        store = FakeJobStore({})
+        alerted: dict = {}
+
+        def write_alert(alert_id, payload):
+            raise RuntimeError("alert boom")
+
+        result = handle_intake(
+            file, get_job=store.get_job, write_alert=write_alert,
+            move_to_quarantine=lambda: None, alerted=alerted,
+        )
+
+        self.assertFalse(result)
+        self.assertEqual({}, alerted)
+
+    def test_deferred_does_not_touch_memo(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-4"}}
+        store = FakeJobStore(raise_exc=TimeoutError("boom"))
+        alerted: dict = {}
+
+        result = handle_intake(
+            file, get_job=store.get_job, write_alert=lambda *a: None,
+            move_to_quarantine=lambda: None, alerted=alerted,
+        )
+
+        self.assertFalse(result)
+        self.assertEqual({}, alerted)
+
+
+class HeadlessAccessorCallTimeEvalTest(unittest.TestCase):
+    """config の headless 鍵は呼び出し時点で os.environ を評価すること（codex review
+    P1、B2 裁決）。
+
+    動機: main.py は `import config` の**後**に `load_dotenv()` を呼ぶ
+    （main.py:22-27）。もし headless_mode()/quarantine_folder_id() 等が
+    モジュール読込時に一度だけ評価される定数だったら、import 時点で
+    まだ .env が読み込まれていない os.environ の値（＝大抵は未設定）に
+    固化されてしまい、.env に HEADLESS_MODE=1 等を書いても headless が
+    永遠に非活性化する。この単体テストはそれを再現する: import 済みの
+    `config` モジュールに対し、import 後（このテスト実行時）に初めて
+    os.environ を設定しても、accessor がその値を正しく読めることを示す
+    ＝ load_dotenv が import の後で呼ばれても壊れないことの保証。
+    """
+
+    def test_headless_mode_reads_env_set_after_config_already_imported(self):
         with patch.dict(os.environ, {"HEADLESS_MODE": "1"}):
-            importlib.reload(config)
-            self.assertTrue(config.HEADLESS_MODE)
+            self.assertTrue(config.headless_mode())
+
+    def test_quarantine_folder_id_reads_env_set_after_config_already_imported(self):
+        with patch.dict(os.environ, {"QUARANTINE_FOLDER_ID": "Q1"}):
+            self.assertEqual("Q1", config.quarantine_folder_id())
+
+    def test_handoff_folder_id_reads_env_set_after_config_already_imported(self):
+        # B2＝鍵の予約のみ・未接線（folder_map への接線は後続批）だが、accessor
+        # 自体は他の3関数と同じ呼び出し時点評価であること。
+        with patch.dict(os.environ, {"HANDOFF_FOLDER_ID": "H1"}):
+            self.assertEqual("H1", config.handoff_folder_id())
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HANDOFF_FOLDER_ID", None)
+            self.assertEqual("", config.handoff_folder_id())
+
+    def test_firestore_project_id_reads_env_set_after_config_already_imported(self):
+        # U14（真 Firestore 環境）未就緒のため鍵先行。build_reporter_from_env は
+        # 本 accessor 経由でこの値を読む（単一真相源、B1 裁決反映）。
+        with patch.dict(os.environ, {"FIRESTORE_PROJECT_ID": "proj-9"}):
+            self.assertEqual("proj-9", config.firestore_project_id())
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FIRESTORE_PROJECT_ID", None)
+            self.assertEqual("", config.firestore_project_id())
+
+
+class HeadlessModeConfigTest(unittest.TestCase):
+    """config.headless_mode(): env 解析（IP-303 入口守衛の有効化フラグ）。"""
 
     def test_headless_mode_false_for_empty_string_or_zero(self):
         for value in ("", "0"):
             with self.subTest(value=value):
                 with patch.dict(os.environ, {"HEADLESS_MODE": value}):
-                    importlib.reload(config)
-                    self.assertFalse(config.HEADLESS_MODE)
+                    self.assertFalse(config.headless_mode())
+
+    def test_headless_mode_false_when_env_unset(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HEADLESS_MODE", None)
+            self.assertFalse(config.headless_mode())
 
 
-class ListFilesFieldsTest(unittest.TestCase):
-    """main.list_files が properties を含む fields で Drive API を呼ぶこと。
+class ValidateHeadlessConfigTest(unittest.TestCase):
+    """config.validate_headless_config: HEADLESS_MODE 起動必須鍵の缺落検査
+    （宣言側で一元管理、B3/B4 で鍵が増えたらここに足す）。"""
 
-    交棒契約の base posting_id は Drive 公開 properties に載る（v0.10 定名）。
-    list の fields にこれを含めないと properties が一切返らず、入口守衛
-    （check_intake/resolve_posting_id）が機能しない
-    （Drive API は明示指定したフィールドしか返さない仕様のため）。
-    """
+    def test_returns_missing_key_when_quarantine_folder_id_empty(self):
+        with patch.dict(os.environ, {"QUARANTINE_FOLDER_ID": ""}):
+            self.assertEqual(
+                ["QUARANTINE_FOLDER_ID"], config.validate_headless_config())
 
-    def test_fields_include_properties(self):
-        service = MagicMock()
-        service.files.return_value.list.return_value.execute.return_value = {
-            "files": []
-        }
-
-        main.list_files(service, "FOLDER_X")
-
-        kwargs = service.files.return_value.list.call_args.kwargs
-        self.assertIn("properties", kwargs.get("fields", ""))
+    def test_returns_empty_list_when_quarantine_folder_id_set(self):
+        with patch.dict(os.environ, {"QUARANTINE_FOLDER_ID": "Q_FOLDER"}):
+            self.assertEqual([], config.validate_headless_config())
 
 
 class InitHeadlessReporterTest(unittest.TestCase):
@@ -336,21 +498,19 @@ class InitHeadlessReporterTest(unittest.TestCase):
 
     def test_returns_none_when_not_headless(self):
         # UI 版（HEADLESS_MODE 未設定）は reporter を作らず None のまま
-        with patch.object(config, "HEADLESS_MODE", False):
+        with patch.dict(os.environ, {"HEADLESS_MODE": "0"}):
             self.assertIsNone(main._init_headless_reporter())
 
     def test_exits_when_headless_without_quarantine_folder(self):
         # headless なのに隔離夾未設定 → 既存の print + exit(1)（fail fast）を保つ
-        with patch.object(config, "HEADLESS_MODE", True), \
-                patch.object(config, "QUARANTINE_FOLDER_ID", ""), \
+        with patch.dict(os.environ, {"HEADLESS_MODE": "1", "QUARANTINE_FOLDER_ID": ""}), \
                 redirect_stdout(io.StringIO()):
             with self.assertRaises(SystemExit):
                 main._init_headless_reporter()
 
     def test_builds_reporter_from_env_when_headless_and_configured(self):
         sentinel_reporter = object()
-        with patch.object(config, "HEADLESS_MODE", True), \
-                patch.object(config, "QUARANTINE_FOLDER_ID", "Q_FOLDER"), \
+        with patch.dict(os.environ, {"HEADLESS_MODE": "1", "QUARANTINE_FOLDER_ID": "Q_FOLDER"}), \
                 patch("main.firestore_report.build_reporter_from_env",
                       return_value=sentinel_reporter) as mock_build:
             result = main._init_headless_reporter()
@@ -381,7 +541,7 @@ class HeadlessIntakeGateTest(unittest.TestCase):
         reporter = MagicMock()
         file = {"id": "f1"}
 
-        with patch.object(config, "HEADLESS_MODE", False):
+        with patch.dict(os.environ, {"HEADLESS_MODE": "0"}):
             result = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
 
         self.assertTrue(result)
@@ -397,8 +557,7 @@ class HeadlessIntakeGateTest(unittest.TestCase):
         reporter.get_job.return_value = None
         file = {"id": "f1"}  # properties 無し → no_posting_id
 
-        with patch.object(config, "HEADLESS_MODE", True), \
-                patch.object(config, "QUARANTINE_FOLDER_ID", "Q_FOLDER"), \
+        with patch.dict(os.environ, {"HEADLESS_MODE": "1", "QUARANTINE_FOLDER_ID": "Q_FOLDER"}), \
                 redirect_stdout(io.StringIO()):
             result = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
 
@@ -414,8 +573,7 @@ class HeadlessIntakeGateTest(unittest.TestCase):
         reporter.get_job.return_value = {"posting_id": "base-1"}
         file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-1"}}
 
-        with patch.object(config, "HEADLESS_MODE", True), \
-                patch.object(config, "QUARANTINE_FOLDER_ID", "Q_FOLDER"):
+        with patch.dict(os.environ, {"HEADLESS_MODE": "1", "QUARANTINE_FOLDER_ID": "Q_FOLDER"}):
             result = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
 
         self.assertTrue(result)
@@ -429,8 +587,7 @@ class HeadlessIntakeGateTest(unittest.TestCase):
         reporter.get_job.return_value = None
         file = {"id": "f2"}  # no_posting_id → REJECTED（alert/move まで到達）
 
-        with patch.object(config, "HEADLESS_MODE", True), \
-                patch.object(config, "QUARANTINE_FOLDER_ID", "Q_FOLDER"), \
+        with patch.dict(os.environ, {"HEADLESS_MODE": "1", "QUARANTINE_FOLDER_ID": "Q_FOLDER"}), \
                 redirect_stdout(io.StringIO()):
             main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
 
@@ -440,6 +597,35 @@ class HeadlessIntakeGateTest(unittest.TestCase):
         reporter.write_alert.assert_called_once()
         alert_id = reporter.write_alert.call_args.args[0]
         self.assertEqual("f2", alert_id)
+
+    def test_alerted_memo_survives_across_calls_and_suppresses_second_write_alert(self):
+        # move が初回失敗 → alerted に f1 が記憶される。同一 file を二回目に
+        # 呼んだとき、write_alert は再実行されず（旁路失敗の無界重打を防止）、
+        # move だけが再試行される。二回目の move が成功すれば memo から除去される。
+        service = self._make_service()
+        service.files.return_value.update.return_value.execute.side_effect = [
+            RuntimeError("move boom"),
+            {"id": "f1", "parents": ["Q_FOLDER"]},
+        ]
+        reporter = MagicMock()
+        reporter.get_job.return_value = None
+        file = {"id": "f1"}  # properties 無し → no_posting_id
+        alerted: dict = {}
+
+        with patch.dict(os.environ, {"HEADLESS_MODE": "1", "QUARANTINE_FOLDER_ID": "Q_FOLDER"}), \
+                redirect_stdout(io.StringIO()):
+            first = main._headless_intake_gate(
+                service, file, "INPUT_FOLDER", reporter, alerted=alerted)
+            self.assertFalse(first)
+            self.assertIn("f1", alerted, "初回 move 失敗直後は memo に残るはず")
+
+            second = main._headless_intake_gate(
+                service, file, "INPUT_FOLDER", reporter, alerted=alerted)
+
+        self.assertFalse(second)
+        self.assertNotIn("f1", alerted, "二回目の move 成功で memo から除去されるはず")
+        reporter.write_alert.assert_called_once()
+        self.assertEqual(2, service.files.return_value.update.call_count)
 
 
 if __name__ == "__main__":

@@ -250,14 +250,50 @@ def load_folder_map(profiles: dict = None) -> dict:
 
 
 # === ヘッドレスモード（サンデヴィスタン統合） ===
+# 境界宣言: 本ファイル前段の既存モジュール定数（OUTPUT_SPREADSHEET_ID/OCR_* 等）も
+# 同様に import 時点評価で load_dotenv の呼出し順序の影響を受けるが、意図的に未改造のまま残す
+# （UI 版ゼロ改動優先の判断）。新規追加する鍵は一律、下記の呼び出し時点評価方式に従うこと。
+#
 # feature/sandevistan-headless 専用。UI 版（main ブランチ）では
-# HEADLESS_MODE=False（未設定）のままで、既存挙動に一切影響しない。
+# headless_mode()==False（未設定）のままで、既存挙動に一切影響しない。
 # B2（IP-303）時点では入口守衛の有効化フラグ＋隔離夾のみ実接続。
-# HANDOFF_FOLDER_ID / FIRESTORE_PROJECT_ID は鍵の予約のみで、folder_map への
-# 接線・真庫接続は後続批（詳細は docs/headless-deploy-checklist.md）。
-HEADLESS_MODE = os.getenv("HEADLESS_MODE", "") == "1"
-# B2＝鍵の予約のみ・未接線（実体夾は趙が実建後、folder_map 接線は後続批）
-HANDOFF_FOLDER_ID = os.getenv("HANDOFF_FOLDER_ID", "")
-QUARANTINE_FOLDER_ID = os.getenv("QUARANTINE_FOLDER_ID", "")
-# U14（真 Firestore 環境）未就緒のため鍵先行。build_reporter_from_env が読む。
-FIRESTORE_PROJECT_ID = os.getenv("FIRESTORE_PROJECT_ID", "")
+# handoff_folder_id() / firestore_project_id() は鍵の予約のみで、folder_map
+# への接線・真庫接続は後続批（詳細は docs/headless-deploy-checklist.md）。
+#
+# 4関数とも呼び出し時点で os.getenv() を評価する（モジュール定数にしない、
+# codex review P1・B1 裁決で採択）。理由: main.py は load_dotenv() を
+# `import config` の**後**に呼ぶ（main.py:22-27）。もしここがモジュール定数
+# だと、import 時点でまだ .env が読み込まれていない os.environ の値
+# （＝大抵は未設定）に固化されてしまい、.env に HEADLESS_MODE=1 等を書いても
+# headless が永遠に非活性化する。呼び出し時点評価にすることで、load_dotenv
+# が import の後に呼ばれても正しく反映される（load_profiles/load_folder_map
+# と同じ「呼び出し時点評価」の先例に倣う）。
+
+
+def headless_mode() -> bool:
+    """HEADLESS_MODE フラグ（呼び出し時点評価、理由は本セクション冒頭 docstring 参照）。"""
+    return os.getenv("HEADLESS_MODE", "") == "1"
+
+
+def handoff_folder_id() -> str:
+    """B2＝鍵の予約のみ・未接線（実体夾は趙が実建後、folder_map 接線は後続批）。"""
+    return os.getenv("HANDOFF_FOLDER_ID", "")
+
+
+def quarantine_folder_id() -> str:
+    return os.getenv("QUARANTINE_FOLDER_ID", "")
+
+
+def firestore_project_id() -> str:
+    """U14（真 Firestore 環境）未就緒のため鍵先行。build_reporter_from_env が読む。"""
+    return os.getenv("FIRESTORE_PROJECT_ID", "")
+
+
+def validate_headless_config() -> list:
+    """HEADLESS_MODE 起動に必須の鍵の缺落清單（宣言側で一元管理、B3/B4 で鍵が
+    増えたらここに足す）。呼び出し時点の env を讀む純関数。
+    """
+    missing = []
+    if not quarantine_folder_id():
+        missing.append("QUARANTINE_FOLDER_ID")
+    return missing

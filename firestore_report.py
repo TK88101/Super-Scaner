@@ -39,6 +39,8 @@ from typing import Any, TypeVar
 from google.cloud import firestore
 from google.oauth2 import service_account
 
+import config
+
 _T = TypeVar("_T")
 
 # --- 常量（契約權威值，勿臆造） -------------------------------------------------
@@ -377,7 +379,7 @@ def build_reporter_from_env() -> FirestoreReporter:
         kwargs["credentials"] = (
             service_account.Credentials.from_service_account_file(sa_file)
         )
-    project_id = os.getenv("FIRESTORE_PROJECT_ID", "")
+    project_id = config.firestore_project_id()
     if project_id:
         kwargs["project"] = project_id
     client = firestore.Client(**kwargs)
