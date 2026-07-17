@@ -1,3 +1,4 @@
+import functools
 import os
 import sys
 import time
@@ -20,6 +21,8 @@ from sheets_output import SheetsOutputWriter
 from notifier import send_notification
 from doc_types import DocType, DOC_TYPE_CONFIG
 import config
+import firestore_report
+import intake_guard
 
 # ================= 配置區域 =================
 load_dotenv()
@@ -250,16 +253,27 @@ def download_file(service, file_id, file_name):
     return file_path
 
 
+def _move_file_raw(service, file_id, previous_folder_id, new_folder_id) -> None:
+    """move_file の共通実装（例外を握り潰さず伝播、print 無し）。
+
+    HEADLESS_MODE の隔離夾送り（intake_guard.handle_intake の
+    move_to_quarantine）は成否を呼び出し元で判定する必要があるため、例外を
+    透過させる版を切り出す。既存 move_file の print 文言・吞例外挙動
+    （UI 零改動）はここでは一切変えない——move_file はこれを包むだけ。
+    """
+    service.files().update(
+        fileId=file_id,
+        addParents=new_folder_id,
+        removeParents=previous_folder_id,
+        # 共有ドライブ対応: 共有ドライブ内/への移動には supportsAllDrives が必須
+        supportsAllDrives=True,
+        fields='id, parents'
+    ).execute()
+
+
 def move_file(service, file_id, previous_folder_id, new_folder_id):
     try:
-        service.files().update(
-            fileId=file_id,
-            addParents=new_folder_id,
-            removeParents=previous_folder_id,
-            # 共有ドライブ対応: 共有ドライブ内/への移動には supportsAllDrives が必須
-            supportsAllDrives=True,
-            fields='id, parents'
-        ).execute()
+        _move_file_raw(service, file_id, previous_folder_id, new_folder_id)
         print(f"📦 元画像を処理済みフォルダ(Processed)へ移動しました")
     except Exception as e:
         print(f"⚠️ ファイル移動中に警告が発生しました: {e}")
@@ -542,6 +556,17 @@ def main():
         print("❌ エラー：どの出力シートにも接続できませんでした。")
         exit(1)
 
+    # ヘッドレスモード（サンデヴィスタン統合、IP-303）: 入口守衛が使う
+    # Firestore reporter を起動時に一度だけ構築する。UI 版
+    # （HEADLESS_MODE 未設定）では reporter は None のまま、既存挙動に
+    # 一切影響しない。
+    reporter = None
+    if config.HEADLESS_MODE:
+        if not config.QUARANTINE_FOLDER_ID:
+            print("❌ エラー：HEADLESS_MODE には QUARANTINE_FOLDER_ID の設定が必須です。")
+            exit(1)
+        reporter = firestore_report.build_reporter_from_env()
+
     active_folder_map = filter_active_folders(folder_map, writers)
     if not active_folder_map:
         # 接続できたプロファイルに入力フォルダが1つも無い状態。ループに入ると
@@ -587,6 +612,25 @@ def main():
                     file_id = file['id']
                     file_name = file['name']
                     md5 = file.get('md5Checksum')
+
+                    # 0. ヘッドレスモード入口守衛（IP-303）: 防重檢測より前に
+                    # base posting_id を検証する。無 posting_id / job 不一致件
+                    # はここで隔離夾へ退避し、以降の処理（Sheets 書込含む）へ
+                    # 進ませない。functools.partial を使う理由＝for ループ内
+                    # クロージャの遅延束縛（late binding）を避けるため
+                    # （lambda だと file_id/input_folder_id が最後の反復値に
+                    #   固定されてしまう）。
+                    if config.HEADLESS_MODE:
+                        if not intake_guard.handle_intake(
+                            file,
+                            get_job=reporter.get_job,
+                            write_alert=reporter.write_alert,
+                            move_to_quarantine=functools.partial(
+                                _move_file_raw, service, file_id, input_folder_id,
+                                config.QUARANTINE_FOLDER_ID),
+                        ):
+                            print("=" * 30)
+                            continue
 
                     # 1. 防重檢測（同一プロファイルのアーカイブ内のみを見る）
                     if is_duplicate_file(service, md5, processed_folder_id):

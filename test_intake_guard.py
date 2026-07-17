@@ -1,19 +1,44 @@
-"""intake_guard.py の単体テスト（IP-302: base posting_id 受信）。
+"""intake_guard.py の単体テスト（IP-302: base posting_id 受信 / IP-303: 監視夾入口守衛）。
 
 サンデヴィスタン契約 job-state-machine.md v0.12 §3.2/§6 対齊：
     - base posting_id の載体＝Drive 公開 properties、key ＝ POSTING_ID_PROPERTY_KEY
       （契約 v0.10 定名の跨倉庫契約値。改名即破壊交棒）。
+    - SS は無 posting_id / job 不一致件を拒絶＋隔離夾退避＋alerts/{file_id} 直書き
+      （IP-303、契約 §3.2 交棒行）。
 
 跑法:
     venv311/bin/python -m unittest test_intake_guard -v
 """
+import importlib
 import os
 import sys
 import unittest
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from intake_guard import POSTING_ID_PROPERTY_KEY, resolve_posting_id
+# main.py はモジュール読込時に必須環境変数が無いと exit(1) する。
+# 実 .env が無い環境(CI 等)でも import できるよう、未設定のものだけ補完する
+# （test_drive_functions.py と同じ防御パターン。python-dotenv の load_dotenv は
+#   既存 os.environ を上書きしないので、実 .env がある場合はそちらが優先される）。
+os.environ.setdefault("PROCESSED_FOLDER_ID", "test_processed_folder")
+os.environ.setdefault("SERVICE_ACCOUNT_FILE", "test_sa.json")
+os.environ.setdefault("OUTPUT_SPREADSHEET_ID", "test_spreadsheet")
+os.environ.setdefault("FOLDER_RECEIPT_ID", "test_receipt_folder")
+
+import config
+
+importlib.reload(config)  # 先に env 無しで import 済みでも値を反映させる
+import main
+
+from intake_guard import (
+    POSTING_ID_PROPERTY_KEY,
+    IntakeCheck,
+    IntakeDecision,
+    check_intake,
+    handle_intake,
+    resolve_posting_id,
+)
 
 
 class ResolvePostingIdTest(unittest.TestCase):
@@ -52,6 +77,255 @@ class ResolvePostingIdTest(unittest.TestCase):
         # 防御: Drive API が properties=None を返すケース（未設定文件で稀に発生）
         file = {"id": "f1", "properties": None}
         self.assertIsNone(resolve_posting_id(file))
+
+
+class FakeJobStore:
+    """get_job 呼出のダブル。job_id → job dict、無ければ None。例外注入も可。"""
+
+    def __init__(self, jobs=None, raise_exc=None):
+        self._jobs = jobs or {}
+        self._raise_exc = raise_exc
+
+    def get_job(self, job_id):
+        if self._raise_exc is not None:
+            raise self._raise_exc
+        return self._jobs.get(job_id)
+
+
+class CheckIntakeTest(unittest.TestCase):
+    """IP-303: check_intake の五分岐（PROCESS/no_posting_id/job_not_found/
+    posting_id_mismatch/DEFERRED）。"""
+
+    def test_process_when_posting_id_matches_job(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-1"}}
+        store = FakeJobStore({"base-1": {"posting_id": "base-1"}})
+
+        result = check_intake(file, store.get_job)
+
+        self.assertEqual(
+            IntakeCheck(IntakeDecision.PROCESS, "base-1", None), result)
+
+    def test_rejected_no_posting_id_when_property_missing(self):
+        file = {"id": "f1"}
+        store = FakeJobStore({})
+
+        result = check_intake(file, store.get_job)
+
+        self.assertEqual(IntakeDecision.REJECTED, result.decision)
+        self.assertEqual("no_posting_id", result.reason)
+        self.assertIsNone(result.base)
+
+    def test_rejected_job_not_found_when_get_job_returns_none(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-2"}}
+        store = FakeJobStore({})  # base-2 不存在
+
+        result = check_intake(file, store.get_job)
+
+        self.assertEqual(IntakeDecision.REJECTED, result.decision)
+        self.assertEqual("job_not_found", result.reason)
+        self.assertEqual("base-2", result.base)
+
+    def test_rejected_posting_id_mismatch_when_job_disagrees(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-3"}}
+        store = FakeJobStore({"base-3": {"posting_id": "different-base"}})
+
+        result = check_intake(file, store.get_job)
+
+        self.assertEqual(IntakeDecision.REJECTED, result.decision)
+        self.assertEqual("posting_id_mismatch", result.reason)
+        self.assertEqual("base-3", result.base)
+
+    def test_deferred_when_get_job_raises(self):
+        # Firestore 瞬断: DEFERRED、reason に型名を含む（人間可読な最小診断情報）
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-4"}}
+        store = FakeJobStore(raise_exc=ConnectionError("boom"))
+
+        result = check_intake(file, store.get_job)
+
+        self.assertEqual(IntakeDecision.DEFERRED, result.decision)
+        self.assertEqual("firestore_error:ConnectionError", result.reason)
+        self.assertEqual("base-4", result.base)
+
+
+class HandleIntakeTest(unittest.TestCase):
+    """handle_intake: 副作用の呼出順序・失敗隔離・白名単ペイロード検証。"""
+
+    def _make_calls(self):
+        calls = {"alert": [], "move": []}
+
+        def write_alert(alert_id, payload):
+            calls["alert"].append((alert_id, payload))
+
+        def move_to_quarantine():
+            calls["move"].append(True)
+
+        return calls, write_alert, move_to_quarantine
+
+    def test_process_decision_returns_true_with_zero_side_effects(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-1"}}
+        store = FakeJobStore({"base-1": {"posting_id": "base-1"}})
+        calls, write_alert, move_to_quarantine = self._make_calls()
+
+        result = handle_intake(
+            file, get_job=store.get_job,
+            write_alert=write_alert, move_to_quarantine=move_to_quarantine,
+        )
+
+        self.assertTrue(result)
+        self.assertEqual([], calls["alert"])
+        self.assertEqual([], calls["move"])
+
+    def test_deferred_decision_returns_false_with_zero_side_effects(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-4"}}
+        store = FakeJobStore(raise_exc=TimeoutError("boom"))
+        calls, write_alert, move_to_quarantine = self._make_calls()
+
+        result = handle_intake(
+            file, get_job=store.get_job,
+            write_alert=write_alert, move_to_quarantine=move_to_quarantine,
+        )
+
+        self.assertFalse(result)
+        self.assertEqual([], calls["alert"])
+        self.assertEqual([], calls["move"])
+
+    def test_rejected_calls_alert_before_move_and_returns_false(self):
+        file = {"id": "f1"}  # no_posting_id
+        store = FakeJobStore({})
+        order = []
+
+        def write_alert(alert_id, payload):
+            order.append("alert")
+
+        def move_to_quarantine():
+            order.append("move")
+
+        result = handle_intake(
+            file, get_job=store.get_job,
+            write_alert=write_alert, move_to_quarantine=move_to_quarantine,
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(["alert", "move"], order)
+
+    def test_rejected_alert_failure_skips_move_and_returns_false(self):
+        file = {"id": "f1"}  # no_posting_id
+        store = FakeJobStore({})
+        move_calls = []
+
+        def write_alert(alert_id, payload):
+            raise RuntimeError("alert boom")
+
+        def move_to_quarantine():
+            move_calls.append(True)
+
+        result = handle_intake(
+            file, get_job=store.get_job,
+            write_alert=write_alert, move_to_quarantine=move_to_quarantine,
+        )
+
+        self.assertFalse(result)
+        self.assertEqual([], move_calls)
+
+    def test_rejected_move_failure_still_returns_false_alert_already_written(self):
+        file = {"id": "f1"}  # no_posting_id
+        store = FakeJobStore({})
+        alert_calls = []
+
+        def write_alert(alert_id, payload):
+            alert_calls.append((alert_id, payload))
+
+        def move_to_quarantine():
+            raise RuntimeError("move boom")
+
+        result = handle_intake(
+            file, get_job=store.get_job,
+            write_alert=write_alert, move_to_quarantine=move_to_quarantine,
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(1, len(alert_calls))
+
+    def test_rejected_alert_payload_keys_are_whitelisted_no_posting_id(self):
+        # no_posting_id: base は None なので posting_id キーは payload に入らない
+        file = {"id": "f1", "name": "顧客の請求書.pdf"}
+        store = FakeJobStore({})
+        calls, write_alert, move_to_quarantine = self._make_calls()
+
+        handle_intake(
+            file, get_job=store.get_job,
+            write_alert=write_alert, move_to_quarantine=move_to_quarantine,
+        )
+
+        alert_id, payload = calls["alert"][0]
+        self.assertEqual("f1", alert_id)
+        self.assertLessEqual(
+            set(payload.keys()), {"kind", "file_id", "reason", "posting_id"})
+        self.assertNotIn("name", payload)
+        self.assertNotIn("顧客の請求書.pdf", str(payload))
+        self.assertEqual("intake_rejected", payload["kind"])
+        self.assertEqual("f1", payload["file_id"])
+        self.assertEqual("no_posting_id", payload["reason"])
+        self.assertNotIn("posting_id", payload)
+
+    def test_rejected_alert_payload_includes_posting_id_when_base_present(self):
+        # job_not_found: base は非 None なので posting_id キーが payload に入る
+        file = {"id": "f2", "properties": {POSTING_ID_PROPERTY_KEY: "base-5"}}
+        store = FakeJobStore({})
+        calls, write_alert, move_to_quarantine = self._make_calls()
+
+        handle_intake(
+            file, get_job=store.get_job,
+            write_alert=write_alert, move_to_quarantine=move_to_quarantine,
+        )
+
+        alert_id, payload = calls["alert"][0]
+        self.assertEqual("f2", alert_id)
+        self.assertEqual("job_not_found", payload["reason"])
+        self.assertEqual("base-5", payload["posting_id"])
+        self.assertLessEqual(
+            set(payload.keys()), {"kind", "file_id", "reason", "posting_id"})
+
+
+class HeadlessModeConfigTest(unittest.TestCase):
+    """config.HEADLESS_MODE の env 解析（IP-303 入口守衛の有効化フラグ）。"""
+
+    def tearDown(self):
+        # 他テストへの汚染防止: 常に実環境で再 reload して復元
+        importlib.reload(config)
+
+    def test_headless_mode_true_when_env_is_one(self):
+        with patch.dict(os.environ, {"HEADLESS_MODE": "1"}):
+            importlib.reload(config)
+            self.assertTrue(config.HEADLESS_MODE)
+
+    def test_headless_mode_false_for_empty_string_or_zero(self):
+        for value in ("", "0"):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {"HEADLESS_MODE": value}):
+                    importlib.reload(config)
+                    self.assertFalse(config.HEADLESS_MODE)
+
+
+class ListFilesFieldsTest(unittest.TestCase):
+    """main.list_files が properties を含む fields で Drive API を呼ぶこと。
+
+    交棒契約の base posting_id は Drive 公開 properties に載る（v0.10 定名）。
+    list の fields にこれを含めないと properties が一切返らず、入口守衛
+    （check_intake/resolve_posting_id）が機能しない
+    （Drive API は明示指定したフィールドしか返さない仕様のため）。
+    """
+
+    def test_fields_include_properties(self):
+        service = MagicMock()
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": []
+        }
+
+        main.list_files(service, "FOLDER_X")
+
+        kwargs = service.files.return_value.list.call_args.kwargs
+        self.assertIn("properties", kwargs.get("fields", ""))
 
 
 if __name__ == "__main__":

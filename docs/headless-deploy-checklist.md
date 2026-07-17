@@ -40,8 +40,10 @@
 | `INPUT_FOLDER_ID` | `config.py:245` | legacy 互換（単一夾時代）。新規環境では文書タイプ別キーを使う |
 | `OCR_STRATEGY` / `OCR_CONFIDENCE_THRESHOLD` / `OCR_MODEL_TIER` / `OCR_MAX_SIDE` / `DOC_LOW_CONFIDENCE_THRESHOLD` | `config.py:13-32` | 任意（既定値あり） |
 | `CHATWORK_API_TOKEN` / `CHATWORK_ROOM_ID` | `notifier.py:7-8` | **故意に未設定**（§1 参照） |
-
-後続批で追加予定のキー（本批では未実装、参考）：`HEADLESS_MODE`（B4/IP-308）、隔離夾 ID（B2/IP-303）、交棒夾 `handoff_folder_id`（B2）。
+| `HEADLESS_MODE` | `config.py`（IP-303 追加） | **必須（"1" で有効化）**。当初 B4/IP-308 を予定していたが、監視夾入口守衛（IP-303）が UI 版と headless 版の挙動を分岐する唯一のスイッチであるため **B2 に前倒し**（新行為は本フラグで隔離、UI 版は未設定のまま影響ゼロ）。値解釈：`"1"` → True、`""`／`"0"`（含む他の非 `"1"` 値）→ False |
+| `QUARANTINE_FOLDER_ID` | `config.py`（IP-303 追加） | **headless 必配**。`HEADLESS_MODE=1` かつ本キー未設定は `main()` 起動時に即 `exit(1)`（`config.py` 同様の「落として気付かせる」方針）。無 posting_id / job 不一致件の隔離先 |
+| `HANDOFF_FOLDER_ID` | `config.py`（IP-303 追加） | **B2 時点は鍵の予約のみ・未接線**。契約上の交棒夾 `handoff_folder_id`（控制面がここへ file を投入）に対応する SS 側の鍵だが、`folder_map` への接線（監視対象化）は後続批。実体夾は趙が実建後に接続 |
+| `FIRESTORE_PROJECT_ID` | `config.py` / `firestore_report.build_reporter_from_env()`（IP-303 追加） | 鍵先行、**U14（真 Firestore 環境）待ち**。未設定なら SDK の既定解決（ADC 等）に委ねる |
 
 ## 3. Python 依存（B1 で追加）
 

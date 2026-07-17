@@ -12,9 +12,11 @@ import os
 import sys
 import unittest
 from datetime import UTC, datetime
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+import firestore_report
 from firestore_report import (
     ACTOR_SUPER_SCANER,
     STATE_DEAD_LETTER,
@@ -105,6 +107,27 @@ class ExplodingAlertClient(FakeFirestoreClient):
     def collection(self, name):
         if name == "alerts":
             return _ExplodingCollection()
+        return super().collection(name)
+
+
+class _ExplodingGetDocRef:
+    """get() が必ず失敗する doc ref ダブル（get_job の例外伝播検証用）。"""
+
+    def get(self, transaction=None):
+        raise ConnectionError("boom")
+
+
+class _ExplodingJobsCollection:
+    def document(self, doc_id):
+        return _ExplodingGetDocRef()
+
+
+class ExplodingJobsClient(FakeFirestoreClient):
+    """jobs への読取だけ必ず失敗する fake client（get_job 例外伝播検証用）。"""
+
+    def collection(self, name):
+        if name == "jobs":
+            return _ExplodingJobsCollection()
         return super().collection(name)
 
 
@@ -437,6 +460,71 @@ class WriteAlertTest(unittest.TestCase):
         stored = client.alerts_store["alert-2"]
         self.assertEqual(set(stored.keys()), {"at", "by"})
         self.assertEqual(stored["by"], ACTOR_SUPER_SCANER)
+
+
+class GetJobTest(unittest.TestCase):
+    """IP-303: get_job（intake_guard.check_intake が呼ぶ單發非事務讀）。"""
+
+    def test_returns_dict_when_job_exists(self):
+        reporter, client, txn, runner = _make_reporter()
+        _seed_job(client, "job-x", current_state=STATE_POSTING_IN_PROGRESS,
+                   lease_epoch=1, source_file_id="file-x")
+
+        result = reporter.get_job("job-x")
+
+        self.assertEqual(STATE_POSTING_IN_PROGRESS, result["current_state"])
+        self.assertEqual("file-x", result["source_file_id"])
+
+    def test_returns_none_when_job_does_not_exist(self):
+        reporter, client, txn, runner = _make_reporter()
+
+        self.assertIsNone(reporter.get_job("missing-job"))
+
+    def test_propagates_exception_from_client(self):
+        # SDK 例外は握り潰さず伝播（呼出方 intake_guard.check_intake が
+        # DEFERRED へ倒す判断をする）
+        reporter = FirestoreReporter(ExplodingJobsClient())
+
+        with self.assertRaises(ConnectionError):
+            reporter.get_job("job-y")
+
+
+class BuildReporterFromEnvTest(unittest.TestCase):
+    """IP-303: build_reporter_from_env（HEADLESS_MODE 起動時のモジュール級工廠）。
+
+    実 SDK 呼出し（firestore.Client / service_account.Credentials）は
+    patch で差し替え、環境変数の有無による分岐のみを検証する。
+    """
+
+    def test_builds_client_with_credentials_when_service_account_file_exists(self):
+        with patch.dict(
+            os.environ,
+            {"SERVICE_ACCOUNT_FILE": "sa.json", "FIRESTORE_PROJECT_ID": "proj-1"},
+        ), patch("firestore_report.os.path.exists", return_value=True), \
+                patch("firestore_report.service_account.Credentials"
+                      ".from_service_account_file") as mock_creds, \
+                patch("firestore_report.firestore.Client") as mock_client:
+            reporter = firestore_report.build_reporter_from_env()
+
+        mock_creds.assert_called_once_with("sa.json")
+        mock_client.assert_called_once_with(
+            credentials=mock_creds.return_value, project="proj-1")
+        self.assertIsInstance(reporter, FirestoreReporter)
+
+    def test_builds_client_without_credentials_when_file_missing(self):
+        with patch.dict(
+            os.environ, {"SERVICE_ACCOUNT_FILE": "sa.json", "FIRESTORE_PROJECT_ID": ""},
+        ), patch("firestore_report.os.path.exists", return_value=False), \
+                patch("firestore_report.firestore.Client") as mock_client:
+            firestore_report.build_reporter_from_env()
+
+        mock_client.assert_called_once_with()
+
+    def test_propagates_exception_from_client_construction(self):
+        with patch.dict(os.environ, {"SERVICE_ACCOUNT_FILE": "", "FIRESTORE_PROJECT_ID": ""}), \
+                patch("firestore_report.firestore.Client", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                firestore_report.build_reporter_from_env()
 
 
 if __name__ == "__main__":

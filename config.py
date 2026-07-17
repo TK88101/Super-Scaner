@@ -247,3 +247,17 @@ def load_folder_map(profiles: dict = None) -> dict:
             claim(legacy_id, DocType.RECEIPT, PROFILE_DEFAULT)
 
     return folder_map
+
+
+# === ヘッドレスモード（サンデヴィスタン統合） ===
+# feature/sandevistan-headless 専用。UI 版（main ブランチ）では
+# HEADLESS_MODE=False（未設定）のままで、既存挙動に一切影響しない。
+# B2（IP-303）時点では入口守衛の有効化フラグ＋隔離夾のみ実接続。
+# HANDOFF_FOLDER_ID / FIRESTORE_PROJECT_ID は鍵の予約のみで、folder_map への
+# 接線・真庫接続は後続批（詳細は docs/headless-deploy-checklist.md）。
+HEADLESS_MODE = os.getenv("HEADLESS_MODE", "") == "1"
+# B2＝鍵の予約のみ・未接線（実体夾は趙が実建後、folder_map 接線は後続批）
+HANDOFF_FOLDER_ID = os.getenv("HANDOFF_FOLDER_ID", "")
+QUARANTINE_FOLDER_ID = os.getenv("QUARANTINE_FOLDER_ID", "")
+# U14（真 Firestore 環境）未就緒のため鍵先行。build_reporter_from_env が読む。
+FIRESTORE_PROJECT_ID = os.getenv("FIRESTORE_PROJECT_ID", "")

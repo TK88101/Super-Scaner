@@ -29,6 +29,7 @@ REJECTED 語意（重要）：本模組每次呼叫恰執行一次 Firestore 事
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -36,6 +37,7 @@ from enum import Enum
 from typing import Any, TypeVar
 
 from google.cloud import firestore
+from google.oauth2 import service_account
 
 _T = TypeVar("_T")
 
@@ -166,6 +168,20 @@ class FirestoreReporter:
 
     def _alert_doc(self, alert_id: str) -> Any:
         return self._client.collection(self._alerts_collection).document(alert_id)
+
+    def get_job(self, job_id: str) -> Mapping[str, Any] | None:
+        """単發非事務讀 `jobs/{job_id}`（IP-303、intake_guard.check_intake が呼ぶ）。
+
+        report_posted/report_dead_letter の読-校-写事務とは別経路——事務を張らない
+        単純読取り。job が存在しなければ None。SDK 例外はそのまま伝播させる
+        （Firestore 瞬断と「job が実在しない」を呼び出し側が区別できるよう、
+        ここで握り潰さない。intake_guard.check_intake が例外を捕捉して
+        DEFERRED に倒す判断をする——本メソッドの責務ではない）。
+        """
+        snap = self._job_doc(job_id).get()
+        if not snap.exists:
+            return None
+        return snap.to_dict() or {}
 
     def report_posted(self, job_id: str, *, lease_epoch: int) -> ReportResult:
         """回報「已記帳完成」：POSTING_IN_PROGRESS → POSTED。"""
@@ -339,3 +355,30 @@ class FirestoreReporter:
         enriched: dict[str, Any] = {**payload, "at": _utcnow(), "by": ACTOR_SUPER_SCANER}
         self._alert_doc(alert_id).set(enriched)
         print(f"alert 已寫入 alert_id={alert_id}")
+
+
+def build_reporter_from_env() -> FirestoreReporter:
+    """`.env` から `FirestoreReporter` を構築するモジュール級工廠（IP-303）。
+
+    HEADLESS_MODE 起動時に main.py が一度だけ呼ぶ想定。Drive/Sheets と同一の
+    `SERVICE_ACCOUNT_FILE`（SA 共用、docs/headless-deploy-checklist.md）を流用
+    する——ファイルが実在すればそこから明示的に credentials を組み立てる。
+    `FIRESTORE_PROJECT_ID` が設定されていれば project を明示指定する。どちらも
+    未設定／ファイル不在なら google-cloud-firestore の既定解決
+    （Application Default Credentials 等）に委ねる。
+
+    失敗（ファイル破損・権限不足・プロジェクト未検出等）は例外をそのまま
+    伝播させる——main 起動時に fail fast する
+    （ENTRY_BUILDERS 事故と同じ「落として気付かせる」先例、CLAUDE.md 参照）。
+    """
+    kwargs: dict[str, Any] = {}
+    sa_file = os.getenv("SERVICE_ACCOUNT_FILE", "")
+    if sa_file and os.path.exists(sa_file):
+        kwargs["credentials"] = (
+            service_account.Credentials.from_service_account_file(sa_file)
+        )
+    project_id = os.getenv("FIRESTORE_PROJECT_ID", "")
+    if project_id:
+        kwargs["project"] = project_id
+    client = firestore.Client(**kwargs)
+    return FirestoreReporter(client)
