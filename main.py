@@ -279,6 +279,41 @@ def move_file(service, file_id, previous_folder_id, new_folder_id):
         print(f"⚠️ ファイル移動中に警告が発生しました: {e}")
 
 
+def _init_headless_reporter():
+    """main() 起動段の reporter 構築を切り出す（IP-303 接線ヘルパー抽出＝
+    可測化。新增行80%鉄律）。
+
+    UI 版（HEADLESS_MODE 未設定）では reporter を作らず None を返す（既存挙動
+    に一切影響しない）。HEADLESS_MODE だが QUARANTINE_FOLDER_ID 未設定は
+    fail fast のため print + exit(1) を保つ（起動時に気付かせる）。
+    """
+    if not config.HEADLESS_MODE:
+        return None
+    if not config.QUARANTINE_FOLDER_ID:
+        print("❌ エラー：HEADLESS_MODE には QUARANTINE_FOLDER_ID の設定が必須です。")
+        exit(1)
+    return firestore_report.build_reporter_from_env()
+
+
+def _headless_intake_gate(service, file, input_folder_id, reporter) -> bool:
+    """main() ファイル循環内の入口守衛接線を切り出す（IP-303 接線ヘルパー抽出
+    ＝可測化。新增行80%鉄律）。
+
+    非 HEADLESS_MODE では常に True（副作用なし、既存 UI 版挙動を保つ）。
+    functools.partial を使う理由＝呼び出し時点の file/input_folder_id を
+    束縛するため（呼び出し元の for ループでの遅延束縛問題を避ける）。
+    """
+    if not config.HEADLESS_MODE:
+        return True
+    return intake_guard.handle_intake(
+        file,
+        get_job=reporter.get_job,
+        write_alert=reporter.write_alert,
+        move_to_quarantine=functools.partial(
+            _move_file_raw, service, file["id"], input_folder_id,
+            config.QUARANTINE_FOLDER_ID),
+    )
+
 
 def is_duplicate_file(service, md5_checksum, processed_folder_id):
     """指定された Processed フォルダ中の重複チェック。
@@ -560,12 +595,7 @@ def main():
     # Firestore reporter を起動時に一度だけ構築する。UI 版
     # （HEADLESS_MODE 未設定）では reporter は None のまま、既存挙動に
     # 一切影響しない。
-    reporter = None
-    if config.HEADLESS_MODE:
-        if not config.QUARANTINE_FOLDER_ID:
-            print("❌ エラー：HEADLESS_MODE には QUARANTINE_FOLDER_ID の設定が必須です。")
-            exit(1)
-        reporter = firestore_report.build_reporter_from_env()
+    reporter = _init_headless_reporter()
 
     active_folder_map = filter_active_folders(folder_map, writers)
     if not active_folder_map:
@@ -616,21 +646,10 @@ def main():
                     # 0. ヘッドレスモード入口守衛（IP-303）: 防重檢測より前に
                     # base posting_id を検証する。無 posting_id / job 不一致件
                     # はここで隔離夾へ退避し、以降の処理（Sheets 書込含む）へ
-                    # 進ませない。functools.partial を使う理由＝for ループ内
-                    # クロージャの遅延束縛（late binding）を避けるため
-                    # （lambda だと file_id/input_folder_id が最後の反復値に
-                    #   固定されてしまう）。
-                    if config.HEADLESS_MODE:
-                        if not intake_guard.handle_intake(
-                            file,
-                            get_job=reporter.get_job,
-                            write_alert=reporter.write_alert,
-                            move_to_quarantine=functools.partial(
-                                _move_file_raw, service, file_id, input_folder_id,
-                                config.QUARANTINE_FOLDER_ID),
-                        ):
-                            print("=" * 30)
-                            continue
+                    # 進ませない。
+                    if not _headless_intake_gate(service, file, input_folder_id, reporter):
+                        print("=" * 30)
+                        continue
 
                     # 1. 防重檢測（同一プロファイルのアーカイブ内のみを見る）
                     if is_duplicate_file(service, md5, processed_folder_id):

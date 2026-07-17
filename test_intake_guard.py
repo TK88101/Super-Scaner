@@ -10,9 +10,11 @@
     venv311/bin/python -m unittest test_intake_guard -v
 """
 import importlib
+import io
 import os
 import sys
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -326,6 +328,118 @@ class ListFilesFieldsTest(unittest.TestCase):
 
         kwargs = service.files.return_value.list.call_args.kwargs
         self.assertIn("properties", kwargs.get("fields", ""))
+
+
+class InitHeadlessReporterTest(unittest.TestCase):
+    """main._init_headless_reporter: HEADLESS_MODE 起動時の reporter 構築を
+    main() 本体から抽出した単体（IP-303 接線ヘルパー抽出、可測化）。"""
+
+    def test_returns_none_when_not_headless(self):
+        # UI 版（HEADLESS_MODE 未設定）は reporter を作らず None のまま
+        with patch.object(config, "HEADLESS_MODE", False):
+            self.assertIsNone(main._init_headless_reporter())
+
+    def test_exits_when_headless_without_quarantine_folder(self):
+        # headless なのに隔離夾未設定 → 既存の print + exit(1)（fail fast）を保つ
+        with patch.object(config, "HEADLESS_MODE", True), \
+                patch.object(config, "QUARANTINE_FOLDER_ID", ""), \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                main._init_headless_reporter()
+
+    def test_builds_reporter_from_env_when_headless_and_configured(self):
+        sentinel_reporter = object()
+        with patch.object(config, "HEADLESS_MODE", True), \
+                patch.object(config, "QUARANTINE_FOLDER_ID", "Q_FOLDER"), \
+                patch("main.firestore_report.build_reporter_from_env",
+                      return_value=sentinel_reporter) as mock_build:
+            result = main._init_headless_reporter()
+
+        mock_build.assert_called_once_with()
+        self.assertIs(result, sentinel_reporter)
+
+
+class HeadlessIntakeGateTest(unittest.TestCase):
+    """main._headless_intake_gate: 監視フォルダ入口守衛の main() 循環内接線を
+    抽出した単体（IP-303 接線ヘルパー抽出）。
+
+    functools.partial の引数順序守護：quarantine 隔離の move 先/元が入れ替わる
+    実バグ（addParents と removeParents の取り違え）を、fake service への
+    実際の呼出し引数で直接検証する（handle_intake 自体の単体テストは
+    move_to_quarantine を差し替え済みのため、この取り違えを検知できない）。
+    """
+
+    def _make_service(self):
+        service = MagicMock()
+        service.files.return_value.update.return_value.execute.return_value = {
+            "id": "F1", "parents": ["Q_FOLDER"],
+        }
+        return service
+
+    def test_non_headless_returns_true_with_zero_side_effects(self):
+        service = self._make_service()
+        reporter = MagicMock()
+        file = {"id": "f1"}
+
+        with patch.object(config, "HEADLESS_MODE", False):
+            result = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
+
+        self.assertTrue(result)
+        reporter.get_job.assert_not_called()
+        reporter.write_alert.assert_not_called()
+        service.files.return_value.update.assert_not_called()
+
+    def test_headless_rejected_file_moves_to_quarantine_with_correct_folder_direction(self):
+        # no_posting_id → REJECTED。addParents=隔離夾、removeParents=入力夾
+        # であること（順序が逆転すると隔離夾から入力夾へ戻す誤動作になる）。
+        service = self._make_service()
+        reporter = MagicMock()
+        reporter.get_job.return_value = None
+        file = {"id": "f1"}  # properties 無し → no_posting_id
+
+        with patch.object(config, "HEADLESS_MODE", True), \
+                patch.object(config, "QUARANTINE_FOLDER_ID", "Q_FOLDER"), \
+                redirect_stdout(io.StringIO()):
+            result = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
+
+        self.assertFalse(result)
+        kwargs = service.files.return_value.update.call_args.kwargs
+        self.assertEqual("Q_FOLDER", kwargs.get("addParents"))
+        self.assertEqual("INPUT_FOLDER", kwargs.get("removeParents"))
+        reporter.write_alert.assert_called_once()
+
+    def test_headless_process_decision_returns_true_without_moving(self):
+        service = self._make_service()
+        reporter = MagicMock()
+        reporter.get_job.return_value = {"posting_id": "base-1"}
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-1"}}
+
+        with patch.object(config, "HEADLESS_MODE", True), \
+                patch.object(config, "QUARANTINE_FOLDER_ID", "Q_FOLDER"):
+            result = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
+
+        self.assertTrue(result)
+        service.files.return_value.update.assert_not_called()
+
+    def test_get_job_and_write_alert_are_bound_to_reporter_methods(self):
+        # get_job/write_alert が reporter インスタンスの対応メソッドへ束縛
+        # されていること（別オブジェクトの同名メソッドにすり替わっていない）。
+        service = self._make_service()
+        reporter = MagicMock()
+        reporter.get_job.return_value = None
+        file = {"id": "f2"}  # no_posting_id → REJECTED（alert/move まで到達）
+
+        with patch.object(config, "HEADLESS_MODE", True), \
+                patch.object(config, "QUARANTINE_FOLDER_ID", "Q_FOLDER"), \
+                redirect_stdout(io.StringIO()):
+            main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
+
+        # no_posting_id は resolve_posting_id 段階で弾かれるため get_job 自体は
+        # 呼ばれない。write_alert は reporter の実インスタンスに束縛されている
+        # ことを、呼出し元 (=reporter.write_alert) が起動されたことで確認する。
+        reporter.write_alert.assert_called_once()
+        alert_id = reporter.write_alert.call_args.args[0]
+        self.assertEqual("f2", alert_id)
 
 
 if __name__ == "__main__":
