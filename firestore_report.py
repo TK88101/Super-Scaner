@@ -151,6 +151,11 @@ class FirestoreReporter:
             transaction_runner if transaction_runner is not None else self._default_transaction_runner
         )
 
+    @property
+    def client(self) -> Any:
+        """保持している Firestore client（IP-304 の PostingLedger が同一 client を再利用）。"""
+        return self._client
+
     def _default_transaction_runner(self, body: Callable[[Any], _T]) -> _T:
         """SDK 預設事務路徑（對齊 firestore_store.py `_run_txn`）。
 

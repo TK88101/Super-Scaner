@@ -4,6 +4,7 @@ import time
 import io
 import random
 import re
+from enum import Enum
 
 # Windows console encoding fix
 if sys.platform == "win32":
@@ -294,17 +295,17 @@ def _init_headless_reporter():
     return firestore_report.build_reporter_from_env()
 
 
-def _headless_intake_gate(service, file, input_folder_id, reporter, alerted=None) -> bool:
-    """監視フォルダ入口守衛（IP-303）を1ファイルに適用する。
+def _headless_intake_gate(service, file, input_folder_id, reporter, alerted=None):
+    """監視フォルダ入口守衛（IP-303）を1ファイルに適用し (続行可, base) を返す。
 
-    非 HEADLESS_MODE では常に True（副作用なし）。HEADLESS_MODE では
-    intake_guard.handle_intake の裁決結果（続行可＝True／隔離済み・保留＝
-    False）をそのまま返す。alerted は main() が持つ拒絶件記憶層（進程内快取）
-    をそのまま handle_intake へ橋渡しするだけで、ここでは中身に関知しない。
+    非 HEADLESS_MODE では常に (True, None)（副作用なし）。HEADLESS_MODE では
+    intake_guard.handle_intake_gate の裁決を橋渡しし、PROCESS 時のみ base posting_id
+    を第2要素で通す（IP-304 が頁級台賬の job_key に使う、#14）。base の中身には
+    関知しない。
     """
     if not config.headless_mode():
-        return True
-    return intake_guard.handle_intake(
+        return True, None
+    result = intake_guard.handle_intake_gate(
         file,
         get_job=reporter.get_job,
         write_alert=reporter.write_alert,
@@ -312,6 +313,7 @@ def _headless_intake_gate(service, file, input_folder_id, reporter, alerted=None
             service, file["id"], input_folder_id, config.quarantine_folder_id()),
         alerted=alerted,
     )
+    return result.should_process, result.base
 
 
 def is_duplicate_file(service, md5_checksum, processed_folder_id):
@@ -353,10 +355,182 @@ def is_duplicate_file(service, md5_checksum, processed_folder_id):
 # CSV 関連関数は sheets_output.py に移行済み (廃止)
 
 
+class ProcessOutcome(Enum):
+    """headless process_file の三態（定稿 Plan §9 D4' #11）。UI 経路は現状 bool を返す。"""
+
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+    ESCALATED = "ESCALATED"
+
+
+def _extract_tickets(results):
+    """頁内の各 result を F59 対账 advisory の 1 票 TicketSummary へ（去重键には非使用）。"""
+    from posting_ledger import TicketSummary
+    from receipt_aggregation import sum_row_amounts
+    return [
+        TicketSummary(
+            date=r.get("date", "") or "",
+            amount=sum_row_amounts(r.get("entries", []) or []),
+            vendor=r.get("vendor", "") or "",
+        )
+        for r in results
+    ]
+
+
+def _flush_page(writer, ledger, base, doc_type, uploader_name, page_num,
+                results, urls):
+    """1 頁分の查重→記帳。戻り値 'written'|'skipped'|'escalate'。
+
+    check_page で SKIP（既 CONFIRMED/witness PRESENT）→ 何も書かない（硬去重）。
+    ESCALATE（witness 不確実）→ 呼出側でファイル保持・回報せず。WRITE → build_page_write
+    →（PENDING→append→CONFIRMED）を ledger.post_page が原子封装。
+    """
+    from posting_ledger import derive_page_id, PageDecision, PagePostingSummary
+    from sheets_output import compute_page_fingerprint
+
+    page_id = derive_page_id(base, page_num)
+    decision = ledger.check_page(page_id)
+    if decision is PageDecision.SKIP:
+        print(f"⏭️ 頁 {page_num} は既記帳（台賬）→ スキップ")
+        return "skipped"
+    if decision is PageDecision.ESCALATE:
+        print(f"🚨 頁 {page_num} 判定不能（witness 不確実）→ ESCALATE（人工核）")
+        return "escalate"
+
+    start_txn = writer.next_txn_no(uploader_name, doc_type)
+    page_write = writer.build_page_write(
+        uploader_name, doc_type, results, urls, start_txn)
+    predicted = writer.peek_append_range(page_write)
+    fingerprint = compute_page_fingerprint(page_write.rows)
+    tickets = _extract_tickets(results)
+    summary = PagePostingSummary(
+        page_num=page_num,
+        ticket_count=len(tickets),
+        row_count=len(page_write.rows),
+        tickets=tuple(tickets),
+        predicted_row_range=predicted,
+        row_fingerprint=fingerprint,
+        sheet_tab=page_write.tab_name,
+    )
+    ledger.post_page(page_id, summary, lambda: writer.commit_page(page_write))
+    return "written"
+
+
+def _process_file_headless(service, writer, file_path, uploader_name, base,
+                           ledger, doc_type, drive_file_id, split_pdf_folder_id):
+    """HEADLESS_MODE の頁級緩衝集約経路（IP-304）。三態 ProcessOutcome を返す（#11）。
+
+    process_pipeline の yield を page_num で連続緩衝し、頁境界で flush（查重→原子書込）。
+    緩衝は一頁分のみ（CLAUDE.md メモリ硬約束、頁 flush 後に解放）。page_num の再登場は
+    ESCALATE（#6 連続性 contract、静默拆頁禁）。
+    """
+    filename = os.path.basename(file_path)
+    base_url = _drive_view_url(drive_file_id) if drive_file_id else ""
+    resolver = PageUrlResolver(
+        service, base_url, filename, split_pdf_folder_id, drive_file_id)
+
+    buffered_num = None
+    buffered_results = []
+    buffered_urls = []
+    seen_pages = set()
+    error_pages = 0
+    failed_page_nums = []
+    total_count = 0
+
+    def flush(page_num_, results_, urls_):
+        """緩衝頁を記帳。ESCALATE なら ProcessOutcome.ESCALATED、それ以外は None。"""
+        if not results_:
+            return None
+        outcome = _flush_page(writer, ledger, base, doc_type, uploader_name,
+                              page_num_, results_, urls_)
+        return ProcessOutcome.ESCALATED if outcome == "escalate" else None
+
+    for page in process_pipeline(file_path, doc_type=doc_type):
+        result = page["result"]
+        page_num = page["page_num"]
+        total_pages = page["total_pages"]
+
+        # 頁境界：page_num が変わったら前頁を flush してから当頁の緩衝を開始
+        if buffered_num is not None and page_num != buffered_num:
+            esc = flush(buffered_num, buffered_results, buffered_urls)
+            if esc is not None:
+                return esc
+            seen_pages.add(buffered_num)
+            buffered_results = []
+            buffered_urls = []
+
+        # #6 連続性 contract：処理済み頁番号の再登場（静默拆頁）は ESCALATE
+        if page_num in seen_pages:
+            print(f"🚨 頁番号 {page_num} が非連続に再登場 → ESCALATE（拆頁前提破れ）")
+            return ProcessOutcome.ESCALATED
+
+        buffered_num = page_num
+        total_count += 1
+
+        if result.get("_page_error"):
+            error_pages += 1
+            failed_page_nums.append(page_num)
+            continue  # 頁エラーは Sheets 書込まず（現状踏襲）
+
+        entries = result.get("entries", [])
+        print(f"📄 [{page_num}/{total_pages}] 取引先: {result.get('vendor')} | "
+              f"仕訳: {len(entries)}行")
+        page_bytes = page.get("page_bytes")
+        source_url = resolver.resolve(page_num, total_pages, page_bytes)
+        result["uploader"] = uploader_name
+        buffered_results.append(result)
+        buffered_urls.append(source_url)
+
+    esc = flush(buffered_num, buffered_results, buffered_urls)
+    if esc is not None:
+        return esc
+
+    # 部分ページエラー（成功頁は台賬 CONFIRMED 済）: 失敗頁を占位行で可視化してから
+    # 歸檔する。UI 経路と同一挙動——headless で失敗頁を静默に落とさない（silent loss
+    # 防止）。
+    #
+    # 既知の非幂等窗口（IP-306/B4 の職責、本批では代拍せず）: この占位行は頁級台賬の
+    # 外で書くため、append 後・move 前に崩潰／move 失敗すると再跑で成功頁は SKIP される
+    # が占位行だけ再追加され重複し得る。ただし重複するのは人工再スキャン警告行のみ
+    # （真の仕訳行は台賬保護下で不重複）で cosmetic。占位行の終態記録
+    # （POSTED_PARTIAL/failed_pages の Firestore 化＝幂等键）は F06-How 未確定で
+    # IP-306/B4 の設計事項。UI 経路も同型の非幂等を持つ（既存・許容）。
+    if 0 < error_pages < total_count:
+        failed_pages_str = ",".join(f"p{n}" for n in failed_page_nums)
+        try:
+            writer.append_entries(
+                employee_name=uploader_name,
+                doc_type=doc_type,
+                entries_data={
+                    "entries": [],
+                    "_unrecognized": True,
+                    "memo": f"⚠ ページ処理エラー {error_pages}/{total_count}頁 "
+                            f"[{failed_pages_str}] 手動再スキャン要",
+                    "date": "",
+                    "vendor": filename,
+                    "uploader": uploader_name,
+                },
+                source_url=base_url,
+            )
+        except Exception as e:
+            # 占位行すら書けない（transient Sheets 障害）→ 失敗頁の可視記録が無い
+            # ままの歸檔は silent loss。SUCCESS を返さずファイル保持して次輪再試行へ
+            # （成功頁は台賬 CONFIRMED 済みで再跑時 SKIP、重複しない）。
+            print(f"⚠️ 部分エラー占位行の書き込み失敗 → ファイル保持: {e}")
+            return ProcessOutcome.FAILED
+
+    if total_count == 0 or error_pages == total_count:
+        return ProcessOutcome.FAILED  # 解析失敗/全頁エラー → ファイル保持
+    return ProcessOutcome.SUCCESS
+
+
 def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
                   doc_type=DocType.RECEIPT, drive_file_id=None,
-                  split_pdf_folder_id=""):
+                  split_pdf_folder_id="", base=None, ledger=None):
     """ファイルを処理し、Google Sheets に逐次書き込み、通知を送信する。
+
+    ledger 非 None（HEADLESS_MODE）は頁級緩衝集約＋硬去重の経路へ分流し ProcessOutcome
+    を返す。ledger None（UI 版）は従来の逐 result append_entries で bool を返す（挙動不変）。
 
     process_pipeline がジェネレータなので、1ページ処理→即Sheets書き込み→
     メモリ解放→次ページ の流れでメモリ使用量を最小化する。
@@ -364,6 +538,11 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
     split_pdf_folder_id もプロファイルごとに異なる。共通の分割保存先へ
     アップロードすると、社長専用シートの原票 URL が全社から閲覧可能になる。
     """
+    if ledger is not None:
+        return _process_file_headless(
+            service, sheets_writer, file_path, uploader_name, base, ledger,
+            doc_type, drive_file_id, split_pdf_folder_id)
+
     type_label = DOC_TYPE_CONFIG.get(doc_type, {}).get("label", doc_type)
     filename = os.path.basename(file_path)
     print(f"⚙️  処理開始: {filename} [{type_label}] (担当: {uploader_name})")
@@ -651,9 +830,10 @@ def main():
                     # base posting_id を検証する。無 posting_id / job 不一致件
                     # はここで隔離夾へ退避し、以降の処理（Sheets 書込含む）へ
                     # 進ませない。
-                    if not _headless_intake_gate(
-                            service, file, input_folder_id, reporter,
-                            alerted=quarantine_alerted):
+                    should_process, base = _headless_intake_gate(
+                        service, file, input_folder_id, reporter,
+                        alerted=quarantine_alerted)
+                    if not should_process:
                         print("=" * 30)
                         continue
 
@@ -683,17 +863,37 @@ def main():
                     # 4. 下載與處理
                     local_path = download_file(service, file_id, file_name)
 
-                    # PDF 間分割線 + 取引No リセット
-                    writer.start_new_file(uploader_name, doc_type, file_name)
+                    # 頁級台賬（IP-304、headless のみ）: 1 ファイル＝1 job、job_key=base。
+                    # reporter と同一 Firestore client を再利用、witness probe は writer 提供。
+                    ledger = None
+                    if reporter is not None and base is not None:
+                        from posting_ledger import PostingLedger
+                        ledger = PostingLedger(
+                            reporter.client, base, sheet_probe=writer.probe_page)
 
-                    success = process_file(
+                    # PDF 間分割線 + 取引No リセットは UI 版のみ（headless は取引No を
+                    # Sheets A 列から都度再構築＝崩潰重跑冪等、分割線リセットは不要・有害）。
+                    if ledger is None:
+                        writer.start_new_file(uploader_name, doc_type, file_name)
+
+                    outcome = process_file(
                         service, writer, local_path,
                         uploader_name, chat_id,
                         doc_type=doc_type, drive_file_id=file_id,
                         split_pdf_folder_id=profile["split_pdf_folder_id"],
+                        base=base, ledger=ledger,
                     )
 
-                    if success:
+                    if ledger is not None:
+                        # headless 三態（#11）。ESCALATE は POSTED 回報せず・move せず・
+                        # ファイル保持（打刻停止で控制面 reconciliation が停滞→POST_UNKNOWN）。
+                        if outcome is ProcessOutcome.SUCCESS:
+                            move_file(service, file_id, input_folder_id, processed_folder_id)
+                        elif outcome is ProcessOutcome.ESCALATED:
+                            print("🚨 ESCALATE: ファイル保持・回報せず（控制面へ委ねる）")
+                        else:
+                            print("⚠️ ファイル処理失敗（保持）。")
+                    elif outcome:
                         move_file(service, file_id, input_folder_id, processed_folder_id)
                     else:
                         print("⚠️ ファイル処理失敗。")

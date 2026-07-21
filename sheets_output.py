@@ -1,6 +1,7 @@
 # sheets_output.py — Google Sheets 出力モジュール (csv_writer.py の後継)
 import re
 import time
+from dataclasses import dataclass
 import gspread
 from gspread_formatting import CellFormat, Color, format_cell_range, format_cell_ranges, Border, Borders
 from datetime import datetime, timezone, timedelta
@@ -41,6 +42,145 @@ TAG_COL_INDEX = MF_HEADERS.index("タグ")
 # 跨ぐと Google が新規行に直前行の書式を継承し、標色された最終行の色が空尾行へ
 # 伝染する。書き込み前に add_rows で空きバッファを確保し、自動拡容自体を起こさない。
 GRID_ROW_BUFFER = 200
+
+
+# --- IP-304 頁級原子書＋共通ビルダの純データ型（定稿 Plan §9 D2'） ------------------
+@dataclass(frozen=True)
+class HighlightOp:
+    """高亮の一操作（ブロック相対 offset。commit 側で絶対行へ translate）。
+
+    row_start/row_end：ブロック先頭からの 0-based 行 offset（inclusive）。
+    col："full"（A:AB 全列）または列文字（"I"/"B"/"F"/"H" 等、単列）。
+    severity："high"/"medium"/"low" → _severity_color で色に写す（単一ソース）。
+    """
+
+    row_start: int
+    row_end: int
+    col: str
+    severity: str
+
+
+@dataclass(frozen=True)
+class ResultBlock:
+    """1 result（1 票）分の rows＋異常メタ（純データ、書込・高亮なし）。
+
+    append_entries（UI）は rows/*_flags をそのまま Phase B で使う（挙動保存）。
+    headless は _result_ops で highlight_ops へ翻訳する。
+    """
+
+    rows: list
+    anomaly_flags: list   # [(行 offset, flags)]（per-entry）
+    conf_flags: list      # 低置信（RECEIPT・全行黄の下地）
+    red_flags: list       # doc 赤（合計不符/規則①・I列赤）
+    next_txn_no: int
+
+
+@dataclass(frozen=True)
+class UnrecognizedBlock:
+    """占位行（認識不能/部分認識）の row＋高亮判定材料（UI/headless 共用、#9）。"""
+
+    row: list
+    has_partial: bool
+    has_date: bool
+    has_vendor: bool
+    next_txn_no: int
+
+
+@dataclass(frozen=True)
+class PageWrite:
+    """1 頁分の書込計画（純データ、書込副作用ゼロ）。commit_page が消費する。"""
+
+    tab_name: str
+    rows: list
+    highlight_ops: tuple
+    txn_range: tuple      # (start_txn_no, last_txn_no)
+
+
+def _op_cell_ref(op, block_start_row):
+    """HighlightOp（ブロック相対）を Sheets の絶対セル範囲文字列へ翻訳する。"""
+    r1 = block_start_row + op.row_start
+    r2 = block_start_row + op.row_end
+    if op.col == "full":
+        return f"A{r1}:AB{r2}"
+    return f"{op.col}{r1}:{op.col}{r2}"
+
+
+def _result_block_ops(block, offset):
+    """ResultBlock の *_flags を頁相対 HighlightOp 列へ翻訳（塗り順＝黄→per-entry→赤）。"""
+    ops = []
+    n = len(block.rows)
+    if block.conf_flags:
+        ops.append(HighlightOp(offset, offset + n - 1, "full", "low"))
+    for row_offset, flags in block.anomaly_flags:
+        for flag in flags:
+            severity = flag.get("severity", "low")
+            if flag.get("full_row"):
+                ops.append(HighlightOp(offset + row_offset, offset + row_offset,
+                                       "full", severity))
+            else:
+                col_index = flag.get("col")
+                if col_index is not None:
+                    col_letter = chr(ord('A') + col_index)
+                    ops.append(HighlightOp(offset + row_offset, offset + row_offset,
+                                           col_letter, severity))
+    if block.red_flags:
+        ops.append(HighlightOp(offset, offset + n - 1, "I", "high"))
+    return ops
+
+
+def _unrecognized_block_ops(block, offset):
+    """UnrecognizedBlock の占位行高亮（_write_unrecognized_row の塗り分けと同型）。"""
+    if block.has_partial:
+        ops = [HighlightOp(offset, offset, "I", "high")]
+        if not block.has_date:
+            ops.append(HighlightOp(offset, offset, "B", "high"))
+        if not block.has_vendor:
+            ops.append(HighlightOp(offset, offset, "F", "high"))
+        return ops
+    return [HighlightOp(offset, offset, "full", "high")]
+
+
+def _canonical_row(row):
+    """MF 行を指紋用の正規文字列へ（28 列へパディング＋str strip、write/read 境界で安定）。"""
+    cells = [str(row[i]).strip() if i < len(row) else "" for i in range(len(MF_HEADERS))]
+    return "\x1f".join(cells)
+
+
+def compute_page_fingerprint(rows):
+    """頁の MF rows から順序非依存（multiset）の指紋を計算する（定稿 Plan §9 witness）。
+
+    PENDING 記録時（page_write.rows）と恢復時（Sheets 実行の読取り）で同一値なら一致する
+    ように、各セルを 28 列へ正規化・str strip してから行ハッシュを sorted 連結して sha256。
+    USER_ENTERED による数値/日付の再整形は真庫聯調（U14）で検証する既知の前提。
+    """
+    import hashlib
+    canon = sorted(_canonical_row(r) for r in rows)
+    joined = "\x1e".join(canon)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
+def _tab_name(employee_name, doc_type):
+    """`{従業員名}_{文書後缀}` タブ名（4 箇所で共用、後缀既定＝領収書）。"""
+    from doc_types import DOC_TYPE_TAB_SUFFIX
+    return f"{employee_name}_{DOC_TYPE_TAB_SUFFIX.get(doc_type, '領収書')}"
+
+
+def _classify_probe(segment, predicted_row_range, row_fingerprint):
+    """読取り済み行ブロックを ProbeResult へ分類（I/O 抜きの純判定、real/fake probe 共用）。
+
+    空/該当行無し→ABSENT／範囲末尾不足→ESCALATE／指紋全符→PRESENT／不一致→ESCALATE
+    （定稿 Plan §9 D3' の witness 判定表。啓発的探索なし）。
+    """
+    from posting_ledger import ProbeResult
+    start, end = predicted_row_range
+    non_empty = [r for r in segment if any(str(c).strip() for c in r)]
+    if not non_empty:
+        return ProbeResult.ABSENT
+    if len(segment) != (end - start + 1):
+        return ProbeResult.ESCALATE
+    if compute_page_fingerprint(segment) == row_fingerprint:
+        return ProbeResult.PRESENT
+    return ProbeResult.ESCALATE
 
 
 def _build_description(doc_type, vendor_name, item_description):
@@ -143,9 +283,7 @@ class SheetsOutputWriter:
 
     def start_new_file(self, employee_name, doc_type, filename=""):
         """新しいPDFファイルの処理開始を通知。分割線+取引No リセット。"""
-        from doc_types import DOC_TYPE_TAB_SUFFIX
-        tab_suffix = DOC_TYPE_TAB_SUFFIX.get(doc_type, "領収書")
-        tab_name = f"{employee_name}_{tab_suffix}"
+        tab_name = _tab_name(employee_name, doc_type)
         ws = self._get_or_create_tab(tab_name)
 
         # 既存データがあれば太黒線で分割
@@ -173,37 +311,27 @@ class SheetsOutputWriter:
         # 取引No を 1 にリセット
         self._tab_next_txn[tab_name] = 1
 
-    def append_entries(self, employee_name, doc_type, entries_data, source_url=""):
-        """
-        メイン書き込みメソッド。
+    def _build_result_rows(self, employee_name, doc_type, entries_data,
+                           source_url, txn_no):
+        """1 result（1 票）分の MF rows＋異常メタを純ロジックで構築する（書込なし）。
 
-        Args:
-            employee_name: 従業員名
-            doc_type: 文書タイプ (DocType value)
-            entries_data: OCR結果 dict (date, vendor, invoice_num, memo, entries[])
-            source_url: 原票 PDF の webViewLink
+        append_entries（UI）と build_page_write（headless）の共通ビルダ。有効金額の
+        行が 1 つも無ければ None を返す（呼び出し側が占位行へ分岐）。txn_no は採番済み
+        の値を受け取り（ws 非依存＝純）、全行に同一取引Noを振り、次番号を next_txn_no へ。
         """
-        from doc_types import DOC_TYPE_TAB_SUFFIX
-        from config import (ACCOUNT_MAP, UNKNOWN_ACCOUNT,
-                            CREDIT_SUB_ACCOUNT_RECEIPT, CREDIT_ONLY_ACCOUNTS,
+        from config import (ACCOUNT_MAP, UNKNOWN_ACCOUNT, CREDIT_ONLY_ACCOUNTS,
                             DOC_LOW_CONFIDENCE_THRESHOLD)
         from anomaly_detector import (detect_anomalies,
                                       detect_document_anomalies,
                                       detect_outlier_exempt_rows,
                                       detect_low_confidence)
-        from receipt_aggregation import coerce_tax_amount
-
-        tab_suffix = DOC_TYPE_TAB_SUFFIX.get(doc_type, "領収書")
-        tab_name = f"{employee_name}_{tab_suffix}"
-        ws = self._get_or_create_tab(tab_name)
 
         entries = entries_data.get("entries", [])
-
         uploader_name = entries_data.get('uploader', employee_name)
         invoice_num = _sanitize_invoice_num(entries_data.get('invoice_num', ''))
         vendor_name = entries_data.get('vendor', '')
         memo = entries_data.get('memo', '')
-        transaction_no = self._get_next_txn_no(tab_name, ws)
+        transaction_no = txn_no
 
         rows = []
         anomaly_flags_list = []
@@ -270,37 +398,19 @@ class SheetsOutputWriter:
                 anomaly_flags_list.append((len(rows) - 1, flags))
 
         if not rows:
-            # 書ける MF 行がゼロ（entries 空 / 全行金額0/None）でも無音 return
-            # しない。黙って戻ると main が Success 判定 → 原票アーカイブ →
-            # 誰も気づかないデータ欠落になるため、必ず認識不能の占位行
-            # （赤タグ）で人手確認へ可視化する（producer 側の _unrecognized
-            # 立て忘れも含めた最終防衛）。
-            if not entries_data.get("_unrecognized"):
-                reason = ("仕訳ゼロ（_unrecognized 未設定）" if not entries
-                          else "有効金額の仕訳がゼロ")
-                print(f"⚠️ {reason} → 認識不能として記録")
-            self._write_unrecognized_row(ws, tab_name, entries_data, source_url)
-            return
+            return None
 
         transaction_no += 1
 
         # --- 色判定を書き込み前に確定（色塗りは行番号が要るため後段で実施）---
-        # 低置信(全行黄)と doc 赤(合計不符/規則①, 全行I列赤)を先に検出し、
-        # U列タグ導出と後段の色塗りで共用する（再計算による色とタグの乖離を防ぐ）。
-        # 非 RECEIPT 経路ではこの2つは空のまま → 下の低置信/赤の色塗りは
-        # 自然に no-op になる（per-entry タグは doc_type 不問で後段で付与する）。
         conf_flags = []
         red_flags = []
         if doc_type == DocType.RECEIPT:
             conf_flags = detect_low_confidence(
                 entries_data, DOC_LOW_CONFIDENCE_THRESHOLD)
-            # 票面合計照合（[B']）と対象外行の構造異常（規則①）を合流。
             amount_col = [r[8] for r in rows]      # I列=借方金額
             tax_type_col = [r[6] for r in rows]    # G列=借方税区分
             doc_flags = detect_document_anomalies(entries_data, amount_col)
-            # 規則①は真の receipt 限定。bank_transfer/fee_receipt は本体が
-            # 「対象外」かつ高額になり得るため除外（合計照合は total=None で既に
-            # スキップ済み、規則①も doc_category で揃える。codex 指摘）
             exempt_flags = []
             if entries_data.get("doc_category") == "receipt":
                 exempt_flags = detect_outlier_exempt_rows(
@@ -309,13 +419,206 @@ class SheetsOutputWriter:
             red_flags = doc_flags + exempt_flags
 
         # U列(タグ): 標色される行に「赤系/橙系/黄系」を埋め込む（社長要望 6/18）。
-        # タグは「値」なので書式継承の影響を受けず、書き込み時に行データへ同梱する
-        # （別途 API 書き込み不要・自動拡容バグの影響も受けない）。
         tags = derive_row_tags(
             len(rows), anomaly_flags_list,
             doc_low_confidence=bool(conf_flags), doc_red=bool(red_flags))
         for i, tag in enumerate(tags):
             rows[i][TAG_COL_INDEX] = tag   # "" = 無標色（既定の空セルと同値）
+
+        return ResultBlock(rows, anomaly_flags_list, conf_flags, red_flags,
+                           transaction_no)
+
+    def _build_unrecognized_block(self, entries_data, source_url, txn_no):
+        """占位行（認識不能/部分認識）の row＋高亮判定材料を純ロジックで構築する（#9）。
+
+        _write_unrecognized_row（UI）と build_page_write（headless）で row/tag を共用し、
+        commit のみ分流する。row の内容は従来の _write_unrecognized_row と一字一句同じ。
+        """
+        date = entries_data.get("date", "") or ""
+        vendor = entries_data.get("vendor", "") or ""
+        memo_override = ((entries_data.get("memo") or "")
+                         if entries_data.get("_unrecognized") else "")
+        has_partial = bool(date or vendor)
+
+        now_jst = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
+
+        row = [""] * len(MF_HEADERS)
+        row[0] = txn_no              # 取引No
+        row[1] = date                # 取引日
+        row[5] = vendor              # 借方取引先
+        if memo_override:
+            row[18] = memo_override
+        elif has_partial:
+            row[18] = "⚠ 部分認識（金額なし）"
+        else:
+            row[18] = "⚠ 認識不能ページ"
+        row[23] = now_jst            # 作成日時
+        row[25] = now_jst            # 最終更新日時
+        row[27] = source_url         # 原票URL
+        row[TAG_COL_INDEX] = UNRECOGNIZED_TAG  # 常に赤系（人手確認後に削除）
+
+        return UnrecognizedBlock(row, has_partial, bool(date), bool(vendor),
+                                 txn_no + 1)
+
+    def build_page_write(self, employee_name, doc_type, results, source_urls,
+                         start_txn_no):
+        """1 頁分（複数票＋占位行）の書込計画を組み立てる（純データ、書込副作用ゼロ）。
+
+        頁内の各 result を _build_result_rows で構築、rows を連結、各 result の頁内
+        offset で高亮プランを組む。有効行ゼロの result は _build_unrecognized_block で
+        占位行 1 行として取込む（頁級では独立書込路径を使わない）。取引No は票ごとに +1。
+        ws には一切触れない（tab 名の算出のみ）——書込は commit_page が行う。
+        """
+        tab_name = _tab_name(employee_name, doc_type)
+
+        txn = start_txn_no
+        all_rows = []
+        ops = []
+        for entries_data, url in zip(results, source_urls):
+            offset = len(all_rows)
+            block = self._build_result_rows(
+                employee_name, doc_type, entries_data, url, txn)
+            if block is None:
+                ublock = self._build_unrecognized_block(entries_data, url, txn)
+                all_rows.append(ublock.row)
+                ops.extend(_unrecognized_block_ops(ublock, offset))
+                txn = ublock.next_txn_no
+            else:
+                all_rows.extend(block.rows)
+                ops.extend(_result_block_ops(block, offset))
+                txn = block.next_txn_no
+
+        return PageWrite(tab_name, all_rows, tuple(ops),
+                         (start_txn_no, txn - 1))
+
+    def commit_page(self, page_write):
+        """PageWrite を一度の append_rows で原子書込し、高亮を適用して行範囲を返す。
+
+        ① _ensure_row_capacity → ② 一度 append_rows（頁原子・硬去重の rows 不重複を保証）
+        → ③ 取引No メモリ更新（append landed 時点、#7）→ ④ 白リセット→高亮プラン適用
+        （頁相対 offset を絶対行へ translate、既存塗り順 白→黄→per-entry→赤 を踏襲）
+        → ⑤ 空尾行清掃。高亮は best-effort（op ごと独立 try/except、#8）。
+        戻り値＝(start_row, end_row)（ledger の CONFIRMED sheet_row_range へ）。
+        """
+        ws = self._get_or_create_tab(page_write.tab_name)
+        rows = page_write.rows
+
+        existing_data = ws.get_all_values()
+        pre_write_count = len(existing_data)
+        self._ensure_row_capacity(ws, pre_write_count + len(rows))
+        self._write_with_retry(ws, rows)
+
+        # 取引No は append landed 時点で前進（CONFIRMED 成否に依らない、#7）
+        start_txn, last_txn = page_write.txn_range
+        if last_txn >= start_txn:
+            self._tab_next_txn[page_write.tab_name] = last_txn + 1
+
+        start_row = pre_write_count + 1
+        end_row = start_row + len(rows) - 1
+
+        # 新規行を白にリセットしてから高亮を被せる（append の書式継承対策）
+        try:
+            fmt_white = CellFormat(backgroundColor=Color(1, 1, 1))
+            format_cell_range(ws, f"A{start_row}:AB{end_row}", fmt_white)
+        except Exception as e:
+            print(f"⚠️ 新規行の背景リセット失敗: {e}")
+
+        for op in page_write.highlight_ops:
+            ref = _op_cell_ref(op, start_row)
+            try:
+                self._format_with_retry(
+                    ws, ref, CellFormat(backgroundColor=_severity_color(op.severity)))
+            except Exception as e:
+                print(f"⚠️ ハイライト適用失敗 ({ref}): {e}")
+
+        self._sanitize_trailing_once(ws, page_write.tab_name, end_row)
+        print(f"💾 Sheets に {len(rows)} 行追加（頁原子）: {page_write.tab_name}")
+        return (start_row, end_row)
+
+    def next_txn_no(self, employee_name, doc_type):
+        """当該タブの次取引No を返す（headless の build_page_write へ渡す start_txn_no）。"""
+        tab_name = _tab_name(employee_name, doc_type)
+        ws = self._get_or_create_tab(tab_name)
+        return self._get_next_txn_no(tab_name, ws)
+
+    def peek_append_range(self, page_write):
+        """append 前に着地予定の行範囲 (start, end) を先読みする（PENDING witness 位置）。
+
+        append-only 前提で「現在の最終行 +1 から num_rows 分」が着地位置。commit_page の
+        pre_write_count 算出と同一口径（len(get_all_values())+1）。単進程逐次のため
+        peek→commit 間に他の書込は無い。
+        """
+        ws = self._get_or_create_tab(page_write.tab_name)
+        pre = len(ws.get_all_values())
+        return (pre + 1, pre + len(page_write.rows))
+
+    def probe_page(self, sheet_tab, predicted_row_range, row_fingerprint):
+        """PENDING witness の厳格照合（定稿 Plan §9 D3'、啓発的探索禁）。
+
+        predicted_row_range の当日 Sheets 実行を読み、multiset 指紋を再計算して照合する：
+          - 範囲が空/該当行無し（全セル空）           → ABSENT（append 未landed → 重写）
+          - 範囲内容の指紋が stored と全符             → PRESENT（landed → 補 CONFIRMED）
+          - タブ無し（清空跨ぎ）/範囲外れ/指紋不一致/読取例外 → ESCALATE（人工核）
+        """
+        from posting_ledger import ProbeResult
+        try:
+            ws = self.spreadsheet.worksheet(sheet_tab)
+        except gspread.exceptions.WorksheetNotFound:
+            return ProbeResult.ESCALATE  # タブ無し（清空跨ぎ）
+        except Exception:
+            return ProbeResult.ESCALATE
+        try:
+            all_vals = ws.get_all_values()
+        except Exception:
+            return ProbeResult.ESCALATE  # 読取例外 → 人工核
+
+        start, end = predicted_row_range
+        segment = all_vals[start - 1:end]  # 1-indexed inclusive → slice
+        return _classify_probe(segment, predicted_row_range, row_fingerprint)
+
+    def append_entries(self, employee_name, doc_type, entries_data, source_url=""):
+        """
+        メイン書き込みメソッド。
+
+        Args:
+            employee_name: 従業員名
+            doc_type: 文書タイプ (DocType value)
+            entries_data: OCR結果 dict (date, vendor, invoice_num, memo, entries[])
+            source_url: 原票 PDF の webViewLink
+        """
+        # Phase A（rows 構築＋科目/異常判定）は _build_result_rows へ抽出済み。
+        # 本メソッド（Phase B）は coerce_tax_amount のみ要する。
+        from receipt_aggregation import coerce_tax_amount
+
+        tab_name = _tab_name(employee_name, doc_type)
+        ws = self._get_or_create_tab(tab_name)
+
+        transaction_no = self._get_next_txn_no(tab_name, ws)
+        vendor_name = entries_data.get('vendor', '')
+
+        # Phase A（rows 構築＋異常メタ）は共通ビルダへ抽出（UI/headless 共用）。
+        block = self._build_result_rows(
+            employee_name, doc_type, entries_data, source_url, transaction_no)
+
+        if block is None:
+            # 書ける MF 行がゼロ（entries 空 / 全行金額0/None）でも無音 return
+            # しない。黙って戻ると main が Success 判定 → 原票アーカイブ →
+            # 誰も気づかないデータ欠落になるため、必ず認識不能の占位行
+            # （赤タグ）で人手確認へ可視化する（producer 側の _unrecognized
+            # 立て忘れも含めた最終防衛）。
+            entries = entries_data.get("entries", [])
+            if not entries_data.get("_unrecognized"):
+                reason = ("仕訳ゼロ（_unrecognized 未設定）" if not entries
+                          else "有効金額の仕訳がゼロ")
+                print(f"⚠️ {reason} → 認識不能として記録")
+            self._write_unrecognized_row(ws, tab_name, entries_data, source_url)
+            return
+
+        rows = block.rows
+        anomaly_flags_list = block.anomaly_flags
+        conf_flags = block.conf_flags
+        red_flags = block.red_flags
+        transaction_no = block.next_txn_no
 
         # 書き込み前のデータを取得（ハイライト位置計算+重複検出用）
         existing_data = ws.get_all_values()
@@ -526,35 +829,15 @@ class SheetsOutputWriter:
         _unrecognized を明示した producer（main の部分エラー占位行等）だけ —
         兜底経路で Gemini の memo が標準ラベルを乗っ取らないよう遮断する。
         """
-        date = entries_data.get("date", "") or ""
-        vendor = entries_data.get("vendor", "") or ""
-        memo_override = ((entries_data.get("memo") or "")
-                         if entries_data.get("_unrecognized") else "")
-        has_partial = bool(date or vendor)
-
-        now_jst = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
         txn_no = self._get_next_txn_no(tab_name, ws)
-
-        row = [""] * len(MF_HEADERS)
-        row[0] = txn_no              # 取引No
-        row[1] = date                # 取引日
-        row[5] = vendor              # 借方取引先
-        if memo_override:
-            row[18] = memo_override
-        elif has_partial:
-            row[18] = "⚠ 部分認識（金額なし）"
-        else:
-            row[18] = "⚠ 認識不能ページ"
-        row[23] = now_jst            # 作成日時
-        row[25] = now_jst            # 最終更新日時
-        row[27] = source_url         # 原票URL
-        # 認識不能/部分認識行は常に赤系（U列タグ。人手確認後に削除）
-        row[TAG_COL_INDEX] = UNRECOGNIZED_TAG
+        block = self._build_unrecognized_block(entries_data, source_url, txn_no)
+        row = block.row
+        has_partial = block.has_partial
 
         pre_write = len(ws.get_all_values())
         self._ensure_row_capacity(ws, pre_write + 1)
         self._write_with_retry(ws, [row])
-        self._tab_next_txn[tab_name] = txn_no + 1
+        self._tab_next_txn[tab_name] = block.next_txn_no
 
         actual_row = pre_write + 1
 
@@ -568,9 +851,9 @@ class SheetsOutputWriter:
             fmt_red = CellFormat(backgroundColor=Color(1, 0.8, 0.8))
             if has_partial:
                 format_cell_range(ws, f"I{actual_row}", fmt_red)
-                if not date:
+                if not block.has_date:
                     format_cell_range(ws, f"B{actual_row}", fmt_red)
-                if not vendor:
+                if not block.has_vendor:
                     format_cell_range(ws, f"F{actual_row}", fmt_red)
             else:
                 format_cell_range(ws, f"A{actual_row}:AB{actual_row}", fmt_red)

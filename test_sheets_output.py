@@ -544,5 +544,293 @@ class AppendEntriesSilentLossGuardTest(unittest.TestCase):
                          "⚠ ページ処理エラー 2/8頁 手動再スキャン要")
 
 
+from sheets_output import TAG_COL_INDEX  # noqa: E402
+from tag_rules import UNRECOGNIZED_TAG  # noqa: E402
+
+
+def _receipt_result(vendor, entries, total=None, invoice="T9234567890123", **extra):
+    """headless 頁経路用の 1 票（result）dict を組み立てる。"""
+    data = {"date": "2026/06/01", "vendor": vendor, "invoice_num": invoice,
+            "memo": "", "entries": entries, "doc_category": "receipt"}
+    if total is not None:
+        data["total_amount"] = total
+    data.update(extra)
+    return data
+
+
+class BuildPageWriteOffsetTest(unittest.TestCase):
+    """T2-1（DoD③・必須）: 頁内複数票の高亮オフセットが票段ごとに正しく、隣票へ漏れない。
+
+    build_page_write は純データ（PageWrite.highlight_ops は頁相対 offset）——ws 不要。
+    """
+
+    def test_pure_no_worksheet_side_effect(self):
+        writer = _make_writer()
+        r1 = _receipt_result("店A", [_entry(5000)], total=5000)
+        with patch.object(SheetsOutputWriter, "_get_or_create_tab") as m_tab, \
+             patch.object(SheetsOutputWriter, "_write_with_retry") as m_write:
+            pw = writer.build_page_write(
+                "従業員", DocType.RECEIPT, [r1], ["http://u1"], start_txn_no=1)
+        m_tab.assert_not_called()   # 書込副作用ゼロ（tab も引かない）
+        m_write.assert_not_called()
+        self.assertIsInstance(pw.rows, list)
+
+    def test_second_ticket_red_does_not_leak_to_first(self):
+        writer = _make_writer()
+        # 票1 正常 1 行（total 一致）/ 票2 合計不符 1 行 → I列赤
+        r1 = _receipt_result("店A", [_entry(5000)], total=5000)
+        r2 = _receipt_result("店B", [_entry(3000)], total=9999)
+        pw = writer.build_page_write(
+            "従業員", DocType.RECEIPT, [r1, r2], ["u1", "u2"], start_txn_no=1)
+        self.assertEqual(len(pw.rows), 2)
+        red_ops = [o for o in pw.highlight_ops
+                   if o.col == "I" and o.severity == "high"]
+        self.assertEqual(len(red_ops), 1)
+        # 票2 は page offset 1。赤は offset 1 のみ（票1=offset0 に漏れない）
+        self.assertEqual((red_ops[0].row_start, red_ops[0].row_end), (1, 1))
+
+    def test_first_ticket_red_stays_at_offset_zero(self):
+        writer = _make_writer()
+        r1 = _receipt_result("店A", [_entry(3000)], total=9999)  # 異常
+        r2 = _receipt_result("店B", [_entry(5000)], total=5000)  # 正常
+        pw = writer.build_page_write(
+            "従業員", DocType.RECEIPT, [r1, r2], ["u1", "u2"], start_txn_no=1)
+        red_ops = [o for o in pw.highlight_ops
+                   if o.col == "I" and o.severity == "high"]
+        self.assertEqual(len(red_ops), 1)
+        self.assertEqual((red_ops[0].row_start, red_ops[0].row_end), (0, 0))
+
+    def test_per_entry_flag_lands_on_correct_page_row(self):
+        writer = _make_writer()
+        # 票1 正常 2 行 / 票2（T番号空）1 行 → per-entry 黄（単体セル, low）
+        r1 = _receipt_result("店A", [_entry(5000), _entry(3000)], total=8000)
+        r2 = _receipt_result("店B", [_entry(4000)], total=4000, invoice="")
+        pw = writer.build_page_write(
+            "従業員", DocType.RECEIPT, [r1, r2], ["u1", "u2"], start_txn_no=1)
+        self.assertEqual(len(pw.rows), 3)
+        # 票2 は page offset 2。単体セル low op は offset 2 に載る（票1 の 0/1 に漏れない）
+        single_low = [o for o in pw.highlight_ops
+                      if o.severity == "low" and o.col != "full"]
+        self.assertTrue(single_low)
+        for o in single_low:
+            self.assertEqual((o.row_start, o.row_end), (2, 2))
+
+    def test_txn_number_advances_per_ticket(self):
+        writer = _make_writer()
+        r1 = _receipt_result("店A", [_entry(5000), _entry(3000)], total=8000)
+        r2 = _receipt_result("店B", [_entry(4000)], total=4000)
+        pw = writer.build_page_write(
+            "従業員", DocType.RECEIPT, [r1, r2], ["u1", "u2"], start_txn_no=7)
+        # 票内は同一取引No、票ごとに +1
+        self.assertEqual([r[0] for r in pw.rows], [7, 7, 8])
+        self.assertEqual(pw.txn_range, (7, 8))
+
+
+class CommitPageTest(unittest.TestCase):
+    """T2-2/3: 頁級一度書込（単一 append_rows）＋ offset→絶対行 translation ＋占位入頁。"""
+
+    def _commit(self, writer, pw, ws, fmt_calls):
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(
+                SheetsOutputWriter, "_get_or_create_tab", return_value=ws))
+            stack.enter_context(patch.object(
+                SheetsOutputWriter, "_format_with_retry",
+                lambda self, w, ref, fmt, max_retries=5: fmt_calls.append(ref)))
+            stack.enter_context(patch.object(
+                SheetsOutputWriter, "_ensure_row_capacity"))
+            stack.enter_context(patch.object(
+                SheetsOutputWriter, "_sanitize_trailing_once"))
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                return writer.commit_page(pw)
+
+    def test_single_append_rows_for_whole_page(self):
+        writer = _make_writer()
+        ws = _FakeWorksheet()
+        calls = {"n": 0}
+        base = ws.append_rows
+
+        def counting(rows, value_input_option=None):
+            calls["n"] += 1
+            base(rows, value_input_option=value_input_option)
+
+        ws.append_rows = counting
+        r1 = _receipt_result("店A", [_entry(5000)], total=5000)
+        r2 = _receipt_result("店B", [_entry(3000)], total=3000)
+        pw = writer.build_page_write(
+            "従業員", DocType.RECEIPT, [r1, r2], ["u1", "u2"], start_txn_no=1)
+        rng = self._commit(writer, pw, ws, [])
+        self.assertEqual(calls["n"], 1)          # 頁原子＝append 1 回
+        self.assertEqual(len(ws.appended), 2)
+        self.assertEqual(rng, (6, 7))            # legend4+header1=5 → start 6
+
+    def test_ops_translate_to_absolute_rows(self):
+        writer = _make_writer()
+        ws = _FakeWorksheet()
+        fmt_calls = []
+        r1 = _receipt_result("店A", [_entry(5000)], total=5000)   # 正常
+        r2 = _receipt_result("店B", [_entry(3000)], total=9999)   # 赤
+        pw = writer.build_page_write(
+            "従業員", DocType.RECEIPT, [r1, r2], ["u1", "u2"], start_txn_no=1)
+        self._commit(writer, pw, ws, fmt_calls)
+        self.assertIn("I7:I7", fmt_calls)        # 票2 = page offset1 → 絶対 row7
+        self.assertNotIn("I6:I6", fmt_calls)     # 票1 に漏れない
+
+    def test_unrecognized_result_becomes_normal_page_row(self):
+        writer = _make_writer()
+        r1 = _receipt_result("店A", [_entry(5000)], total=5000)
+        # 票2: 全行金額0 → 占位行（部分認識ラベル、赤タグ）
+        r2 = _receipt_result("店B", [_entry(0)], total=None, invoice="")
+        pw = writer.build_page_write(
+            "従業員", DocType.RECEIPT, [r1, r2], ["u1", "u2"], start_txn_no=1)
+        self.assertEqual(len(pw.rows), 2)        # 占位も普通の一行として集約
+        self.assertEqual(pw.rows[1][TAG_COL_INDEX], UNRECOGNIZED_TAG)
+        self.assertEqual(pw.rows[1][18], "⚠ 部分認識（金額なし）")
+        # 占位行（has_partial）は I列赤 op を持つ（offset 1）
+        red_ops = [o for o in pw.highlight_ops
+                   if o.col == "I" and o.row_start == 1]
+        self.assertTrue(red_ops)
+
+
+from sheets_output import compute_page_fingerprint  # noqa: E402
+from posting_ledger import ProbeResult  # noqa: E402
+
+
+class FingerprintTest(unittest.TestCase):
+    """compute_page_fingerprint: 順序非依存＋write/read 境界（int↔str, 列不足）安定。"""
+
+    def test_order_independent(self):
+        a = [[1, "x"], [2, "y"]]
+        b = [[2, "y"], [1, "x"]]
+        self.assertEqual(compute_page_fingerprint(a), compute_page_fingerprint(b))
+
+    def test_int_and_str_cells_match(self):
+        # page_write.rows（int 混在）と Sheets 読取り（全 str）が同一値なら一致
+        written = [[1, "2026/06/01", 5000]]
+        read_back = [["1", "2026/06/01", "5000"]]
+        self.assertEqual(compute_page_fingerprint(written),
+                         compute_page_fingerprint(read_back))
+
+    def test_different_content_differs(self):
+        self.assertNotEqual(compute_page_fingerprint([[1, "x"]]),
+                            compute_page_fingerprint([[1, "z"]]))
+
+
+class _FakeSpreadsheet:
+    def __init__(self, tabs):
+        self._tabs = tabs  # {tab_name: [[...rows...]]}
+
+    def worksheet(self, name):
+        import gspread
+        if name not in self._tabs:
+            raise gspread.exceptions.WorksheetNotFound(name)
+        ws = _FakeWorksheet()
+        ws._values = list(self._tabs[name])
+        return ws
+
+
+class ProbePageTest(unittest.TestCase):
+    """probe_page: 厳格 witness（PRESENT/ABSENT/ESCALATE、附近探索なし）。"""
+
+    def _writer(self, tabs):
+        writer = _make_writer()
+        writer.spreadsheet = _FakeSpreadsheet(tabs)
+        return writer
+
+    def test_present_when_fingerprint_matches(self):
+        rows = [["1", "2026/06/01", "5000"]]
+        # legend4+header1 の後、row6 に着地したと想定
+        tab_rows = [["L1"], ["L2"], ["L3"], ["L4"], ["H"]] + rows
+        writer = self._writer({"従業員_領収書": tab_rows})
+        fp = compute_page_fingerprint(rows)
+        self.assertIs(
+            writer.probe_page("従業員_領収書", (6, 6), fp), ProbeResult.PRESENT)
+
+    def test_absent_when_range_empty(self):
+        tab_rows = [["L1"], ["L2"], ["L3"], ["L4"], ["H"]]  # データ行なし
+        writer = self._writer({"従業員_領収書": tab_rows})
+        self.assertIs(
+            writer.probe_page("従業員_領収書", (6, 6), "anyfp"), ProbeResult.ABSENT)
+
+    def test_escalate_when_fingerprint_mismatch(self):
+        tab_rows = [["L1"], ["L2"], ["L3"], ["L4"], ["H"],
+                    ["1", "2026/06/01", "9999"]]
+        writer = self._writer({"従業員_領収書": tab_rows})
+        fp = compute_page_fingerprint([["1", "2026/06/01", "5000"]])  # 異なる内容
+        self.assertIs(
+            writer.probe_page("従業員_領収書", (6, 6), fp), ProbeResult.ESCALATE)
+
+    def test_escalate_when_tab_missing(self):
+        writer = self._writer({})  # タブ無し（清空跨ぎ）
+        self.assertIs(
+            writer.probe_page("消えたタブ", (6, 6), "fp"), ProbeResult.ESCALATE)
+
+    def test_escalate_when_range_exceeds_sheet(self):
+        # 範囲末尾が実行を超える（末尾不足）→ ESCALATE
+        tab_rows = [["L1"], ["L2"], ["L3"], ["L4"], ["H"], ["1", "x", "5000"]]
+        writer = self._writer({"従業員_領収書": tab_rows})
+        self.assertIs(
+            writer.probe_page("従業員_領収書", (6, 8), "fp"), ProbeResult.ESCALATE)
+
+
+class HighlightOpsTranslationTest(unittest.TestCase):
+    """_result_block_ops / _unrecognized_block_ops の分岐（R1 高亮の要）を純関数で固定。"""
+
+    def _ops(self):
+        from sheets_output import (_result_block_ops, _unrecognized_block_ops,
+                                   ResultBlock, UnrecognizedBlock)
+        return _result_block_ops, _unrecognized_block_ops, ResultBlock, UnrecognizedBlock
+
+    def test_result_ops_full_row_and_col_and_red(self):
+        rbo, _, ResultBlock, _u = self._ops()
+        block = ResultBlock(
+            rows=[["r0"], ["r1"]],
+            anomaly_flags=[(0, [{"severity": "high", "full_row": True}]),
+                           (1, [{"severity": "low", "col": 7}])],  # H列
+            conf_flags=[{"message": "低置信"}],
+            red_flags=[{"message": "不符"}],
+            next_txn_no=2)
+        ops = rbo(block, offset=3)
+        cols = {(o.col, o.row_start, o.row_end, o.severity) for o in ops}
+        self.assertIn(("full", 3, 4, "low"), cols)      # 黄下地（全行、offset3..4）
+        self.assertIn(("full", 3, 3, "high"), cols)     # per-entry full_row（offset3）
+        self.assertIn(("H", 4, 4, "low"), cols)         # per-entry 単体セル（offset4）
+        self.assertIn(("I", 3, 4, "high"), cols)        # doc 赤（I列、offset3..4）
+
+    def test_unrecognized_ops_partial_missing_date_and_vendor(self):
+        _, ubo, _r, UnrecognizedBlock = self._ops()
+        block = UnrecognizedBlock(row=["x"], has_partial=True,
+                                  has_date=False, has_vendor=False, next_txn_no=2)
+        ops = ubo(block, offset=5)
+        cols = {o.col for o in ops}
+        self.assertEqual(cols, {"I", "B", "F"})         # I＋日付B＋取引先F 赤
+        self.assertTrue(all(o.severity == "high" and o.row_start == 5 for o in ops))
+
+    def test_unrecognized_ops_full_when_not_partial(self):
+        _, ubo, _r, UnrecognizedBlock = self._ops()
+        block = UnrecognizedBlock(row=["x"], has_partial=False,
+                                  has_date=False, has_vendor=False, next_txn_no=2)
+        ops = ubo(block, offset=0)
+        self.assertEqual([(o.col, o.severity) for o in ops], [("full", "high")])
+
+
+class NextTxnAndPeekTest(unittest.TestCase):
+    """headless の start_txn 先読み（next_txn_no）と着地予定範囲（peek_append_range）。"""
+
+    def test_next_txn_no_empty_tab_returns_one(self):
+        writer = _make_writer()
+        ws = _FakeWorksheet()  # legend4+header1、数値 A 列なし → 1
+        with patch.object(SheetsOutputWriter, "_get_or_create_tab", return_value=ws):
+            self.assertEqual(writer.next_txn_no("従業員", DocType.RECEIPT), 1)
+
+    def test_peek_append_range_after_existing_rows(self):
+        writer = _make_writer()
+        ws = _FakeWorksheet()  # 既存 5 行 → 次は row6 から
+        import types
+        pw = types.SimpleNamespace(rows=[["a"], ["b"]], tab_name="従業員_領収書")
+        with patch.object(SheetsOutputWriter, "_get_or_create_tab", return_value=ws):
+            self.assertEqual(writer.peek_append_range(pw), (6, 7))
+
+
 if __name__ == "__main__":
     unittest.main()

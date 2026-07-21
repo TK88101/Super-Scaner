@@ -103,6 +103,22 @@ def check_intake(
     return IntakeCheck(IntakeDecision.PROCESS, base, None)
 
 
+@dataclass(frozen=True)
+class IntakeGateResult:
+    """handle_intake_gate の戻り値（定稿 Plan §9 D4' #14）。
+
+    should_process：True なら呼び出し側は処理続行してよい（＝PROCESS のみ）。
+    base：PROCESS 時の base posting_id（IP-304 の頁級台賬 job_key）。PROCESS 以外は
+    参考値（隔離済み/保留のため process_file へは渡らない）。
+    decision/reason：check_intake の裁決（memo 命中は REJECTED 扱い、base=None）。
+    """
+
+    should_process: bool
+    base: str | None
+    decision: IntakeDecision
+    reason: str | None
+
+
 def _finish_quarantine_move(
     move_to_quarantine: Callable[[], None],
     file_id: Any,
@@ -182,20 +198,41 @@ def handle_intake(
     どちらかで失敗しても次回の再試行で無害に補完できる
     （alert は文檔 ID 冪等、move は隔離先に既に無ければ再実行されるだけ）。
     """
+    return handle_intake_gate(
+        file, get_job=get_job, write_alert=write_alert,
+        move_to_quarantine=move_to_quarantine, alerted=alerted,
+    ).should_process
+
+
+def handle_intake_gate(
+    file: Mapping[str, Any],
+    *,
+    get_job: Callable[[str], Mapping[str, Any] | None],
+    write_alert: Callable[[str, Mapping[str, Any]], None],
+    move_to_quarantine: Callable[[], None],
+    alerted: MutableMapping[str, str] | None = None,
+) -> IntakeGateResult:
+    """handle_intake の本体（副作用は同一・戻り値を IntakeGateResult へ拡張、#14）。
+
+    handle_intake（bool）はこれの should_process を返す薄包装。IP-304 が PROCESS 時の
+    base を process_file へ通す必要があるため、bool ではなく base を伴う結果を返す。
+    副作用の順序・失敗隔離・payload 白名単は handle_intake の docstring と一字も違わない。
+    """
     file_id = file.get("id")
 
     if alerted is not None and file_id in alerted:
         reason = alerted[file_id]
-        return _finish_quarantine_move(move_to_quarantine, file_id, reason, alerted)
+        _finish_quarantine_move(move_to_quarantine, file_id, reason, alerted)
+        return IntakeGateResult(False, None, IntakeDecision.REJECTED, reason)
 
     check = check_intake(file, get_job)
 
     if check.decision is IntakeDecision.PROCESS:
-        return True
+        return IntakeGateResult(True, check.base, IntakeDecision.PROCESS, None)
 
     if check.decision is IntakeDecision.DEFERRED:
         print(f"入口守衛: 判定保留 file_id={file_id} reason={check.reason}")
-        return False
+        return IntakeGateResult(False, check.base, IntakeDecision.DEFERRED, check.reason)
 
     # REJECTED
     payload: dict[str, Any] = {
@@ -210,9 +247,10 @@ def handle_intake(
         write_alert(file_id, payload)
     except Exception as exc:  # noqa: BLE001 - 旁路失敗を隔離、呼び出し方針は下輪再試行
         print(f"入口守衛: alert 書込失敗 file_id={file_id} error_type={type(exc).__name__}")
-        return False
+        return IntakeGateResult(False, check.base, IntakeDecision.REJECTED, check.reason)
 
     if alerted is not None:
         alerted[file_id] = check.reason
 
-    return _finish_quarantine_move(move_to_quarantine, file_id, check.reason, alerted)
+    _finish_quarantine_move(move_to_quarantine, file_id, check.reason, alerted)
+    return IntakeGateResult(False, check.base, IntakeDecision.REJECTED, check.reason)

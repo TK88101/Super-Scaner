@@ -542,9 +542,10 @@ class HeadlessIntakeGateTest(unittest.TestCase):
         file = {"id": "f1"}
 
         with patch.dict(os.environ, {"HEADLESS_MODE": "0"}):
-            result = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
+            should, base = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
 
-        self.assertTrue(result)
+        self.assertTrue(should)
+        self.assertIsNone(base)
         reporter.get_job.assert_not_called()
         reporter.write_alert.assert_not_called()
         service.files.return_value.update.assert_not_called()
@@ -559,9 +560,9 @@ class HeadlessIntakeGateTest(unittest.TestCase):
 
         with patch.dict(os.environ, {"HEADLESS_MODE": "1", "QUARANTINE_FOLDER_ID": "Q_FOLDER"}), \
                 redirect_stdout(io.StringIO()):
-            result = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
+            should, base = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
 
-        self.assertFalse(result)
+        self.assertFalse(should)
         kwargs = service.files.return_value.update.call_args.kwargs
         self.assertEqual("Q_FOLDER", kwargs.get("addParents"))
         self.assertEqual("INPUT_FOLDER", kwargs.get("removeParents"))
@@ -574,9 +575,10 @@ class HeadlessIntakeGateTest(unittest.TestCase):
         file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-1"}}
 
         with patch.dict(os.environ, {"HEADLESS_MODE": "1", "QUARANTINE_FOLDER_ID": "Q_FOLDER"}):
-            result = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
+            should, base = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
 
-        self.assertTrue(result)
+        self.assertTrue(should)
+        self.assertEqual(base, "base-1")
         service.files.return_value.update.assert_not_called()
 
     def test_get_job_and_write_alert_are_bound_to_reporter_methods(self):
@@ -614,12 +616,12 @@ class HeadlessIntakeGateTest(unittest.TestCase):
 
         with patch.dict(os.environ, {"HEADLESS_MODE": "1", "QUARANTINE_FOLDER_ID": "Q_FOLDER"}), \
                 redirect_stdout(io.StringIO()):
-            first = main._headless_intake_gate(
+            first, _ = main._headless_intake_gate(
                 service, file, "INPUT_FOLDER", reporter, alerted=alerted)
             self.assertFalse(first)
             self.assertIn("f1", alerted, "初回 move 失敗直後は memo に残るはず")
 
-            second = main._headless_intake_gate(
+            second, _ = main._headless_intake_gate(
                 service, file, "INPUT_FOLDER", reporter, alerted=alerted)
 
         self.assertFalse(second)
