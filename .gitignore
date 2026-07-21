@@ -19,3 +19,9 @@ temp_downloads/
 MF_Import_Data.csv
 benchmark_results*.txt
 .playwright-mcp/
+
+# --- 黄金様本回帰（golden_capture.py の出力） ---
+# fixture は客先の領収書/請求書の生 OCR 結果を含むため仓へ入れない。
+# 再現性は golden_manifest/（sha256＋commit＋model）で担保する。
+golden/
+.coverage

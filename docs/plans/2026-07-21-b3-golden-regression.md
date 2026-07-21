@@ -127,7 +127,7 @@
   - `FakeWorksheet`：`title` / `get_all_values` / `append_rows` / **`append_row`** / **`row_count`** / **`add_rows`**（裁決#8。欠けると容量拡張・尾行清掃が握り潰されて静かに未検証になる、F12）。容量・清掃の呼出は `warnings` へ記録。
   - `make_offline_writer()`：`SheetsOutputWriter.__new__` ＋ 属性注入（F6）、`_get_or_create_tab` を fake 返却へ差替。
   - `freeze_time()`：`sheets_output.datetime` を固定（D4-1）。
-  - `capture_formats()`：`format_cell_range` と `_format_with_retry` を patch（D4-2）。
+  - `capture_formats()`：モジュール級 `format_cell_range` **のみ**を patch（D4-2 訂正後。`_format_with_retry` は内部でこれを呼ぶため二重 patch 不可）。
   - `replay_ui(fixture, doc_type)` / `replay_page(fixture, doc_type)`：**`local_test.process_local_file` の wrapper 語義を再現**（D2）。
   - `normalize(...) -> dict`／`origin_report() -> dict`（D3 の出自証明）。
 - TDD（先 RED、`test_golden_replay.py`）：
@@ -203,6 +203,7 @@
 - fixture 本体を仓へ入れるか（現案＝manifest のみ追跡）。B4 以降で共有回帰基準にしたいなら別途拍板。
 - ハーネス自洽緑の限界（R6）は原理的に残る。将来 `local_test.py` の実 Sheets 出力を機械読取して replay 出力と突き合わせれば閉じるが、Gemini 非決定性のため同一 run 内でしか成立しない——B4 以降の検討事項。
 - `LocalTest` tab の後綴実名（`DOC_TYPE_TAB_SUFFIX` の receipt 値）は T6 実行時に実測して報告へ記す。
+- **T7 の書き方の注意（Phase 3 追記）**：DIFF-B が緑でも、それは「同一入力に対し `build_page_write`＋`commit_page` が UI 経路と同じ 28 列 rows／高亮を出す」ことの証明であって、「実在の headless 呼出側が既にそう振る舞っている」ことの証明ではない。頁緩衝（`main.py:454-467`）と部分失敗占位行（`main.py:498-510`）については実装を実測して合わせたが、それ以外の headless wrapper 語義は本批の射程外（IP-306/B4）。T7 ではこの区別を明記すること。
 
 ## 8. 附録：Codex 辯論裁決記録（Phase 1・定稿）
 
