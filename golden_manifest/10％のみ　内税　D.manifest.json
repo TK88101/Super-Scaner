@@ -1,0 +1,9 @@
+{
+  "source_file": "10％のみ　内税　D.png",
+  "source_sha256": "736d45a5596f3490903fa7fbd4134f6cab11135ba56b46a492112cb151214431",
+  "commit": "234aa123d171c44ed932fc0599c309c098316c80",
+  "strategy": "C",
+  "gemini_model": "models/gemini-2.5-flash",
+  "captured_at": "2026-07-21T14:17:44+09:00",
+  "page_count": 1
+}

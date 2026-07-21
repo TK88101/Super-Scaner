@@ -1,0 +1,9 @@
+{
+  "source_file": "10_のみ　外税   A.png",
+  "source_sha256": "45f7ba2e3f95620ca1c291bf371442ab36ca1e321658b021f4eda64c41b90c79",
+  "commit": "234aa123d171c44ed932fc0599c309c098316c80",
+  "strategy": "C",
+  "gemini_model": "models/gemini-2.5-flash",
+  "captured_at": "2026-07-21T14:14:26+09:00",
+  "page_count": 1
+}

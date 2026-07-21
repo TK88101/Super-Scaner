@@ -1,0 +1,9 @@
+{
+  "source_file": "8％と10％両方ある　内税　A.png",
+  "source_sha256": "12cf433fc39cc38f2467a73bad3f52c5a0e1f44e0c444963214eadd9d42784a8",
+  "commit": "234aa123d171c44ed932fc0599c309c098316c80",
+  "strategy": "C",
+  "gemini_model": "models/gemini-2.5-flash",
+  "captured_at": "2026-07-21T14:19:38+09:00",
+  "page_count": 1
+}

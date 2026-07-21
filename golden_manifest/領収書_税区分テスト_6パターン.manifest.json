@@ -1,0 +1,9 @@
+{
+  "source_file": "領収書_税区分テスト_6パターン.pdf",
+  "source_sha256": "3ce5535fc7282cfe3ba3c011a7fe7bc12a2774b3ca7d81862dcda6f2c2860121",
+  "commit": "234aa123d171c44ed932fc0599c309c098316c80",
+  "strategy": "C",
+  "gemini_model": "models/gemini-2.5-flash",
+  "captured_at": "2026-07-21T14:13:49+09:00",
+  "page_count": 6
+}

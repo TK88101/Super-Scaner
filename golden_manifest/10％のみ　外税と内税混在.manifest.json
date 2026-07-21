@@ -1,0 +1,9 @@
+{
+  "source_file": "10％のみ　外税と内税混在.png",
+  "source_sha256": "d9e804d93aa6f538632e50abd6a10d271665d6168fd2e26516761694aef507e3",
+  "commit": "234aa123d171c44ed932fc0599c309c098316c80",
+  "strategy": "C",
+  "gemini_model": "models/gemini-2.5-flash",
+  "captured_at": "2026-07-21T14:16:15+09:00",
+  "page_count": 1
+}

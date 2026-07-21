@@ -1,0 +1,9 @@
+{
+  "source_file": "8％と10％両方ある　外税 .png",
+  "source_sha256": "4211026638108ffcc6a5d622830fa0182e2a16b87ced6c9f76297f4db695b48f",
+  "commit": "234aa123d171c44ed932fc0599c309c098316c80",
+  "strategy": "C",
+  "gemini_model": "models/gemini-2.5-flash",
+  "captured_at": "2026-07-21T14:18:16+09:00",
+  "page_count": 1
+}

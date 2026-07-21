@@ -1,0 +1,9 @@
+{
+  "source_file": "10％と非課税混在　内税.png",
+  "source_sha256": "af7c91d14a272ef8ec1ed29b90c652e51457cc82dd814e2b6fc9afbf95d5ab13",
+  "commit": "234aa123d171c44ed932fc0599c309c098316c80",
+  "strategy": "C",
+  "gemini_model": "models/gemini-2.5-flash",
+  "captured_at": "2026-07-21T14:15:06+09:00",
+  "page_count": 1
+}
