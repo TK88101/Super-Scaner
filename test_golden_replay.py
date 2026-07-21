@@ -7,6 +7,8 @@ import json
 import unittest
 from datetime import datetime, timedelta
 
+from gspread_formatting import CellFormat, Color
+
 import golden_replay as gr
 from doc_types import DocType
 
@@ -149,6 +151,50 @@ class HighlightCaptureTest(unittest.TestCase):
         others = [h for h in highlights
                   if h["cell"] not in (f"A{start}:AB{end}", f"I{start}:I{end}")]
         self.assertTrue(others, f"per-entry 高亮が捕獲されていない: {highlights}")
+
+    # 生産の白リセットは 3 箇所（append_entries / commit_page /
+    # _write_unrecognized_row）。前 2 つは通常票で、3 つ目は部分失敗の占位行でしか
+    # 踏まないため、fixture を 2 種類流す必要がある（1 種類だと変異が生き残る）。
+    ORDER_FIXTURES = {
+        "通常票": [_four_outlet_page()],
+        "部分失敗の占位行": [_normal_page(1, 2), _error_page(2, 2)],
+    }
+
+    def test_white_reset_precedes_highlights_on_both_paths(self):
+        """不変条件: 真の書込経路で白リセットが高亮を消してはならない。
+
+        生産の書込尾部は「append → 白リセット → 高亮」の順に依存する。この順序が
+        壊れると顧客シート上で赤が消えるが、旧口径（highlights / reset_ranges）は
+        集合へ畳むため byte 一致で緑になる（順序盲）。
+        合成 records ではなく**実際の書込経路**を駆動して恒空を釘で留める。
+        """
+        for label, fixture in self.ORDER_FIXTURES.items():
+            for path, replay in (("ui", gr.replay_ui), ("page", gr.replay_page)):
+                out = replay(fixture, DocType.RECEIPT, source="fx")
+                self.assertTrue(out["tabs"], f"{label}/{path}: tab がゼロ")
+                for tab, block in out["tabs"].items():
+                    self.assertEqual(
+                        block["white_erased"], [],
+                        f"{label}/{path}/{tab}: 白リセットが高亮を消している")
+                    self.assertTrue(
+                        block["final_highlights"],
+                        f"{label}/{path}/{tab}: 最終態が空——判定が空振りしている")
+
+    def test_severity_priority_survives_on_the_real_path(self):
+        """塗り順「黄(全行) → per-entry → 赤(I列)」の優先順位を最終態で釘付ける。
+
+        非空だけを見ると、全行黄を赤の後に塗る改変（＝票面合計不一致の赤が黄へ
+        降格し、会計士が警告レベルを読み違える）を取り逃がす。
+        """
+        for path, replay in (("ui", gr.replay_ui), ("page", gr.replay_page)):
+            out = replay([_four_outlet_page()], DocType.RECEIPT, source="fx")
+            block = out["tabs"][gr.tab_name_for(DocType.RECEIPT)]
+            final = {h["cell"]: h["severity"] for h in block["final_highlights"]}
+            # I 列＝票面合計≠行合計 の赤。全行黄に上書きされてはならない。
+            self.assertEqual(final.get("I6"), "high",
+                             f"{path}: I 列の赤が降格している: {final.get('I6')}")
+            # 全行黄の下地は赤以外の列に残る。
+            self.assertEqual(final.get("A6"), "low", f"{path}: 全行黄が消えた")
 
     def test_canonical_ref_unifies_single_cell_forms(self):
         self.assertEqual(gr.canonical_ref("I7"), gr.canonical_ref("I7:I7"))
@@ -343,6 +389,28 @@ class BaselineCompatTest(unittest.TestCase):
                         "_SEVERITY_COLORS", "_severity_color",
                         "GRID_ROW_BUFFER", "TAG_COL_INDEX"}
 
+    # 実行時に `sheets_output.X` として触る名前（monkeypatch 対象）。
+    # import 文ではないので上の ImportFrom 走査には引っかからない。
+    BASELINE_ATTRS = {"datetime", "format_cell_range", "format_cell_ranges"}
+
+    def test_runtime_attribute_access_is_declared(self):
+        """属性アクセスも基線互換の対象——AST ガードの穴を塞ぐ。
+
+        `capture_formats` は sheets_output の名前を差し替えるが、それは import 文
+        ではないため ImportFrom 走査では見えない。基線に無い名前を触り始めても
+        テストは緑のまま、基線で実行した瞬間に AttributeError になる。
+        """
+        import ast, inspect
+        tree = ast.parse(inspect.getsource(gr))
+        touched = {n.attr for n in ast.walk(tree)
+                   if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                   and n.value.id == "sheets_output"}
+        self.assertTrue(touched, "sheets_output への属性アクセスが検出できない")
+        self.assertLessEqual(
+            touched, self.BASELINE_ATTRS,
+            f"未申告の実行時依存: {sorted(touched - self.BASELINE_ATTRS)} "
+            f"——基線 0d304f0 に存在するか確認し、BASELINE_ATTRS へ追加すること")
+
     def test_module_level_sheets_output_imports_exist_in_baseline(self):
         import ast
         import inspect
@@ -357,6 +425,181 @@ class BaselineCompatTest(unittest.TestCase):
             imported, self.BASELINE_SYMBOLS,
             f"基線に存在しないシンボルを import している: "
             f"{sorted(imported - self.BASELINE_SYMBOLS)}")
+
+
+class _RecordsMixin:
+    """records を組んで normalize する共通土台（TestCase ではないので重複実行しない）。"""
+
+    TAB = "T_順序"
+
+    @staticmethod
+    def _fmt(name):
+        """severity 名（または "white"）から CellFormat を作る。"""
+        color = (Color(*gr.WHITE_RGB) if name == "white"
+                 else gr._SEVERITY_COLORS[name])
+        return CellFormat(backgroundColor=color)
+
+    def _normalize(self, ops):
+        """(cell_ref, severity 名) の列を捕獲順の records として normalize する。"""
+        records = [(self.TAB, ref, self._fmt(name)) for ref, name in ops]
+        return gr.normalize("fx", "ui", gr.make_offline_writer(), records)
+
+    def _tab(self, out):
+        return out["tabs"][self.TAB]
+
+
+class FinalStateTest(_RecordsMixin, unittest.TestCase):
+    """順序盲の修復（Plan T1）。
+
+    旧口径は highlights を集合へ畳むため「白が高亮を上書きして消した」を表現できない。
+    最終態（final_highlights）と白による消去記録（white_erased）でそれを可視化する。
+    """
+
+    # --- 上書き語義 ---
+
+    def test_white_after_highlight_erases_it(self):
+        out = self._normalize([("B10", "high"), ("B10", "white")])
+        self.assertEqual(self._tab(out)["final_highlights"], [])
+        self.assertEqual(self._tab(out)["white_erased"],
+                         [{"cell": "B10", "was": "high"}])
+
+    def test_highlight_after_white_survives(self):
+        out = self._normalize([("B10", "white"), ("B10", "high")])
+        self.assertEqual(self._tab(out)["final_highlights"],
+                         [{"cell": "B10", "severity": "high"}])
+        self.assertEqual(self._tab(out)["white_erased"], [])
+
+    def test_partial_range_overwrite(self):
+        """行全体を塗った後 1 セルだけ白 → そのセルだけが消える。"""
+        out = self._normalize([("A5:AB5", "high"), ("B5", "white")])
+        cells = [h["cell"] for h in self._tab(out)["final_highlights"]]
+        self.assertEqual(len(cells), 27)          # 28 列 - B5
+        self.assertNotIn("B5", cells)
+        self.assertIn("A5", cells)
+        self.assertIn("AB5", cells)
+        self.assertEqual(self._tab(out)["white_erased"],
+                         [{"cell": "B5", "was": "high"}])
+
+    def test_non_white_overwrite_is_not_erasure(self):
+        """黄(全行下地) → 赤(I列) は正しい優先順位であり消去ではない。"""
+        out = self._normalize([("A6:AB6", "low"), ("I6", "high")])
+        by_cell = {h["cell"]: h["severity"]
+                   for h in self._tab(out)["final_highlights"]}
+        self.assertEqual(by_cell["I6"], "high")
+        self.assertEqual(by_cell["A6"], "low")
+        self.assertEqual(len(by_cell), 28)
+        self.assertEqual(self._tab(out)["white_erased"], [])
+
+    # --- D1 の中核主張：順序が違っても最終態は同じ ---
+
+    def test_different_operation_history_same_final_state_is_equal(self):
+        """UI 風と頁級風で白リセットの範囲が違っても final は一致する。"""
+        ui = self._normalize([("A6:AB6", "white"), ("A6:AB6", "low"),
+                              ("I6", "high")])
+        page = self._normalize([("A6:AB7", "white"), ("A6:AB6", "low"),
+                                ("I6", "high")])
+        # 非空を先に固定する——[] == [] で通ってしまう空転を防ぐ
+        self.assertEqual(len(self._tab(ui)["final_highlights"]), 28)
+        self.assertEqual(self._tab(ui)["final_highlights"],
+                         self._tab(page)["final_highlights"])
+        self.assertEqual(self._tab(ui)["white_erased"], [])
+        self.assertEqual(self._tab(page)["white_erased"], [])
+
+    # --- 範囲パーサ ---
+
+    def test_expand_range_forms(self):
+        self.assertEqual(gr.expand_range("I7"), [(7, 8)])
+        self.assertEqual(gr.expand_range("I7:I7"), [(7, 8)])
+        self.assertEqual(gr.expand_range("AB6"), [(6, 27)])
+        self.assertEqual(len(gr.expand_range("A5:AB6")), 56)   # 28 列 x 2 行
+        self.assertEqual(len(gr.expand_range("B5:B9")), 5)     # 単列 5 行
+
+    def test_cell_a1_column_letters(self):
+        """Z→AA 境界は列文字変換の古典的な off-by-one 罠。"""
+        self.assertEqual(gr.cell_a1(10, 1), "B10")
+        self.assertEqual(gr.cell_a1(7, 25), "Z7")
+        self.assertEqual(gr.cell_a1(7, 26), "AA7")
+        self.assertEqual(gr.cell_a1(6, 27), "AB6")
+
+    def test_range_parser_rejects_malformed_refs(self):
+        """解析不能な ref は fail fast。静默無視は「消えたのに緑」を生む。"""
+        for bad in ("A:AB", "", "AB6:A6", "A6:AB", "??", "A0", "A1:B2:C3"):
+            with self.assertRaises(ValueError, msg=f"{bad!r} を拒否していない"):
+                gr.expand_range(bad)
+
+    # --- 並び順（A1 文字列順だと "A10" < "A6" になる） ---
+
+    def test_final_highlights_sorted_by_row_then_column(self):
+        out = self._normalize([("B10", "high"), ("B6", "low"), ("A6", "medium")])
+        self.assertEqual([h["cell"] for h in self._tab(out)["final_highlights"]],
+                         ["A6", "B6", "B10"])
+
+    def test_every_tab_has_the_new_fields(self):
+        """records が無い tab にもキーが存在する（byte diff を安定させる）。
+
+        capture_formats で包むのは、包まないと本物の format_cell_range が
+        FakeWorksheet を相手に走り、生産の best-effort ハンドラへ落ちて
+        別の分岐を踏んでしまうため。
+        """
+        writer = gr.make_offline_writer()
+        with gr.capture_formats():
+            gr.drive_ui(writer, [_normal_page(1, 1)], DocType.RECEIPT)
+        out = gr.normalize("fx", "ui", writer, [])
+        self.assertTrue(out["tabs"])
+        for tab in out["tabs"].values():
+            self.assertEqual(tab["final_highlights"], [])
+            self.assertEqual(tab["white_erased"], [])
+
+    def test_unknown_color_keeps_its_rgb_in_both_new_fields(self):
+        """_SEVERITY_COLORS に無い色は rgb を落とさない（旧 highlights と同口径）。
+
+        判別力が旧口径より弱くなると、「旧が盲だったから直す」という本改修の
+        前提が新フィールド側で崩れる。
+        """
+        purple = CellFormat(backgroundColor=Color(0.85, 0.8, 1))
+        white = self._fmt("white")
+        rows = [(self.TAB, "B5", purple), (self.TAB, "B5", white)]
+        out = gr.normalize("fx", "ui", gr.make_offline_writer(), rows[:1])
+        self.assertEqual(self._tab(out)["final_highlights"],
+                         [{"cell": "B5", "severity": "unknown",
+                           "rgb": [0.85, 0.8, 1]}])
+        erased = gr.normalize("fx", "ui", gr.make_offline_writer(), rows)
+        self.assertEqual(self._tab(erased)["white_erased"],
+                         [{"cell": "B5", "was": "unknown",
+                           "rgb": [0.85, 0.8, 1]}])
+
+
+class OrderBlindnessProofTest(_RecordsMixin, unittest.TestCase):
+    """T3-a: 否定対照——旧口径が盲であり新口径が盲でないことの実証。
+
+    同一の多重集合・異なる順序の 2 本を流す。生産コードには一切触れずに
+    「盲点そのもの」を証明する（Codex #5）。
+    """
+
+    # 白リセットが高亮の前（正しい）／後（バグ）の 2 本。op の多重集合は同一。
+    CORRECT = [("A6:AB6", "white"), ("I6", "high")]
+    BROKEN = [("I6", "high"), ("A6:AB6", "white")]
+
+    def test_the_two_orders_use_the_same_operations(self):
+        """前提: 差は順序のみ（多重集合は同一）。"""
+        self.assertEqual(sorted(self.CORRECT), sorted(self.BROKEN))
+        self.assertNotEqual(self.CORRECT, self.BROKEN)
+
+    def test_old_fields_are_blind_to_the_reordering(self):
+        """旧口径は集合へ畳むため差分ゼロ＝盲。"""
+        correct, broken = self._normalize(self.CORRECT), self._normalize(self.BROKEN)
+        self.assertEqual(self._tab(correct)["highlights"],
+                         self._tab(broken)["highlights"])
+        self.assertEqual(correct["reset_ranges"], broken["reset_ranges"])
+
+    def test_new_fields_detect_the_reordering(self):
+        """新口径は赤くなる——赤が消えたことを検出する。"""
+        correct, broken = self._normalize(self.CORRECT), self._normalize(self.BROKEN)
+        self.assertEqual(self._tab(correct)["final_highlights"],
+                         [{"cell": "I6", "severity": "high"}])
+        self.assertEqual(self._tab(broken)["final_highlights"], [])
+        self.assertEqual(self._tab(broken)["white_erased"],
+                         [{"cell": "I6", "was": "high"}])
 
 
 if __name__ == "__main__":

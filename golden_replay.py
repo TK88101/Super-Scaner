@@ -158,6 +158,54 @@ def freeze_time(moment=FROZEN_AT):
 _CELL_RE = re.compile(r"^([A-Z]+)(\d+)$")
 
 
+def _col_index(letters):
+    """列文字 → 0 始まりの列番号（A=0, Z=25, AA=26, AB=27）。"""
+    n = 0
+    for ch in letters:
+        n = n * 26 + (ord(ch) - 64)
+    return n - 1
+
+
+def cell_a1(row, col):
+    """(行番号 1 始まり, 列番号 0 始まり) → A1 記法。"""
+    letters = ""
+    n = col + 1
+    while n:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(65 + rem) + letters
+    return f"{letters}{row}"
+
+
+def parse_range(ref):
+    """A1 記法の範囲を (r1, c1, r2, c2) へ。解析不能なら ValueError。
+
+    静默無視は禁止（Codex #8）——ref を読み飛ばすと「高亮が消えたのに緑」という、
+    本改修が潰そうとしている失敗様態そのものを新設してしまう。
+    """
+    parts = (ref or "").split(":")
+    if len(parts) > 2:
+        raise ValueError(f"解析不能な cell ref: {ref!r}")
+    bounds = []
+    for part in parts:
+        m = _CELL_RE.match(part)
+        if not m:
+            raise ValueError(f"解析不能な cell ref: {ref!r}")
+        row = int(m.group(2))
+        if row < 1:
+            raise ValueError(f"行番号は 1 以上: {ref!r}")
+        bounds.append((row, _col_index(m.group(1))))
+    (r1, c1), (r2, c2) = bounds[0], bounds[-1]
+    if r1 > r2 or c1 > c2:
+        raise ValueError(f"逆順の範囲: {ref!r}")
+    return (r1, c1, r2, c2)
+
+
+def expand_range(ref):
+    """範囲を (行, 列) のセル列へ展開する（行優先・昇順）。"""
+    r1, c1, r2, c2 = parse_range(ref)
+    return [(r, c) for r in range(r1, r2 + 1) for c in range(c1, c2 + 1)]
+
+
 def canonical_ref(ref):
     """D4-4：`I7` を `I7:I7` へ寄せ、範囲形はそのまま返す。"""
     m = _CELL_RE.match(ref)
@@ -199,15 +247,25 @@ def capture_formats():
     """
     records = []
     original = sheets_output.format_cell_range
+    original_batch = sheets_output.format_cell_ranges
 
     def _spy(worksheet, cell_ref, fmt, *args, **kwargs):
         records.append((getattr(worksheet, "title", "?"), cell_ref, fmt))
 
+    def _spy_batch(worksheet, ranges, *args, **kwargs):
+        """複数形も捕獲する（現状 `_detect_and_highlight_duplicates` 専用で、
+        その関数は仓内に呼出点が無い＝死コード。将来接続された際に静默で
+        取りこぼさないための防御であり、今は 1 件も流れてこない）。"""
+        for cell_ref, fmt in ranges:
+            records.append((getattr(worksheet, "title", "?"), cell_ref, fmt))
+
     sheets_output.format_cell_range = _spy
+    sheets_output.format_cell_ranges = _spy_batch
     try:
         yield records
     finally:
         sheets_output.format_cell_range = original
+        sheets_output.format_cell_ranges = original_batch
 
 
 # --- wrapper 語義の再現（D2、F10） --------------------------------------
@@ -345,6 +403,11 @@ def _mask_row(row):
     return cells
 
 
+def _empty_block(rows=None):
+    """tab ブロックの雛形。フィールドを増やす際の唯一の変更点にする。"""
+    return {"rows": rows if rows is not None else [], "highlights": []}
+
+
 def normalize(source, path, writer, records):
     """D4 の正規化 JSON を組む（浮動要素は一切入れない）。"""
     by_tab = {}
@@ -354,9 +417,18 @@ def normalize(source, path, writer, records):
     warnings.extend(getattr(writer, "_replay_warnings", []))
 
     for tab, ws in sorted(writer._fake_tabs.items()):
-        by_tab[tab] = {"rows": [_mask_row(r) for r in ws.appended_rows],
-                       "highlights": []}
+        by_tab[tab] = _empty_block([_mask_row(r) for r in ws.appended_rows])
         warnings.extend(ws.warnings)
+
+    # 最終態（D1）: 捕獲順に再生し「後勝ち」を再現する。旧口径は集合へ畳むため
+    # 「白が高亮を上書きして消した」を表現できない（順序盲）。
+    #
+    # 限界（Plan D5）: FakeWorksheet は append の書式継承を建模しないため、ここで
+    # 得られるのは「**明示 format op のみ**を適用した最終非白態」であって真の
+    # Sheets 背景色ではない。白リセット自体が削除／失敗して継承色が残るケースは
+    # 明示 op を伴わないので現れない——それは真 Sheets readback でしか捕まらない。
+    final = {}      # tab -> {(row, col): (severity, rgb)}
+    erased = {}     # tab -> [((row, col), 消された severity)]
 
     for tab, cell_ref, fmt in records:
         severity, rgb = severity_of(fmt)
@@ -365,8 +437,23 @@ def normalize(source, path, writer, records):
         ref = canonical_ref(cell_ref)
         if severity == "white":
             reset_ranges.append(ref)
+            # 白は「消す操作」。範囲を展開せず final の既存キーだけを走査する
+            # （A7:AB1000 は 27,832 セル。非白側は生産の全出口が「今 append した
+            # 行塊」に界されるため展開して安全——実測で最大 1 セル。D2）。
+            # `get` であって `setdefault` でないのは、全 record が白の tab に
+            # 空エントリを作らないため（存在しない tab が出力に現れるのを防ぐ）。
+            r1, c1, r2, c2 = parse_range(cell_ref)
+            tab_final = final.get(tab, {})
+            hit = [k for k in tab_final
+                   if r1 <= k[0] <= r2 and c1 <= k[1] <= c2]
+            if hit:
+                # pop で走査中の dict を変異させないよう、先に snapshot を取る
+                erased.setdefault(tab, []).extend(
+                    (k, tab_final.pop(k)) for k in hit)
             continue
-        by_tab.setdefault(tab, {"rows": [], "highlights": []})
+        by_tab.setdefault(tab, _empty_block())
+        for key in expand_range(cell_ref):
+            final.setdefault(tab, {})[key] = (severity, rgb)
         seen.setdefault(tab, set()).add((ref, severity, rgb))
 
     for tab, entries in seen.items():
@@ -374,6 +461,19 @@ def normalize(source, path, writer, records):
             ({"cell": c, "severity": s} if s != "unknown"
              else {"cell": c, "severity": s, "rgb": list(g)})
             for c, s, g in sorted(entries)]
+
+    # 並びは (行, 列) の数値順。A1 文字列順だと "A10" < "A6" になる。
+    # final / erased の tab は必ず by_tab にも居る（非白 record が先行するため）
+    # ので by_tab を回すだけで足りる。
+    for tab, block in by_tab.items():
+        block["final_highlights"] = [
+            ({"cell": cell_a1(r, c), "severity": sev} if sev != "unknown"
+             else {"cell": cell_a1(r, c), "severity": sev, "rgb": list(g)})
+            for (r, c), (sev, g) in sorted(final.get(tab, {}).items())]
+        block["white_erased"] = [
+            ({"cell": cell_a1(r, c), "was": was} if was != "unknown"
+             else {"cell": cell_a1(r, c), "was": was, "rgb": list(g)})
+            for (r, c), (was, g) in sorted(erased.get(tab, []))]
 
     return {
         "source": source,
