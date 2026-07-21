@@ -95,7 +95,8 @@
 
 正規化規則（裁決#2・#4・#8）：
 1. **時刻の凍結**：replay 実行中 `sheets_output.datetime` を固定時刻（合成定数 `2026/01/01 00:00 JST`）へ patch する。加えて保険として、normalize 時に「作成日時／最終更新日時」列を `<FROZEN>` へ置換する（二重防御）。
-2. **高亮の捕獲層＝format 出口の統一**（裁決#4、複審成立）：モジュール級 `format_cell_range` と `SheetsOutputWriter._format_with_retry` の**両方**を patch し `(cell_ref, backgroundColor)` を記録。F8 の 4 出口すべてがここを通る。`_apply_anomaly_highlight` の語義層は patch **しない**（(a)(b)(d) を取りこぼすため）。
+2. **高亮の捕獲層＝format 出口の統一**（裁決#4、複審成立）：モジュール級 `format_cell_range` **のみ**を patch し `(cell_ref, backgroundColor)` を記録。`_apply_anomaly_highlight` の語義層は patch **しない**（(a)(b)(d) を取りこぼすため）。
+   > **実施中の訂正（Phase 2、笔误直改）**：草案は `_format_with_retry` も併せて patch すると書いていたが、`_format_with_retry` は内部で同じモジュール級 `format_cell_range` を呼ぶ（`sheets_output.py:718`）。両方を patch すると二重記録または記録漏れになる。**モジュール級 1 箇所の patch で F8 の 4 出口＋頁級経路すべてを捕獲できる**。判定基準への影響なし。
 3. **severity の復元**：記録した色を `_severity_color` の逆写像で severity 名へ戻す。両経路が同一の色テーブル（`_SEVERITY_COLORS`）を使うため、色定義が変わっても両側同時に変わり diff は成立し続ける。白（1,1,1）は severity ではなく **`reset_ranges`** へ分離（意味的高亮ではない）。
 4. **cell ref の canonicalize**：`I7` と `I7:I7` を同一表現へ正規化（単セルは `X{n}:X{n}` 形へ寄せる）。
 5. **順序**：`rows` は append 順（意味あり、順序比較）。`highlights` は**集合比較**（塗り順は仕様上の重ね順であり、両経路で順序が違っても最終色は同じ）。ただし差分が出た場合は順序も報告に載せる。
