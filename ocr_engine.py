@@ -104,6 +104,21 @@ _GEMINI_RETRY_EXCEPTIONS = (
 _GEMINI_RETRY_DELAYS = [1, 4, 10, 30]
 
 
+def _classify_page_error(exc: BaseException) -> str:
+    """頁エラー三分類（B4 Plan §2.1、白名単制）。`_page_error` 例外分岐専用。
+
+    isinstance 語義（**子類含む**、type() 精確比較ではない）で
+    `_GEMINI_RETRY_EXCEPTIONS` に該当すれば "RETRYABLE"（暫時故障、3秒自癒窗）。
+    それ以外の一切（SDK/認証/プログラム欠陥等）は "UNKNOWN"（檔級 FAILED＋
+    per-epoch memo、控制面重投でのみ再試行）——認証エラー等を誤って
+    "CONTENT"/DEAD_LETTER に倒すと「全夾 DEAD_LETTER 風暴」を招くため、
+    ここでは判定しない（CONTENT は JSON 解析失敗の専用分岐でのみ立つ）。
+    """
+    if isinstance(exc, _GEMINI_RETRY_EXCEPTIONS):
+        return "RETRYABLE"
+    return "UNKNOWN"
+
+
 def _generate_content_with_retry(contents):
     last_err = None
     for attempt, delay in enumerate([0] + _GEMINI_RETRY_DELAYS):
@@ -1811,6 +1826,9 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                                 "entries": [],
                                 "_unrecognized": True,
                                 "_page_error": True,
+                                # B4 Plan §2.1 三分類: 例外は isinstance 判定
+                                # （子類含む）で RETRYABLE/UNKNOWN のいずれか
+                                "_error_class": _classify_page_error(page_err),
                             },
                             "page_num": idx,
                             "total_pages": total,
@@ -1834,6 +1852,9 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                                 "entries": [],
                                 "_unrecognized": True,
                                 "_page_error": True,
+                                # B4 Plan §2.1: 例外を伴わない JSON 解析失敗は
+                                # 常に CONTENT（票面不可読、白名単制・専用分岐）
+                                "_error_class": "CONTENT",
                             },
                             "page_num": idx,
                             "total_pages": total,

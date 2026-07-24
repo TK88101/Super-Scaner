@@ -220,6 +220,27 @@ class PostingLedger:
             return PageDecision.WRITE
         return PageDecision.ESCALATE
 
+    # --- 只読 accessor（B4 Plan §2.2/T2、三謂詞シグネチャは不変） -----------------
+    def confirmed_ticket_count(self, page_id: str) -> int | None:
+        """該頁の CONFIRMED 記録の ticket_count を読む（単発読、副作用ゼロ）。
+
+        無 CONFIRMED 記録（doc 不存在／status != CONFIRMED）／ticket_count が
+        int でない（旧 schema・破損防御）→ None。存在すれば記録済み値
+        （0 も正常値＝占位頁）をそのまま返す。check_page が SKIP を返した後、
+        呼び出し側（main、T3）がこの値の >0/==0 で「真に入賬済み」か「占位頁」
+        かを自証する（§2.2 ticket_count 語義釘死）。
+        """
+        snap = self._posting_doc(page_id).get()
+        if not snap.exists:
+            return None
+        data = snap.to_dict() or {}
+        if data.get("status") != STATUS_CONFIRMED:
+            return None
+        ticket_count = data.get("ticket_count")
+        if not isinstance(ticket_count, int):
+            return None
+        return ticket_count
+
     # --- 記帳（三步） ---------------------------------------------------------
     def post_page(
         self,

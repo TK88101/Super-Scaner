@@ -37,8 +37,10 @@ from intake_guard import (
     POSTING_ID_PROPERTY_KEY,
     IntakeCheck,
     IntakeDecision,
+    IntakeGateResult,
     check_intake,
     handle_intake,
+    handle_intake_gate,
     resolve_posting_id,
 )
 
@@ -147,6 +149,141 @@ class CheckIntakeTest(unittest.TestCase):
         self.assertEqual(IntakeDecision.DEFERRED, result.decision)
         self.assertEqual("firestore_error:ConnectionError", result.reason)
         self.assertEqual("base-4", result.base)
+
+
+class IntakeCheckLeaseEpochJobStateTest(unittest.TestCase):
+    """B4 Plan §2.5/T2: IntakeCheck 尾部の lease_epoch/job_state 透出。
+
+    守衛五分岐判定そのものは零改動——job が取得できた分岐（PROCESS/
+    posting_id_mismatch）でのみ job.get("lease_epoch")/job.get("current_state")
+    をそのまま転記し、job が取得できない分岐（no_posting_id/job_not_found/
+    DEFERRED）では None のまま。
+    """
+
+    def test_process_carries_lease_epoch_and_job_state_from_job(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-1"}}
+        store = FakeJobStore({"base-1": {
+            "posting_id": "base-1", "lease_epoch": 3,
+            "current_state": "POSTING_IN_PROGRESS"}})
+
+        result = check_intake(file, store.get_job)
+
+        self.assertEqual(IntakeDecision.PROCESS, result.decision)
+        self.assertEqual(3, result.lease_epoch)
+        self.assertEqual("POSTING_IN_PROGRESS", result.job_state)
+
+    def test_posting_id_mismatch_still_carries_observed_job_fields(self):
+        # job は取得できている（ただし posting_id が不一致で REJECTED）ので
+        # lease_epoch/job_state は裁決線索として転記してよい
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-3"}}
+        store = FakeJobStore({"base-3": {
+            "posting_id": "different-base", "lease_epoch": 5,
+            "current_state": "POSTED"}})
+
+        result = check_intake(file, store.get_job)
+
+        self.assertEqual(IntakeDecision.REJECTED, result.decision)
+        self.assertEqual("posting_id_mismatch", result.reason)
+        self.assertEqual(5, result.lease_epoch)
+        self.assertEqual("POSTED", result.job_state)
+
+    def test_missing_keys_in_job_default_to_none(self):
+        # 旧 schema の job（lease_epoch/current_state 未設定）→ None（釘死しない）
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-1"}}
+        store = FakeJobStore({"base-1": {"posting_id": "base-1"}})
+
+        result = check_intake(file, store.get_job)
+
+        self.assertIsNone(result.lease_epoch)
+        self.assertIsNone(result.job_state)
+
+    def test_job_not_found_leaves_fields_none(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-2"}}
+        store = FakeJobStore({})
+
+        result = check_intake(file, store.get_job)
+
+        self.assertEqual(IntakeDecision.REJECTED, result.decision)
+        self.assertIsNone(result.lease_epoch)
+        self.assertIsNone(result.job_state)
+
+    def test_no_posting_id_leaves_fields_none(self):
+        file = {"id": "f1"}
+        store = FakeJobStore({})
+
+        result = check_intake(file, store.get_job)
+
+        self.assertIsNone(result.lease_epoch)
+        self.assertIsNone(result.job_state)
+
+    def test_deferred_leaves_fields_none(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-4"}}
+        store = FakeJobStore(raise_exc=ConnectionError("boom"))
+
+        result = check_intake(file, store.get_job)
+
+        self.assertIsNone(result.lease_epoch)
+        self.assertIsNone(result.job_state)
+
+
+class IntakeGateResultLeaseEpochJobStateTest(unittest.TestCase):
+    """handle_intake_gate も check_intake の lease_epoch/job_state を
+    IntakeGateResult へ橋渡しする（#14 base 橋渡しと同型）。"""
+
+    def test_process_gate_result_carries_lease_epoch_and_job_state(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-1"}}
+        store = FakeJobStore({"base-1": {
+            "posting_id": "base-1", "lease_epoch": 7,
+            "current_state": "POSTING_IN_PROGRESS"}})
+        write_alert_calls = []
+
+        result = handle_intake_gate(
+            file, get_job=store.get_job,
+            write_alert=lambda *a: write_alert_calls.append(a),
+            move_to_quarantine=lambda: None)
+
+        self.assertTrue(result.should_process)
+        self.assertEqual("base-1", result.base)
+        self.assertEqual(7, result.lease_epoch)
+        self.assertEqual("POSTING_IN_PROGRESS", result.job_state)
+        self.assertEqual([], write_alert_calls)  # PROCESS は alert 送達なし
+
+    def test_rejected_gate_result_carries_observed_job_fields(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-3"}}
+        store = FakeJobStore({"base-3": {
+            "posting_id": "different-base", "lease_epoch": 5,
+            "current_state": "POSTED"}})
+
+        result = handle_intake_gate(
+            file, get_job=store.get_job,
+            write_alert=lambda *a: None, move_to_quarantine=lambda: None)
+
+        self.assertFalse(result.should_process)
+        self.assertEqual(5, result.lease_epoch)
+        self.assertEqual("POSTED", result.job_state)
+
+    def test_deferred_gate_result_fields_none(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-4"}}
+        store = FakeJobStore(raise_exc=ConnectionError("boom"))
+
+        result = handle_intake_gate(
+            file, get_job=store.get_job,
+            write_alert=lambda *a: None, move_to_quarantine=lambda: None)
+
+        self.assertIsNone(result.lease_epoch)
+        self.assertIsNone(result.job_state)
+
+    def test_memo_hit_gate_result_fields_none(self):
+        # メモ命中経路は check_intake を一切呼ばない→lease_epoch/job_state も None
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-1"}}
+        alerted = {"f1": "no_posting_id"}
+
+        result = handle_intake_gate(
+            file, get_job=lambda b: None, write_alert=lambda *a: None,
+            move_to_quarantine=lambda: None, alerted=alerted)
+
+        self.assertIsNone(result.lease_epoch)
+        self.assertIsNone(result.job_state)
 
 
 class HandleIntakeTest(unittest.TestCase):

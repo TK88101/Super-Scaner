@@ -60,11 +60,17 @@ class IntakeCheck:
     でも base が取れていれば alert payload に含める（裁決線索、白名単内）。
     reason：PROCESS 時は None、それ以外は技術字段の理由文字列
     （no_posting_id / job_not_found / posting_id_mismatch / firestore_error:<型名>）。
+    lease_epoch/job_state：B4 Plan §2.5。job が取得できた分岐（PROCESS/
+    posting_id_mismatch）のみ job.get("lease_epoch")/job.get("current_state")
+    をそのまま転記、それ以外（job 未取得）は None のまま。main（T4）の
+    intake 状態白名単判定・report_posted の lease_epoch 引数に使う。
     """
 
     decision: IntakeDecision
     base: str | None
     reason: str | None
+    lease_epoch: int | None = None
+    job_state: str | None = None
 
 
 def check_intake(
@@ -97,10 +103,16 @@ def check_intake(
     if job is None:
         return IntakeCheck(IntakeDecision.REJECTED, base, "job_not_found")
 
-    if job.get("posting_id") != base:
-        return IntakeCheck(IntakeDecision.REJECTED, base, "posting_id_mismatch")
+    # job は取得済み——以降の分岐は lease_epoch/job_state を裁決線索として転記する
+    lease_epoch = job.get("lease_epoch")
+    job_state = job.get("current_state")
 
-    return IntakeCheck(IntakeDecision.PROCESS, base, None)
+    if job.get("posting_id") != base:
+        return IntakeCheck(IntakeDecision.REJECTED, base, "posting_id_mismatch",
+                           lease_epoch=lease_epoch, job_state=job_state)
+
+    return IntakeCheck(IntakeDecision.PROCESS, base, None,
+                       lease_epoch=lease_epoch, job_state=job_state)
 
 
 @dataclass(frozen=True)
@@ -111,12 +123,16 @@ class IntakeGateResult:
     base：PROCESS 時の base posting_id（IP-304 の頁級台賬 job_key）。PROCESS 以外は
     参考値（隔離済み/保留のため process_file へは渡らない）。
     decision/reason：check_intake の裁決（memo 命中は REJECTED 扱い、base=None）。
+    lease_epoch/job_state：check_intake からの橋渡し（B4 Plan §2.5、#14 base 橋渡しと
+    同型）。メモ命中経路は check_intake を呼ばないため常に None。
     """
 
     should_process: bool
     base: str | None
     decision: IntakeDecision
     reason: str | None
+    lease_epoch: int | None = None
+    job_state: str | None = None
 
 
 def _finish_quarantine_move(
@@ -228,11 +244,13 @@ def handle_intake_gate(
     check = check_intake(file, get_job)
 
     if check.decision is IntakeDecision.PROCESS:
-        return IntakeGateResult(True, check.base, IntakeDecision.PROCESS, None)
+        return IntakeGateResult(True, check.base, IntakeDecision.PROCESS, None,
+                                lease_epoch=check.lease_epoch, job_state=check.job_state)
 
     if check.decision is IntakeDecision.DEFERRED:
         print(f"入口守衛: 判定保留 file_id={file_id} reason={check.reason}")
-        return IntakeGateResult(False, check.base, IntakeDecision.DEFERRED, check.reason)
+        return IntakeGateResult(False, check.base, IntakeDecision.DEFERRED, check.reason,
+                                lease_epoch=check.lease_epoch, job_state=check.job_state)
 
     # REJECTED
     payload: dict[str, Any] = {
@@ -247,10 +265,12 @@ def handle_intake_gate(
         write_alert(file_id, payload)
     except Exception as exc:  # noqa: BLE001 - 旁路失敗を隔離、呼び出し方針は下輪再試行
         print(f"入口守衛: alert 書込失敗 file_id={file_id} error_type={type(exc).__name__}")
-        return IntakeGateResult(False, check.base, IntakeDecision.REJECTED, check.reason)
+        return IntakeGateResult(False, check.base, IntakeDecision.REJECTED, check.reason,
+                                lease_epoch=check.lease_epoch, job_state=check.job_state)
 
     if alerted is not None:
         alerted[file_id] = check.reason
 
     _finish_quarantine_move(move_to_quarantine, file_id, check.reason, alerted)
-    return IntakeGateResult(False, check.base, IntakeDecision.REJECTED, check.reason)
+    return IntakeGateResult(False, check.base, IntakeDecision.REJECTED, check.reason,
+                            lease_epoch=check.lease_epoch, job_state=check.job_state)

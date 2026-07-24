@@ -226,5 +226,59 @@ class PostPageTest(unittest.TestCase):
         self.assertEqual(fs.store[POSTING_PATH]["status"], pl.STATUS_CONFIRMED)
 
 
+class ConfirmedTicketCountTest(unittest.TestCase):
+    """B4 Plan §2.2/T2: 只読 accessor `confirmed_ticket_count`（三態、三謂詞簽名は不変）。
+
+    >0＝真に入賬済み頁、==0＝占位頁（占位行のみ、票なし）、None＝CONFIRMED 記録
+    が無い（doc 不存在／status != CONFIRMED）。main（T3）が check_page の SKIP
+    後にこの値で頁の身分を自証する。
+    """
+
+    def _probe_const(self, result):
+        return lambda tab, rng, fp: result
+
+    def test_returns_ticket_count_when_confirmed_with_tickets(self) -> None:
+        fs = _FakeFirestore()
+        fs.store[POSTING_PATH] = _pending_doc(status=pl.STATUS_CONFIRMED, ticket_count=2)
+        ledger = _make_ledger(fs, self._probe_const(ProbeResult.ABSENT))
+        self.assertEqual(ledger.confirmed_ticket_count(PAGE_ID), 2)
+
+    def test_returns_zero_when_confirmed_placeholder_page(self) -> None:
+        fs = _FakeFirestore()
+        fs.store[POSTING_PATH] = _pending_doc(status=pl.STATUS_CONFIRMED, ticket_count=0)
+        ledger = _make_ledger(fs, self._probe_const(ProbeResult.ABSENT))
+        self.assertEqual(ledger.confirmed_ticket_count(PAGE_ID), 0)
+
+    def test_returns_none_when_no_record(self) -> None:
+        fs = _FakeFirestore()
+        ledger = _make_ledger(fs, self._probe_const(ProbeResult.ABSENT))
+        self.assertIsNone(ledger.confirmed_ticket_count(PAGE_ID))
+
+    def test_returns_none_when_pending_not_confirmed(self) -> None:
+        fs = _FakeFirestore()
+        fs.store[POSTING_PATH] = _pending_doc(status=pl.STATUS_PENDING)
+        ledger = _make_ledger(fs, self._probe_const(ProbeResult.ABSENT))
+        self.assertIsNone(ledger.confirmed_ticket_count(PAGE_ID))
+
+    def test_returns_none_when_ticket_count_field_missing_or_malformed(self) -> None:
+        # 旧 schema／破損データ防御: ticket_count が int でなければ None（釘死しない）
+        fs = _FakeFirestore()
+        doc = _pending_doc(status=pl.STATUS_CONFIRMED)
+        del doc["ticket_count"]
+        fs.store[POSTING_PATH] = doc
+        ledger = _make_ledger(fs, self._probe_const(ProbeResult.ABSENT))
+        self.assertIsNone(ledger.confirmed_ticket_count(PAGE_ID))
+
+    def test_does_not_mutate_state_pure_read(self) -> None:
+        # 三謂詞（derive_page_id/check_page/post_page）とは独立した単発読取り
+        # ——呼出しても check_page の判定に副作用を与えない
+        fs = _FakeFirestore()
+        fs.store[POSTING_PATH] = _pending_doc(status=pl.STATUS_CONFIRMED, ticket_count=3)
+        ledger = _make_ledger(fs, self._probe_const(ProbeResult.ABSENT))
+        ledger.confirmed_ticket_count(PAGE_ID)
+        self.assertIs(ledger.check_page(PAGE_ID), PageDecision.SKIP)
+        self.assertEqual(fs.store[POSTING_PATH]["status"], pl.STATUS_CONFIRMED)
+
+
 if __name__ == "__main__":
     unittest.main()
