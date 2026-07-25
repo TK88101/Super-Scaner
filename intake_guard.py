@@ -243,14 +243,19 @@ def handle_intake_gate(
 
     check = check_intake(file, get_job)
 
-    if check.decision is IntakeDecision.PROCESS:
-        return IntakeGateResult(True, check.base, IntakeDecision.PROCESS, None,
+    def gate_result(should_process: bool, decision: IntakeDecision,
+                    reason: str | None) -> IntakeGateResult:
+        """check（本関数クロージャ捕捉）から base/lease_epoch/job_state を転記する
+        （simcodex Round 2 #3、4 返回点の尾引数重複を解消）。"""
+        return IntakeGateResult(should_process, check.base, decision, reason,
                                 lease_epoch=check.lease_epoch, job_state=check.job_state)
+
+    if check.decision is IntakeDecision.PROCESS:
+        return gate_result(True, IntakeDecision.PROCESS, None)
 
     if check.decision is IntakeDecision.DEFERRED:
         print(f"入口守衛: 判定保留 file_id={file_id} reason={check.reason}")
-        return IntakeGateResult(False, check.base, IntakeDecision.DEFERRED, check.reason,
-                                lease_epoch=check.lease_epoch, job_state=check.job_state)
+        return gate_result(False, IntakeDecision.DEFERRED, check.reason)
 
     # REJECTED
     payload: dict[str, Any] = {
@@ -265,12 +270,10 @@ def handle_intake_gate(
         write_alert(file_id, payload)
     except Exception as exc:  # noqa: BLE001 - 旁路失敗を隔離、呼び出し方針は下輪再試行
         print(f"入口守衛: alert 書込失敗 file_id={file_id} error_type={type(exc).__name__}")
-        return IntakeGateResult(False, check.base, IntakeDecision.REJECTED, check.reason,
-                                lease_epoch=check.lease_epoch, job_state=check.job_state)
+        return gate_result(False, IntakeDecision.REJECTED, check.reason)
 
     if alerted is not None:
         alerted[file_id] = check.reason
 
     _finish_quarantine_move(move_to_quarantine, file_id, check.reason, alerted)
-    return IntakeGateResult(False, check.base, IntakeDecision.REJECTED, check.reason,
-                            lease_epoch=check.lease_epoch, job_state=check.job_state)
+    return gate_result(False, IntakeDecision.REJECTED, check.reason)

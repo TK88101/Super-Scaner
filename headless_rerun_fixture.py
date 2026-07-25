@@ -32,8 +32,48 @@ DEFAULT_BASE = "cust:hash"
 DEFAULT_UPLOADER = "田中"
 _TAB = f"{DEFAULT_UPLOADER}_領収書"
 
-__all__ = ["FakeFirestore", "FakeWriter", "HeadlessRerunFixture",
+__all__ = ["FakeFirestore", "FakeReporter", "FakeWriter", "HeadlessRerunFixture",
            "make_ledger", "run_headless", "page", "pages"]
+
+
+class FakeReporter:
+    """firestore_report.FirestoreReporter のダブル（B4 T4/T5 共用、真庫不接）。
+
+    呼出し記録（report_posted_calls/report_dead_letter_calls/write_alert_calls）
+    に加え、stale-epoch REJECTED を模せる：jobs[job_id]["lease_epoch"] が
+    report_posted/report_dead_letter へ渡された lease_epoch と食い違えば
+    "REJECTED:stale_lease_epoch" を返す（IP-305 DoD②）。job が無い／
+    job に lease_epoch キーが無ければ食い違いチェックをスキップし常に
+    "APPLIED"（simcodex Round 1 #2、test_headless_loop_wiring.py と
+    test_ip305_resume.py の重複 _FakeReporter を統合）。
+    """
+
+    def __init__(self, jobs=None):
+        self.client = object()
+        self._jobs = jobs or {}
+        self.report_posted_calls = []
+        self.report_dead_letter_calls = []
+        self.write_alert_calls = []
+
+    def get_job(self, base):
+        return self._jobs.get(base)
+
+    def write_alert(self, alert_id, payload):
+        self.write_alert_calls.append((alert_id, payload))
+
+    def _check_epoch(self, job_id, lease_epoch):
+        current = self._jobs.get(job_id, {}).get("lease_epoch")
+        if current is not None and current != lease_epoch:
+            return "REJECTED:stale_lease_epoch"
+        return "APPLIED"
+
+    def report_posted(self, job_id, *, lease_epoch):
+        self.report_posted_calls.append((job_id, lease_epoch))
+        return self._check_epoch(job_id, lease_epoch)
+
+    def report_dead_letter(self, job_id, *, lease_epoch, error):
+        self.report_dead_letter_calls.append((job_id, lease_epoch, error))
+        return self._check_epoch(job_id, lease_epoch)
 
 
 class FakeWriter:

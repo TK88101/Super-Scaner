@@ -19,34 +19,9 @@ from __future__ import annotations
 import unittest
 
 import main
-from headless_rerun_fixture import HeadlessRerunFixture, error_page, page, pages
-
-
-class _FakeReporter:
-    """firestore_report.FirestoreReporter のダブル（stale epoch を模せる）。"""
-
-    def __init__(self, jobs=None):
-        self.client = object()
-        self._jobs = jobs or {}
-        self.report_posted_calls = []
-        self.report_dead_letter_calls = []
-
-    def get_job(self, base):
-        return self._jobs.get(base)
-
-    def write_alert(self, alert_id, payload):
-        pass
-
-    def report_posted(self, job_id, *, lease_epoch):
-        self.report_posted_calls.append((job_id, lease_epoch))
-        current = self._jobs.get(job_id, {}).get("lease_epoch")
-        if current is not None and current != lease_epoch:
-            return "REJECTED:stale_lease_epoch"
-        return "APPLIED"
-
-    def report_dead_letter(self, job_id, *, lease_epoch, error):
-        self.report_dead_letter_calls.append((job_id, lease_epoch, error))
-        return "APPLIED"
+from headless_rerun_fixture import (
+    FakeReporter, HeadlessRerunFixture, error_page, page, pages,
+)
 
 
 class FivePageCrashResumeTest(unittest.TestCase):
@@ -80,7 +55,7 @@ class StaleEpochRejectedTest(unittest.TestCase):
         base = "cust:hash"
         # 控制面が epoch を 1→2 へ進めた後（reconciliation 等）、SS がまだ古い
         # epoch=1 で report_posted を呼ぶ状況を模す。
-        reporter = _FakeReporter({base: {"lease_epoch": 2}})
+        reporter = FakeReporter({base: {"lease_epoch": 2}})
         fx = HeadlessRerunFixture(base=base, reporter=reporter)
 
         out1 = fx.run(pages(3), lease_epoch=1, cycle=1)
@@ -103,7 +78,7 @@ class StaleEpochRejectedTest(unittest.TestCase):
         # _report_headless_outcome は REJECTED でも例外を出さず、呼出し回数は
         # 恰一回（契約：SS は不重試）。
         base = "cust:hash"
-        reporter = _FakeReporter({base: {"lease_epoch": 99}})
+        reporter = FakeReporter({base: {"lease_epoch": 99}})
         fx = HeadlessRerunFixture(base=base, reporter=reporter)
         fx.run(pages(1), lease_epoch=1, cycle=1)
         self.assertEqual(len(reporter.report_posted_calls), 1)
@@ -116,7 +91,7 @@ class RetryableSelfHealTest(unittest.TestCase):
 
     def test_retryable_page_then_success_on_rerun_posts_without_rewriting_success_pages(self):
         base = "cust:hash"
-        reporter = _FakeReporter({base: {"lease_epoch": 1}})
+        reporter = FakeReporter({base: {"lease_epoch": 1}})
         fx = HeadlessRerunFixture(base=base, reporter=reporter)
 
         pages1 = [page(1, 3, "店1", 1000), page(2, 3, "店2", 2000),

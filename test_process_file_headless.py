@@ -17,7 +17,8 @@ from unittest.mock import patch
 import main
 from doc_types import DocType
 from posting_ledger import PostingLedger, derive_page_id
-from sheets_output import SheetsOutputWriter, TAG_COL_INDEX
+from sheets_output import TAG_COL_INDEX
+from test_sheets_output import _make_writer as _make_sheets_output_writer
 # 夾具（T4/T5、B4 復用）から fake 部品を import——二重定義を避け単一ソース化。
 from headless_rerun_fixture import (
     FakeFirestore, FakeWriter, _FakeResolver, error_page, make_ledger,
@@ -34,11 +35,9 @@ def _make_ledger(fs, writer):
 
 
 def _valid_result(vendor, amount, extra=None):
-    result = {"entries": [{"amount": amount, "debit_account": "備品・消耗品費"}],
-              "vendor": vendor, "date": "2026/06/01"}
-    if extra:
-        result.update(extra)
-    return result
+    """entries 非空の bare result dict。headless_rerun_fixture.page() の
+    result をそのまま借りる（simcodex Round 2 #4、重複実装を排除）。"""
+    return _page(1, 1, vendor, amount, extra)["result"]
 
 
 def _zero_entry_result(**extra):
@@ -48,6 +47,8 @@ def _zero_entry_result(**extra):
 
 
 def _yield(result, page_num, total):
+    """bare result dict を pipeline yield 形へ包む——zero-entry 等、page()
+    （entries 非空専用）では作れない形状向けの汎用ラッパ。"""
     return {"result": result, "page_num": page_num, "total_pages": total,
             "page_bytes": b"x"}
 
@@ -202,10 +203,11 @@ class IntakeGateBaseWiringTest(unittest.TestCase):
                 pass
 
         with patch.object(main.config, "headless_mode", return_value=True):
-            should, base, epoch = main._headless_intake_gate(
+            should, base, epoch, state_rejected = main._headless_intake_gate(
                 service=None, file=file, input_folder_id="in", reporter=_Rep())
         self.assertTrue(should)
         self.assertEqual(base, "cust:hash")
+        self.assertFalse(state_rejected)
         self.assertEqual(epoch, 1)
 
 
@@ -399,7 +401,7 @@ class PriorityTableDrivenTest(unittest.TestCase):
     def test_escalate_wins_over_retryable(self):
         # p1=RETRYABLE（零書込・記録）、p2=混型頁（有効+零entry並存）→ ESCALATE 最高優先
         pages = [error_page(1, 2, error_class="RETRYABLE"),
-                 _yield(_valid_result("店A", 1000), 2, 2),
+                 _page(2, 2, "店A", 1000),
                  _yield(_zero_entry_result(), 2, 2)]
         out = self._run_mixed(pages)
         self.assertIs(out.outcome, main.ProcessOutcome.ESCALATED)
@@ -407,9 +409,9 @@ class PriorityTableDrivenTest(unittest.TestCase):
     def test_escalate_detected_mid_loop_at_page_boundary(self):
         # 混型頁が「最終頁ではない」場合、頁境界の flush（ループ内 flush、末尾
         # flush ではない）で ESCALATE が検出される分岐を踏む。
-        pages = [_yield(_valid_result("店A", 1000), 1, 2),
+        pages = [_page(1, 2, "店A", 1000),
                  _yield(_zero_entry_result(), 1, 2),
-                 _yield(_valid_result("店B", 2000), 2, 2)]
+                 _page(2, 2, "店B", 2000)]
         out = self._run_mixed(pages)
         self.assertIs(out.outcome, main.ProcessOutcome.ESCALATED)
 
@@ -455,9 +457,9 @@ class MultiTicketPagePlusFailedPageCountTest(unittest.TestCase):
         ledger = _make_ledger(fs, writer)
         # p1: 3 票（同一頁に3 yield）、p2: 1 敗頁（CONTENT）
         pages = [
-            _yield(_valid_result("店A", 1000), 1, 2),
-            _yield(_valid_result("店B", 2000), 1, 2),
-            _yield(_valid_result("店C", 3000), 1, 2),
+            _page(1, 2, "店A", 1000),
+            _page(1, 2, "店B", 2000),
+            _page(1, 2, "店C", 3000),
             error_page(2, 2, error_class="CONTENT"),
         ]
         out = _run(writer, ledger, pages)
@@ -509,6 +511,36 @@ class PriorPageKindNoneFallbackTest(unittest.TestCase):
 
         self.assertEqual(
             main._prior_page_kind(_Ledger(), "any:p1"), "PLACEHOLDER_PRIOR")
+
+
+class HeadlessOutcomeInvariantTest(unittest.TestCase):
+    """simcodex Round 1 #10: HeadlessOutcome.__post_init__ 不変式検証。
+
+    retryable=True は outcome==FAILED でのみ、dead_letter_payload は
+    outcome==DEAD_LETTER でのみ許可——誤組合せは構築時に fail fast。
+    """
+
+    def test_retryable_true_with_non_failed_outcome_raises(self):
+        with self.assertRaises(ValueError):
+            main.HeadlessOutcome(main.ProcessOutcome.SUCCESS, retryable=True)
+
+    def test_dead_letter_payload_with_non_dead_letter_outcome_raises(self):
+        with self.assertRaises(ValueError):
+            main.HeadlessOutcome(
+                main.ProcessOutcome.PARTIAL,
+                dead_letter_payload={"stage": "ocr", "error_class": "NON_RETRYABLE",
+                                     "message": "x"})
+
+    def test_valid_combinations_do_not_raise(self):
+        main.HeadlessOutcome(main.ProcessOutcome.FAILED, retryable=True)
+        main.HeadlessOutcome(main.ProcessOutcome.FAILED, retryable=False)
+        main.HeadlessOutcome(
+            main.ProcessOutcome.DEAD_LETTER,
+            dead_letter_payload={"stage": "ocr", "error_class": "NON_RETRYABLE",
+                                 "message": "x"})
+        main.HeadlessOutcome(main.ProcessOutcome.SUCCESS)
+        main.HeadlessOutcome(main.ProcessOutcome.PARTIAL)
+        main.HeadlessOutcome(main.ProcessOutcome.ESCALATED)
 
 
 class ExtractTicketsOnlyValidTest(unittest.TestCase):
@@ -611,7 +643,7 @@ class MixedPageEscalatesTest(unittest.TestCase):
         fs = FakeFirestore()
         writer = FakeWriter()
         ledger = _make_ledger(fs, writer)
-        pages = [_yield(_valid_result("店A", 1000), 1, 1),
+        pages = [_page(1, 1, "店A", 1000),
                  _yield(_zero_entry_result(), 1, 1)]
         out = _run(writer, ledger, pages)
         self.assertIs(out.outcome, main.ProcessOutcome.ESCALATED)
@@ -623,7 +655,7 @@ class MixedPageEscalatesTest(unittest.TestCase):
         fs = FakeFirestore()
         writer = FakeWriter()
         ledger = _make_ledger(fs, writer)
-        pages = [_yield(_valid_result("店A", 1000), 1, 1),
+        pages = [_page(1, 1, "店A", 1000),
                  {"result": {"_page_error": True, "_error_class": "CONTENT",
                              "entries": [], "_unrecognized": True},
                   "page_num": 1, "total_pages": 1, "page_bytes": b"x"}]
@@ -634,7 +666,7 @@ class MixedPageEscalatesTest(unittest.TestCase):
         fs = FakeFirestore()
         writer = FakeWriter()
         ledger = _make_ledger(fs, writer)
-        pages = [_yield(_valid_result("店A", 1000), 1, 1),
+        pages = [_page(1, 1, "店A", 1000),
                  _yield(_zero_entry_result(), 1, 1)]
         out1 = _run(writer, ledger, pages)
         self.assertIs(out1.outcome, main.ProcessOutcome.ESCALATED)
@@ -654,10 +686,9 @@ class ContentPlaceholderRowShapeTest(unittest.TestCase):
     """
 
     def _real_writer(self):
-        writer = SheetsOutputWriter.__new__(SheetsOutputWriter)
-        writer._tab_next_txn = {}
-        writer._tabs_sanitized = set()
-        return writer
+        # test_sheets_output._make_writer を復用（gspread 認証を回避した
+        # SheetsOutputWriter 組立ての重複実装を解消、simcodex Round 2 #8）。
+        return _make_sheets_output_writer()
 
     def test_content_override_produces_fixed_memo_vendor_date_and_url(self):
         writer = self._real_writer()

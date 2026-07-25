@@ -60,15 +60,26 @@ def _two_pdf_pages():
     ])
 
 
-def _run_receipt_pipeline(route_side_effect):
+def _run_receipt_pipeline(route_side_effect, *, vision_side_effect=None,
+                          vision_return=None):
     """RECEIPT×多ページ PDF 分岐を通し、yield された結果を全件返す。
 
     route_side_effect: _route_ocr_strategy のページ順戻り値リスト
-    (raw, ocr_text, conf)。raw=None のページは Vision 兜底も失敗させる。
+    (raw, ocr_text, conf)。raw=None のページは Vision 兜底
+    （_call_gemini_bytes）に落ちる。vision_side_effect を渡すとその兜底
+    呼出しで例外を発生させる（test_ocr_engine_error_class.py の
+    RETRYABLE/UNKNOWN 判定駆動に再利用、simcodex Round 1 #3）。渡さなければ
+    vision_return をそのまま返す（既定 None＝JSON 解析失敗、本ファイルの
+    従来挙動と同一）。
     """
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(b"%PDF-1.4 dummy")
         path = tmp.name
+
+    vision_kwargs = (
+        {"side_effect": vision_side_effect} if vision_side_effect is not None
+        else {"return_value": vision_return}
+    )
 
     try:
         with mock.patch.object(ocr_engine, "_split_pdf_pages",
@@ -76,7 +87,7 @@ def _run_receipt_pipeline(route_side_effect):
              mock.patch.object(ocr_engine, "_route_ocr_strategy",
                                side_effect=route_side_effect), \
              mock.patch.object(ocr_engine, "_call_gemini_bytes",
-                               return_value=None) as vision:
+                               **vision_kwargs) as vision:
             with redirect_stdout(io.StringIO()):
                 pages = list(ocr_engine.process_pipeline(
                     path, doc_type=DocType.RECEIPT, ocr_strategy="C"))

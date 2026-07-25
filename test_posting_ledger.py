@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import UTC, datetime
+from unittest import mock
 
 import posting_ledger as pl
 from posting_ledger import (
@@ -278,6 +279,40 @@ class ConfirmedTicketCountTest(unittest.TestCase):
         ledger.confirmed_ticket_count(PAGE_ID)
         self.assertIs(ledger.check_page(PAGE_ID), PageDecision.SKIP)
         self.assertEqual(fs.store[POSTING_PATH]["status"], pl.STATUS_CONFIRMED)
+
+    def test_reuses_check_page_snapshot_no_second_read(self) -> None:
+        # simcodex Round 1 #9: check_page が読んだ直後の同一 page_id への
+        # confirmed_ticket_count はキャッシュを再利用し、Firestore を再度叩かない。
+        fs = _FakeFirestore()
+        fs.store[POSTING_PATH] = _pending_doc(status=pl.STATUS_CONFIRMED, ticket_count=2)
+        ledger = _make_ledger(fs, self._probe_const(ProbeResult.ABSENT))
+        with mock.patch.object(ledger, "_posting_doc",
+                               wraps=ledger._posting_doc) as spy:
+            self.assertIs(ledger.check_page(PAGE_ID), PageDecision.SKIP)
+            self.assertEqual(spy.call_count, 1)
+            self.assertEqual(ledger.confirmed_ticket_count(PAGE_ID), 2)
+            self.assertEqual(spy.call_count, 1)  # 二回目は増えない（キャッシュ命中）
+
+    def test_different_page_id_is_not_cache_hit(self) -> None:
+        # キャッシュは page_id 単位——別頁への呼出しは普通に読みに行く
+        fs = _FakeFirestore()
+        fs.store[POSTING_PATH] = _pending_doc(status=pl.STATUS_CONFIRMED, ticket_count=2)
+        other_path = ("jobs", JOB_KEY, "postings", "cust:hash:p9")
+        fs.store[other_path] = _pending_doc(
+            page_id="cust:hash:p9", status=pl.STATUS_CONFIRMED, ticket_count=9)
+        ledger = _make_ledger(fs, self._probe_const(ProbeResult.ABSENT))
+        ledger.check_page(PAGE_ID)
+        self.assertEqual(ledger.confirmed_ticket_count("cust:hash:p9"), 9)
+
+    def test_post_page_invalidates_cache_so_later_read_sees_fresh_data(self) -> None:
+        # simcodex Round 1 #9: claim/confirm（post_page）はキャッシュを無効化する
+        # ——書込前に WRITE 判定でキャッシュされた「無記録」が書込後まで生き残り
+        # confirmed_ticket_count が古い None を返す事故を防ぐ。
+        fs = _FakeFirestore()
+        ledger = _make_ledger(fs, self._probe_const(ProbeResult.ABSENT))
+        self.assertIs(ledger.check_page(PAGE_ID), PageDecision.WRITE)  # (PAGE_ID, None) を快取
+        ledger.post_page(PAGE_ID, _summary(ticket_count=5), lambda: (1, 1))
+        self.assertEqual(ledger.confirmed_ticket_count(PAGE_ID), 5)  # 快取無効化→最新値
 
 
 if __name__ == "__main__":

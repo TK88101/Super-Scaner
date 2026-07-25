@@ -163,6 +163,11 @@ class PostingLedger:
             if transaction_runner is not None
             else self._default_transaction_runner
         )
+        # 単発読キャッシュ（simcodex Round 1 #9）: (page_id, data) の直近1件のみ
+        # 保持。check_page と confirmed_ticket_count が同一 page_id を連続で
+        # 読む重跑場景の同文檔二重読を避ける。ADR-007（単進程単線程・lease 単
+        # owner）前提でのみ安全——claim/confirm（書込）で無効化する。
+        self._last_read: tuple[str, dict | None] | None = None
 
     def _default_transaction_runner(self, body: Callable[[Any], _T]) -> _T:
         """SDK 預設事務路徑（reporter._default_transaction_runner と同型）。"""
@@ -182,6 +187,24 @@ class PostingLedger:
             .document(page_id)
         )
 
+    def _cached_or_read(self, page_id: str) -> dict | None:
+        """check_page/confirmed_ticket_count 共用の単発読（キャッシュ命中時は
+        Firestore を叩かない、simcodex Round 1 #9）。doc 不存在 → None、
+        存在すれば dict（空なら {}、check_page の従来挙動と同一）。
+        """
+        if self._last_read is not None and self._last_read[0] == page_id:
+            return self._last_read[1]
+        snap = self._posting_doc(page_id).get()
+        data = (snap.to_dict() or {}) if snap.exists else None
+        self._last_read = (page_id, data)
+        return data
+
+    def _invalidate_cache(self, page_id: str) -> None:
+        """claim/confirm（書込）でキャッシュを無効化する（同一 page_id のみ、
+        他頁の直近読取りは無関係なので残す）。"""
+        if self._last_read is not None and self._last_read[0] == page_id:
+            self._last_read = None
+
     # --- 査重 -----------------------------------------------------------------
     def check_page(self, page_id: str) -> PageDecision:
         """`jobs/{job_key}/postings/{page_id}` を単発読して四情況判定（副作用は PRESENT 補記のみ）。
@@ -189,10 +212,9 @@ class PostingLedger:
         無記録 → WRITE ／ CONFIRMED → SKIP ／ 未知 status → ESCALATE ／
         PENDING → witness 厳格照合（_recover_pending）。
         """
-        snap = self._posting_doc(page_id).get()
-        if not snap.exists:
+        data = self._cached_or_read(page_id)
+        if data is None:
             return PageDecision.WRITE
-        data = snap.to_dict() or {}
         status = data.get("status")
         if status == STATUS_CONFIRMED:
             return PageDecision.SKIP
@@ -228,12 +250,13 @@ class PostingLedger:
         int でない（旧 schema・破損防御）→ None。存在すれば記録済み値
         （0 も正常値＝占位頁）をそのまま返す。check_page が SKIP を返した後、
         呼び出し側（main、T3）がこの値の >0/==0 で「真に入賬済み」か「占位頁」
-        かを自証する（§2.2 ticket_count 語義釘死）。
+        かを自証する（§2.2 ticket_count 語義釘死）。check_page と同一 page_id
+        を直前に読んでいればその結果を再利用する（_cached_or_read、同文檔
+        二重読の回避）。
         """
-        snap = self._posting_doc(page_id).get()
-        if not snap.exists:
+        data = self._cached_or_read(page_id)
+        if data is None:
             return None
-        data = snap.to_dict() or {}
         if data.get("status") != STATUS_CONFIRMED:
             return None
         ticket_count = data.get("ticket_count")
@@ -276,6 +299,7 @@ class PostingLedger:
             txn.set(doc_ref, _pending_payload(page_id, summary, created_at, now))
 
         self._transaction_runner(body)
+        self._invalidate_cache(page_id)
 
     def _confirm(
         self, page_id: str, row_range: SheetRowRange, *, require_pending: bool
@@ -309,6 +333,7 @@ class PostingLedger:
             txn.set(doc_ref, new_data)
 
         self._transaction_runner(body)
+        self._invalidate_cache(page_id)
 
 
 def _pending_payload(

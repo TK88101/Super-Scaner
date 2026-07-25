@@ -24,6 +24,13 @@ from doc_types import DocType, DOC_TYPE_CONFIG
 import config
 import firestore_report
 import intake_guard
+# PageDecision は main.py 内 2 箇所（_flush_page/_classify_and_flush_page）で
+# 個別に遅延 import されていた重複を統合（simcodex Round 2 #6）。firestore_report
+# が既に google-cloud-firestore を無条件 import 済みのため、posting_ledger の
+# 軽量シンボル（Enum のみ）をここで top-level import しても既存の遅延 import
+# 方針（PostingLedger/TicketSummary/PagePostingSummary/derive_page_id は
+# 各関数内のまま）と依存負荷は変わらない。
+from posting_ledger import PageDecision
 
 # ================= 配置區域 =================
 load_dotenv()
@@ -299,23 +306,33 @@ def _init_headless_reporter():
 # B4 Plan §2.4: 契約が授権する記帳窓口はこの状態のみ（IP-303 注記④の完全実装）。
 # POSTED/POST_UNKNOWN/DEAD_LETTER/終態/欠落 None は控制面の管轄——SS は無租約
 # 状態で書込まない（POST_UNKNOWN は控制面の重投で POSTING_IN_PROGRESS に戻り
-# 自然に放行される）。
-_INTAKE_ALLOWED_JOB_STATE = "POSTING_IN_PROGRESS"
+# 自然に放行される）。firestore_report.STATE_POSTING_IN_PROGRESS を参照
+# （跨倉契約値の字面量重複を避ける——値の出所は一箇所のみ）。
+_INTAKE_ALLOWED_JOB_STATE = firestore_report.STATE_POSTING_IN_PROGRESS
 
 
 def _headless_intake_gate(service, file, input_folder_id, reporter, alerted=None):
     """監視フォルダ入口守衛（IP-303）+ 状態白名単（IP-308/T4、§2.4）を1ファイルに
-    適用し (続行可, base, lease_epoch) を返す。
+    適用し (続行可, base, lease_epoch, state_rejected) を返す。
 
-    非 HEADLESS_MODE では常に (True, None, None)（副作用なし）。HEADLESS_MODE では
-    intake_guard.handle_intake_gate の裁決を橋渡しし、PROCESS 時のみ base posting_id
-    ＋lease_epoch を通す（IP-304 が頁級台賬の job_key に、IP-308 が report_posted/
-    report_dead_letter の epoch 引数に使う）。intake_guard 自体の五分岐判定は
-    零改動——状態白名単はこの消費側でのみ適用する（should_process=True でも
-    job_state が POSTING_IN_PROGRESS でなければ本輪は処理をスキップする）。
+    非 HEADLESS_MODE では常に (True, None, None, False)（副作用なし）。
+    HEADLESS_MODE では intake_guard.handle_intake_gate の裁決を橋渡しし、
+    PROCESS 時のみ base posting_id ＋lease_epoch を通す（IP-304 が頁級台賬の
+    job_key に、IP-308 が report_posted/report_dead_letter の epoch 引数に使う）。
+    intake_guard 自体の五分岐判定は零改動——状態白名単はこの消費側でのみ
+    適用する（should_process=True でも job_state が POSTING_IN_PROGRESS で
+    なければ本輪は処理をスキップする）。
+
+    state_rejected：True は「五分岐判定は PROCESS だが job_state が
+    POSTING_IN_PROGRESS でない」局面のみ（simcodex Round 2 #2）。呼出元
+    （_process_one_file）はこれを見て intake_state_memo（TTL 付き pre-gate
+    スキップ memo）に記録するかを決める。それ以外の REJECTED/DEFERRED
+    （no_posting_id 等）は state_rejected=False——REJECTED は intake_guard 自身の
+    alerted/隔離で、DEFERRED は意図的な毎輪再試行で扱われるため、ここでは
+    memo しない。
     """
     if not config.headless_mode():
-        return True, None, None
+        return True, None, None, False
     result = intake_guard.handle_intake_gate(
         file,
         get_job=reporter.get_job,
@@ -325,12 +342,12 @@ def _headless_intake_gate(service, file, input_folder_id, reporter, alerted=None
         alerted=alerted,
     )
     if not result.should_process:
-        return False, result.base, result.lease_epoch
+        return False, result.base, result.lease_epoch, False
     if result.job_state != _INTAKE_ALLOWED_JOB_STATE:
         print(f"入口守衛: 状態非対象 file_id={file.get('id')} "
               f"job_state={result.job_state!r} → 本輪スキップ（不下載不OCR不打刻）")
-        return False, result.base, result.lease_epoch
-    return True, result.base, result.lease_epoch
+        return False, result.base, result.lease_epoch, True
+    return True, result.base, result.lease_epoch, False
 
 
 # B4 Plan §2.4: ESCALATED memo の TTL（≈20輪。SCAN_INTERVAL=3s 前提で約60s、
@@ -339,17 +356,22 @@ def _headless_intake_gate(service, file, input_folder_id, reporter, alerted=None
 _ESCALATE_MEMO_TTL_CYCLES = 20
 
 
-def _prune_headless_memo(memo, folder_id, files):
+def _prune_headless_memo(memo, folder_id, files, *, file_id_index=2):
     """剪枝按夾（B4 Plan §2.4、DoD⑦）。
 
     この夾の list_files が成功した今回に限り、この夾に属す memo 項のうち
     今回の一覧に無い file_id を剪定する。呼出元は list_files 成功後にのみ
     本関数を呼ぶ前提——「夾列舉失敗不剪」は呼出順序だけで自然に満たされる
     （本関数自体に try/except は不要）。
+
+    file_id_index：memo の種類によりキー内 file_id の位置が異なるため可変
+    （outcome memo: (base, lease_epoch, file_id) → 既定 2／intake_state_memo:
+    (base, file_id) → 1、simcodex Round 2 #2）。同じ剪定ロジックを両者で共用。
     """
     seen_ids = {f["id"] for f in files}
     stale_keys = [key for key, value in memo.items()
-                  if value.get("folder_id") == folder_id and key[2] not in seen_ids]
+                  if value.get("folder_id") == folder_id
+                  and key[file_id_index] not in seen_ids]
     for key in stale_keys:
         del memo[key]
 
@@ -379,30 +401,58 @@ def _record_headless_memo(memo, key, outcome_label, folder_id, expire_cycle=None
                  "expire_cycle": expire_cycle}
 
 
+# epoch 欠落（違約態）時に SUCCESS/DEAD_LETTER と偽記しない誠実なラベル
+# （simcodex Round 2 #1）。同鍵で次輪も再打不要（memo は記録される）だが、
+# 実際には報告していない事実を memo 自身が語る。epoch が現れれば（鍵の
+# lease_epoch が変わる）自然に放行される——既存の memo 鍵設計のまま。
+_MEMO_LABEL_EPOCH_MISSING = "EPOCH_MISSING"
+
+
+def _call_reporter_if_epoch_present(lease_epoch, file_id, call) -> bool:
+    """epoch 欠落（違約態）は一律零 reporter 呼出し＋警告日誌（#3）。
+
+    SUCCESS/DEAD_LETTER の両分岐が同じ守衛＋日誌文言を持っていたための抽出
+    （simcodex Round 1 #8）。call は引数無しの実呼出しクロージャ（呼出元が
+    report_posted/report_dead_letter のどちらを束縛するかを決める）。
+
+    戻り値：実際に reporter を呼んだか（True/False）。呼出元（_report_headless_outcome）
+    はこれを見て memo ラベルを選ぶ——epoch 欠落で呼んでいないのに "SUCCESS"/
+    "DEAD_LETTER" と記録すると、実際には未報告なのに報告済みと偽ることになる
+    （simcodex Round 2 #1、memo 誠実化）。
+    """
+    if lease_epoch is not None:
+        call()
+        return True
+    print(f"⚠️ epoch欠落のため回報せず（違約態）file_id={file_id}")
+    return False
+
+
 def _report_headless_outcome(reporter, base, lease_epoch, outcome, file_id, cycle):
     """HeadlessOutcome を回報接線へ渡す（B4 Plan §2.3、IP-308 本体）。
 
     戻り値 (outcome_label, expire_cycle)。outcome_label が None なら memo に
     記録しない（RETRYABLE 由来の FAILED——3秒自癒窗）。epoch 欠落（違約態）は
-    一律零 reporter 呼出し＋警告日誌＋ファイル保持（#3）。回報結果
-    （APPLIED/ALREADY_DONE/REJECTED）の事後処置は firestore_report._report が
+    一律零 reporter 呼出し＋警告日誌＋ファイル保持（#3、_call_reporter_if_epoch_present）
+    ——このとき memo ラベルは "SUCCESS"/"DEAD_LETTER" ではなく
+    _MEMO_LABEL_EPOCH_MISSING（誠実化、simcodex Round 2 #1）。スキップ挙動
+    そのもの（檔案保持・同鍵不重打）は変わらない——鍵に lease_epoch を含む
+    ため epoch が現れれば別鍵として天然放行される。
+    回報結果（APPLIED/ALREADY_DONE/REJECTED）の事後処置は firestore_report._report が
     内部で完結する（診断 print＋REJECTED 時の alert 書込）——本関数は呼ぶだけで、
     結果に応じた再試行／move は一切しない（契約：REJECTED でも SS は不重試不move）。
     """
     h_outcome = outcome.outcome
     if h_outcome is ProcessOutcome.SUCCESS:
-        if lease_epoch is not None:
-            reporter.report_posted(base, lease_epoch=lease_epoch)
-        else:
-            print(f"⚠️ epoch欠落のため回報せず（違約態）file_id={file_id}")
-        return "SUCCESS", None
+        called = _call_reporter_if_epoch_present(
+            lease_epoch, file_id,
+            lambda: reporter.report_posted(base, lease_epoch=lease_epoch))
+        return ("SUCCESS" if called else _MEMO_LABEL_EPOCH_MISSING), None
     if h_outcome is ProcessOutcome.DEAD_LETTER:
-        if lease_epoch is not None:
-            reporter.report_dead_letter(
-                base, lease_epoch=lease_epoch, error=outcome.dead_letter_payload)
-        else:
-            print(f"⚠️ epoch欠落のため回報せず（違約態）file_id={file_id}")
-        return "DEAD_LETTER", None
+        called = _call_reporter_if_epoch_present(
+            lease_epoch, file_id,
+            lambda: reporter.report_dead_letter(
+                base, lease_epoch=lease_epoch, error=outcome.dead_letter_payload))
+        return ("DEAD_LETTER" if called else _MEMO_LABEL_EPOCH_MISSING), None
     if h_outcome is ProcessOutcome.PARTIAL:
         # TBD 接縫（F06-How 未確定、正式回報は本批の非目標）: 日誌のみ豁免記録
         print(f"⚠️ PARTIAL: 未回報（TBD接縫、F06-How未確定）file_id={file_id}")
@@ -421,22 +471,43 @@ def _report_headless_outcome(reporter, base, lease_epoch, outcome, file_id, cycl
 
 def _process_one_file(service, writer, reporter, file, input_folder_id, doc_type,
                       processed_folder_id, split_pdf_folder_id, quarantine_alerted,
-                      headless_memo, cycle):
+                      headless_memo, intake_state_memo, cycle):
     """1 ファイルの取り込み～記帳～終態処理（main() の for file in files: 本体を
     可測化のため抽出、ロジック改変なし——IP-303/304/306/308 全接線の実体）。
 
     UI 版（reporter=None）と headless 版の分岐は本関数の内部で行う。main() 側は
     ファイル一覧の反復と本関数の呼出しのみ担う。
+
+    intake_state_memo：状態白名単で継続的にスキップされる file の pre-gate
+    memo（simcodex Round 2 #2、outcome memo=headless_memo とは別鍵形
+    (base, file_id)——lease_epoch は gate 呼出し前は未知のため）。
     """
     file_id = file['id']
     file_name = file['name']
     md5 = file.get('md5Checksum')
 
+    # -0.5 intake 状態白名単の pre-gate memo（headless のみ）: 前輪で状態非対象
+    # と判定済み（TTL 内）の file は intake gate（Firestore get_job 読取）
+    # 自体を省く——無界の毎輪 get_job 連打を防ぐ（simcodex Round 2 #2）。
+    # base は Drive properties から純関数で読める（Firestore 不要）ため、
+    # gate 呼出し前でもキー参照できる。
+    if reporter is not None:
+        pre_base = intake_guard.resolve_posting_id(file)
+        if pre_base is not None and _headless_memo_skip(
+                intake_state_memo, (pre_base, file_id), cycle):
+            print(f"headless memo 命中（状態非対象・TTL内）→ 本輪スキップ file_id={file_id}")
+            print("=" * 30)
+            return
+
     # 0. ヘッドレスモード入口守衛（IP-303）+ 状態白名単（IP-308/T4）: 防重檢測より
     # 前に base posting_id ＋ job 状態を検証する。
-    should_process, base, lease_epoch = _headless_intake_gate(
+    should_process, base, lease_epoch, state_rejected = _headless_intake_gate(
         service, file, input_folder_id, reporter, alerted=quarantine_alerted)
     if not should_process:
+        if reporter is not None and state_rejected and base is not None:
+            _record_headless_memo(
+                intake_state_memo, (base, file_id), "STATE_NOT_ALLOWED",
+                input_folder_id, cycle + _ESCALATE_MEMO_TTL_CYCLES)
         print("=" * 30)
         return
 
@@ -588,6 +659,25 @@ class HeadlessOutcome:
     retryable: bool = False
     dead_letter_payload: dict | None = None
 
+    def __post_init__(self) -> None:
+        """不変式検証（simcodex Round 1 #10）：retryable/dead_letter_payload は
+        対応する outcome でのみ意味を持つ——他 outcome との誤組合せは fail fast。
+        """
+        if self.retryable and self.outcome is not ProcessOutcome.FAILED:
+            raise ValueError(
+                f"HeadlessOutcome: retryable=True は outcome==FAILED でのみ許可"
+                f"（受取 outcome={self.outcome}）")
+        if self.dead_letter_payload is not None and self.outcome is not ProcessOutcome.DEAD_LETTER:
+            raise ValueError(
+                f"HeadlessOutcome: dead_letter_payload は outcome==DEAD_LETTER でのみ許可"
+                f"（受取 outcome={self.outcome}）")
+
+
+def _has_entries(result) -> bool:
+    """result が有効仕訳（entries 非空）を持つか（simcodex Round 2 #9、
+    main.py 内 3 箇所に散っていた r.get("entries") 真値判定を一元化）。"""
+    return bool(result.get("entries"))
+
 
 def _extract_tickets(results):
     """頁内の各 result を F59 対账 advisory の 1 票 TicketSummary へ（去重键には非使用）。
@@ -605,13 +695,16 @@ def _extract_tickets(results):
             amount=sum_row_amounts(r.get("entries", []) or []),
             vendor=r.get("vendor", "") or "",
         )
-        for r in results if r.get("entries")
+        for r in results if _has_entries(r)
     ]
 
 
-def _flush_page(writer, ledger, base, doc_type, uploader_name, page_num,
+def _flush_page(writer, ledger, page_id, doc_type, uploader_name, page_num,
                 results, urls):
     """1 頁分の查重→記帳。戻り値 'written'|'skipped'|'escalate'。
+
+    page_id は呼出元（_classify_and_flush_page）が既に derive_page_id 済みの値を
+    そのまま受け取る（同一頁で二重算出しない）。
 
     check_page で SKIP（既 CONFIRMED/witness PRESENT）→ 何も書かない（硬去重）。
     ESCALATE（witness 不確実）→ 呼出側でファイル保持・回報せず。WRITE → build_page_write
@@ -619,10 +712,9 @@ def _flush_page(writer, ledger, base, doc_type, uploader_name, page_num,
     全件 entries 空（占位頁）でも build_page_write は _build_unrecognized_block
     で占位行 1 行を天然生成する（sheets_output.py 零改動、B4 Plan §2.2）。
     """
-    from posting_ledger import derive_page_id, PageDecision, PagePostingSummary
+    from posting_ledger import PagePostingSummary
     from sheets_output import compute_page_fingerprint
 
-    page_id = derive_page_id(base, page_num)
     decision = ledger.check_page(page_id)
     if decision is PageDecision.SKIP:
         print(f"⏭️ 頁 {page_num} は既記帳（台賬）→ スキップ")
@@ -652,7 +744,6 @@ def _flush_page(writer, ledger, base, doc_type, uploader_name, page_num,
 
 # B4 Plan §2.3: 頁級 outcome の分類（"種別" 文字列、main 内部専用の軽量タグ）。
 _PLACEHOLDER_KINDS = frozenset({"PLACEHOLDER_WRITTEN", "PLACEHOLDER_PRIOR"})
-_POSTED_KINDS = frozenset({"POSTED_NOW", "POSTED_PRIOR"})
 
 
 def _classify_page_result_shape(results):
@@ -681,13 +772,13 @@ def _classify_page_result_shape(results):
             return ("content_error", None)
         return ("error", error_class)
 
-    valid = [r for r in results if r.get("entries")]
-    zero = [r for r in results if not r.get("entries")]
-    if valid and zero:
+    has_valid = any(_has_entries(r) for r in results)
+    has_placeholder = any(not _has_entries(r) for r in results)
+    if has_valid and has_placeholder:
         # 混型頁（Codex 複審 #14 採択）: ticket_count>0 が完全性を自証できなく
         # なるため、書込せず即座に人工核へ委ねる
         return ("escalate", "mixed_valid_and_placeholder_result")
-    return ("valid", None) if valid else ("placeholder", None)
+    return ("valid", None) if has_valid else ("placeholder", None)
 
 
 def _apply_content_error_override(result, filename, page_num, total_pages):
@@ -725,7 +816,7 @@ def _classify_and_flush_page(writer, ledger, resolver, base, doc_type,
     アップロードを起こさない（旧実装は _page_error を即 continue していたため
     そもそも解決していなかった、その保証を新モデルでも保つ）。
     """
-    from posting_ledger import derive_page_id, PageDecision
+    from posting_ledger import derive_page_id
 
     page_id = derive_page_id(base, page_num)
     shape, detail = _classify_page_result_shape(results)
@@ -755,7 +846,7 @@ def _classify_and_flush_page(writer, ledger, resolver, base, doc_type,
         print(f"📄 [{page_num}/{total_pages}] 取引先: {result.get('vendor')} | "
               f"仕訳: {len(entries)}行")
 
-    outcome = _flush_page(writer, ledger, base, doc_type, uploader_name,
+    outcome = _flush_page(writer, ledger, page_id, doc_type, uploader_name,
                           page_num, results, urls)
     if outcome == "escalate":
         return ("ESCALATE", "ledger_witness_ambiguous")
@@ -806,6 +897,30 @@ def _aggregate_file_outcome(page_kinds, ordered_page_nums, total_pages):
     return HeadlessOutcome(ProcessOutcome.SUCCESS)
 
 
+def _record_page_classification(classified, page_kinds, ordered_page_nums, page_num):
+    """flush() の戻り値を頁級 outcome 記録へ反映する（main.py 内 2 箇所の重複統合、
+    simcodex Round 1 #5/#6）。
+
+    classified が None（緩衝が空、flush 未実施）なら何もせず None を返す
+    （呼出側はループを継続してよい）。("ESCALATE", reason) なら reason を診断
+    ログへ落とし（旧実装は reason を捨てるだけの write-only 穿線だった、#6）
+    HeadlessOutcome(ESCALATED) を返す（呼出側は即座に return する）。それ以外
+    (kind, None) は page_kinds/ordered_page_nums へ記録して None を返す。
+
+    page_kinds/ordered_page_nums は呼出元のループ累積変数をそのまま可変更新
+    する（_process_file_headless 内の既存の蓄積スタイルに合わせる）。
+    """
+    if classified is None:
+        return None
+    kind, reason = classified
+    if kind == "ESCALATE":
+        print(f"🚨 頁 {page_num} ESCALATE: {reason}")
+        return HeadlessOutcome(ProcessOutcome.ESCALATED)
+    page_kinds[page_num] = kind
+    ordered_page_nums.append(page_num)
+    return None
+
+
 def _process_file_headless(service, writer, file_path, uploader_name, base,
                            ledger, doc_type, drive_file_id, split_pdf_folder_id):
     """HEADLESS_MODE の頁級緩衝集約経路（IP-304/IP-306）。HeadlessOutcome を返す。
@@ -848,12 +963,10 @@ def _process_file_headless(service, writer, file_path, uploader_name, base,
         if buffered_num is not None and page_num != buffered_num:
             classified = flush(buffered_num, buffered_total_pages,
                                buffered_results, buffered_page_bytes)
-            if classified is not None:
-                kind, reason = classified
-                if kind == "ESCALATE":
-                    return HeadlessOutcome(ProcessOutcome.ESCALATED)
-                page_kinds[buffered_num] = kind
-                ordered_page_nums.append(buffered_num)
+            escalated = _record_page_classification(
+                classified, page_kinds, ordered_page_nums, buffered_num)
+            if escalated is not None:
+                return escalated
             seen_pages.add(buffered_num)
             buffered_results = []
             buffered_page_bytes = []
@@ -871,12 +984,10 @@ def _process_file_headless(service, writer, file_path, uploader_name, base,
 
     classified = flush(buffered_num, buffered_total_pages,
                        buffered_results, buffered_page_bytes)
-    if classified is not None:
-        kind, reason = classified
-        if kind == "ESCALATE":
-            return HeadlessOutcome(ProcessOutcome.ESCALATED)
-        page_kinds[buffered_num] = kind
-        ordered_page_nums.append(buffered_num)
+    escalated = _record_page_classification(
+        classified, page_kinds, ordered_page_nums, buffered_num)
+    if escalated is not None:
+        return escalated
 
     return _aggregate_file_outcome(page_kinds, ordered_page_nums, file_total_pages)
 
@@ -1142,6 +1253,13 @@ def main():
     # 済みの file を次輪以降スキップし、Gemini 呼出しの無界重打を防ぐ（費用防護の
     # みで正確性は担わない——プロセス再起動で自然に消える）。
     headless_memo: dict = {}
+    # intake 状態白名単 pre-gate memo（IP-308/T4、simcodex Round 2 #2）:
+    # (base, file_id) → {outcome, folder_id, expire_cycle}。job_state が
+    # POSTING_IN_PROGRESS でないと判定された file を TTL 内は intake gate
+    # （Firestore get_job 読取）自体を省いてスキップする——鍵に epoch を含まない
+    # （gate 呼出し前は epoch 未知のため）。outcome memo とは別 dict
+    # （キー形が違うため剪定 file_id_index も別途指定）。
+    intake_state_memo: dict = {}
     cycle = 0
 
     active_folder_map = filter_active_folders(folder_map, writers)
@@ -1178,6 +1296,8 @@ def main():
                 # 呼ぶ（「夾列舉失敗不剪」は呼出順序で自然に満たす）。
                 if reporter is not None:
                     _prune_headless_memo(headless_memo, input_folder_id, files)
+                    _prune_headless_memo(intake_state_memo, input_folder_id, files,
+                                         file_id_index=1)
 
                 if not files:
                     continue
@@ -1196,7 +1316,7 @@ def main():
                         service, writer, reporter, file, input_folder_id,
                         doc_type, processed_folder_id,
                         profile["split_pdf_folder_id"], quarantine_alerted,
-                        headless_memo, cycle)
+                        headless_memo, intake_state_memo, cycle)
 
             if not found_any:
                 print(".", end="", flush=True)

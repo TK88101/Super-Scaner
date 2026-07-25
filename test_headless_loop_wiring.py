@@ -16,7 +16,9 @@ from __future__ import annotations
 import importlib
 import os
 import sys
+import types
 import unittest
+from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -29,32 +31,7 @@ os.environ.setdefault("FOLDER_RECEIPT_ID", "test_receipt_folder")
 import config
 importlib.reload(config)
 import main
-from headless_rerun_fixture import FakeWriter
-
-
-class _FakeReporter:
-    """firestore_report.FirestoreReporter のダブル（呼出し記録のみ、真庫不接）。"""
-
-    def __init__(self, jobs=None):
-        self.client = object()
-        self._jobs = jobs or {}
-        self.report_posted_calls = []
-        self.report_dead_letter_calls = []
-        self.write_alert_calls = []
-
-    def get_job(self, base):
-        return self._jobs.get(base)
-
-    def write_alert(self, alert_id, payload):
-        self.write_alert_calls.append((alert_id, payload))
-
-    def report_posted(self, job_id, *, lease_epoch):
-        self.report_posted_calls.append((job_id, lease_epoch))
-        return "APPLIED"
-
-    def report_dead_letter(self, job_id, *, lease_epoch, error):
-        self.report_dead_letter_calls.append((job_id, lease_epoch, error))
-        return "APPLIED"
+from headless_rerun_fixture import FakeReporter, FakeWriter
 
 
 def _job(posting_id, lease_epoch=1, current_state="POSTING_IN_PROGRESS"):
@@ -65,6 +42,21 @@ def _job(posting_id, lease_epoch=1, current_state="POSTING_IN_PROGRESS"):
 def _file(file_id="f1", base="cust:hash"):
     return {"id": file_id, "name": "invoice.pdf",
             "properties": {"sandevistan_posting_id": base}}
+
+
+def _call_process_one_file(writer, reporter, *, file=None, headless_memo=None,
+                           intake_state_memo=None, cycle=1):
+    """main._process_one_file の呼出し足場（ProcessOneFileTest と
+    IntakeStatePreGateMemoTest で共用、simcodex Round 2 #11 と同型の DRY）。"""
+    main._process_one_file(
+        service=None, writer=writer, reporter=reporter,
+        file=file if file is not None else _file(), input_folder_id="in",
+        doc_type="receipt", processed_folder_id="processed",
+        split_pdf_folder_id="split", quarantine_alerted={},
+        headless_memo=headless_memo if headless_memo is not None else {},
+        intake_state_memo=(
+            intake_state_memo if intake_state_memo is not None else {}),
+        cycle=cycle)
 
 
 # ============================================================
@@ -78,51 +70,137 @@ class IntakeStateWhitelistTest(unittest.TestCase):
 
     def _gate(self, job_state):
         base = "cust:hash"
-        reporter = _FakeReporter({base: _job(base, current_state=job_state)})
+        reporter = FakeReporter({base: _job(base, current_state=job_state)})
         with patch.object(main.config, "headless_mode", return_value=True):
             return main._headless_intake_gate(
                 service=None, file=_file(base=base), input_folder_id="in",
                 reporter=reporter)
 
     def test_posting_in_progress_allows_process(self):
-        should, base, epoch = self._gate("POSTING_IN_PROGRESS")
+        should, base, epoch, state_rejected = self._gate("POSTING_IN_PROGRESS")
         self.assertTrue(should)
         self.assertEqual(base, "cust:hash")
         self.assertEqual(epoch, 1)
+        self.assertFalse(state_rejected)
 
     def test_posted_is_skipped(self):
-        should, base, epoch = self._gate("POSTED")
+        should, base, epoch, state_rejected = self._gate("POSTED")
         self.assertFalse(should)
+        self.assertTrue(state_rejected)  # simcodex Round 2 #2: pre-gate memo 対象
 
     def test_post_unknown_is_skipped(self):
-        should, base, epoch = self._gate("POST_UNKNOWN")
+        should, base, epoch, state_rejected = self._gate("POST_UNKNOWN")
         self.assertFalse(should)
+        self.assertTrue(state_rejected)
 
     def test_dead_letter_is_skipped(self):
-        should, base, epoch = self._gate("DEAD_LETTER")
+        should, base, epoch, state_rejected = self._gate("DEAD_LETTER")
         self.assertFalse(should)
+        self.assertTrue(state_rejected)
 
     def test_missing_job_state_is_skipped(self):
-        should, base, epoch = self._gate(None)
+        should, base, epoch, state_rejected = self._gate(None)
         self.assertFalse(should)
+        self.assertTrue(state_rejected)
 
     def test_non_headless_bypasses_whitelist(self):
         with patch.object(main.config, "headless_mode", return_value=False):
-            should, base, epoch = main._headless_intake_gate(
+            should, base, epoch, state_rejected = main._headless_intake_gate(
                 service=None, file=_file(), input_folder_id="in", reporter=None)
         self.assertTrue(should)
         self.assertIsNone(base)
         self.assertIsNone(epoch)
+        self.assertFalse(state_rejected)
 
     def test_rejected_by_underlying_gate_short_circuits_before_state_check(self):
         # no_posting_id で REJECTED（job 未取得）→ state チェックへ到達しない
-        reporter = _FakeReporter({})
+        reporter = FakeReporter({})
         with patch.object(main.config, "headless_mode", return_value=True):
-            should, base, epoch = main._headless_intake_gate(
+            should, base, epoch, state_rejected = main._headless_intake_gate(
                 service=None, file={"id": "f1"}, input_folder_id="in",
                 reporter=reporter)
         self.assertFalse(should)
         self.assertIsNone(epoch)
+        self.assertFalse(state_rejected)  # 五分岐 REJECTED、state 白名単には未到達
+
+
+class IntakeStatePreGateMemoTest(unittest.TestCase):
+    """simcodex Round 2 #2: 状態非対象スキップの pre-gate memo（TTL 付き）。
+
+    終態 job（POSTED 等）が継続的にスキップされる際、intake gate（Firestore
+    get_job 読取）自体を TTL 内は省く——無界の毎輪 get_job 連打を防ぐ。
+    """
+
+    def _reporter_with_state(self, state):
+        return FakeReporter({"cust:hash": _job("cust:hash", current_state=state)})
+
+    def test_second_cycle_within_ttl_makes_zero_get_job_calls(self):
+        reporter = self._reporter_with_state("POSTED")
+        writer = FakeWriter()
+        intake_state_memo = {}
+        with patch.object(reporter, "get_job", wraps=reporter.get_job) as spy, \
+             patch.object(main.config, "headless_mode", return_value=True):
+            _call_process_one_file(writer, reporter,
+                                   intake_state_memo=intake_state_memo, cycle=1)
+            self.assertEqual(spy.call_count, 1)
+            self.assertIn(("cust:hash", "f1"), intake_state_memo)
+
+            _call_process_one_file(writer, reporter,
+                                   intake_state_memo=intake_state_memo, cycle=2)
+            self.assertEqual(spy.call_count, 1)  # 二輪目は get_job 呼ばれない（DoD⑦）
+
+    def test_ttl_expiry_triggers_requery(self):
+        reporter = self._reporter_with_state("POSTED")
+        writer = FakeWriter()
+        intake_state_memo = {}
+        with patch.object(reporter, "get_job", wraps=reporter.get_job) as spy, \
+             patch.object(main.config, "headless_mode", return_value=True):
+            _call_process_one_file(writer, reporter,
+                                   intake_state_memo=intake_state_memo, cycle=1)
+            expire_cycle = intake_state_memo[("cust:hash", "f1")]["expire_cycle"]
+            self.assertEqual(expire_cycle, 1 + main._ESCALATE_MEMO_TTL_CYCLES)
+            self.assertEqual(spy.call_count, 1)
+
+            _call_process_one_file(writer, reporter,
+                                   intake_state_memo=intake_state_memo,
+                                   cycle=expire_cycle)
+            self.assertEqual(spy.call_count, 2)  # TTL 過期→再照会
+
+    def test_state_change_becomes_visible_only_after_ttl(self):
+        # POSTED（スキップ・memo 記録）→ 控制面が重投して POSTING_IN_PROGRESS
+        # へ戻すが、TTL 内は古い memo が優先されスキップされ続ける。TTL 過期後
+        # に初めて新しい状態が見え、処理が進む。
+        reporter = self._reporter_with_state("POSTED")
+        writer = FakeWriter()
+        intake_state_memo = {}
+        with patch.object(main.config, "headless_mode", return_value=True):
+            _call_process_one_file(writer, reporter,
+                                   intake_state_memo=intake_state_memo, cycle=1)
+            expire_cycle = intake_state_memo[("cust:hash", "f1")]["expire_cycle"]
+
+            reporter._jobs["cust:hash"]["current_state"] = "POSTING_IN_PROGRESS"
+
+            # TTL 内（cycle < expire_cycle）: 状態変化はまだ見えない
+            with patch.object(main, "download_file") as dl, \
+                 patch.object(main, "process_file") as pf:
+                _call_process_one_file(
+                    writer, reporter, intake_state_memo=intake_state_memo,
+                    cycle=expire_cycle - 1)
+                dl.assert_not_called()
+                pf.assert_not_called()
+
+            # TTL 過期後（cycle >= expire_cycle）: 新状態が見え、処理が進む
+            with patch.object(main, "download_file",
+                              return_value="local.pdf") as dl, \
+                 patch.object(main, "process_file",
+                              return_value=main.HeadlessOutcome(
+                                  main.ProcessOutcome.SUCCESS)), \
+                 patch.object(main, "move_file"), \
+                 patch("os.path.exists", return_value=False):
+                _call_process_one_file(
+                    writer, reporter, intake_state_memo=intake_state_memo,
+                    cycle=expire_cycle)
+                dl.assert_called_once()
 
 
 # ============================================================
@@ -165,6 +243,58 @@ class PruneHeadlessMemoTest(unittest.TestCase):
         memo = {("b1", 1, "f1"): {"outcome": "FAILED", "folder_id": "folderA"}}
         main._prune_headless_memo(memo, "folderA", files=[{"id": "f1"}])
         self.assertIn(("b1", 1, "f1"), memo)
+
+
+class PruneIntakeStateMemoTest(unittest.TestCase):
+    """simcodex Round 3 P1: `_prune_headless_memo` の file_id_index=1 分岐
+    （intake_state_memo の 2-tuple 鍵形 (base, file_id)、生産呼出しは main.py の
+    `_prune_headless_memo(intake_state_memo, input_folder_id, files, file_id_index=1)`
+    付近）が全倉未検証だった穴を埋める。PruneHeadlessMemoTest（3-tuple 鍵、
+    file_id_index 既定 2）と同型の三場景を 2-tuple 鍵形で鏡像する——鍵形
+    リファクタや file_id_index 書き間違いを検知できるようにする。
+    """
+
+    def test_other_folder_entries_not_pruned(self):
+        memo = {
+            ("b1", "f1"): {"outcome": "STATE_NOT_ALLOWED", "folder_id": "folderA"},
+            ("b2", "f2"): {"outcome": "STATE_NOT_ALLOWED", "folder_id": "folderB"},
+        }
+        # folderA の一覧に f1 が無い（消えた）→ folderA 分のみ剪定
+        main._prune_headless_memo(memo, "folderA", files=[], file_id_index=1)
+        self.assertNotIn(("b1", "f1"), memo)
+        self.assertIn(("b2", "f2"), memo)  # folderB は無関係、誤剪なし
+
+    def test_folder_listing_failure_means_prune_never_called(self):
+        # 「夾列舉失敗不剪」は呼出順序で自然に満たされる契約——list_files が
+        # 例外送出したら呼出元は本関数を呼ばない。呼ばれなければ memo は無傷。
+        memo = {("b1", "f1"): {"outcome": "STATE_NOT_ALLOWED", "folder_id": "folderA"}}
+        original = dict(memo)
+        self.assertEqual(memo, original)
+
+    def test_file_disappearing_across_cycles_gets_pruned(self):
+        memo = {}
+        # cycle1: f1 が一覧にある → まだ剪定対象ではない
+        main._prune_headless_memo(memo, "folderA", files=[{"id": "f1"}],
+                                  file_id_index=1)
+        memo[("b1", "f1")] = {"outcome": "STATE_NOT_ALLOWED", "folder_id": "folderA"}
+        # cycle2: f1 が一覧から消えた（アーカイブ済み等）→ 剪定される
+        main._prune_headless_memo(memo, "folderA", files=[{"id": "f2"}],
+                                  file_id_index=1)
+        self.assertNotIn(("b1", "f1"), memo)
+
+    def test_file_still_present_is_not_pruned(self):
+        memo = {("b1", "f1"): {"outcome": "STATE_NOT_ALLOWED", "folder_id": "folderA"}}
+        main._prune_headless_memo(memo, "folderA", files=[{"id": "f1"}],
+                                  file_id_index=1)
+        self.assertIn(("b1", "f1"), memo)
+
+    def test_wrong_default_index_would_misbehave_on_two_tuple_key(self):
+        # file_id_index を渡し忘れる（既定 2）と 2-tuple 鍵で IndexError になる
+        # ことを固定——将来の呼出し側リファクタで既定値のまま呼んでしまう
+        # 事故（本 P1 の懸念そのもの）を早期に検知する回帰ガード。
+        memo = {("b1", "f1"): {"outcome": "STATE_NOT_ALLOWED", "folder_id": "folderA"}}
+        with self.assertRaises(IndexError):
+            main._prune_headless_memo(memo, "folderA", files=[])
 
 
 class HeadlessMemoSkipTest(unittest.TestCase):
@@ -217,7 +347,7 @@ class RecordHeadlessMemoTest(unittest.TestCase):
 
 class ReportHeadlessOutcomeTest(unittest.TestCase):
     def test_success_calls_report_posted_once_with_epoch(self):
-        reporter = _FakeReporter()
+        reporter = FakeReporter()
         outcome = main.HeadlessOutcome(main.ProcessOutcome.SUCCESS)
         label, expire = main._report_headless_outcome(
             reporter, "cust:hash", 7, outcome, "f1", cycle=1)
@@ -227,7 +357,7 @@ class ReportHeadlessOutcomeTest(unittest.TestCase):
         self.assertIsNone(expire)
 
     def test_dead_letter_calls_report_dead_letter_once_with_payload(self):
-        reporter = _FakeReporter()
+        reporter = FakeReporter()
         payload = {"stage": "ocr", "error_class": "NON_RETRYABLE",
                    "message": "all_pages_unreadable: 2/2 pages [p1,p2]"}
         outcome = main.HeadlessOutcome(main.ProcessOutcome.DEAD_LETTER,
@@ -240,7 +370,7 @@ class ReportHeadlessOutcomeTest(unittest.TestCase):
         self.assertEqual(label, "DEAD_LETTER")
 
     def test_partial_makes_zero_reporter_calls(self):
-        reporter = _FakeReporter()
+        reporter = FakeReporter()
         outcome = main.HeadlessOutcome(main.ProcessOutcome.PARTIAL)
         label, expire = main._report_headless_outcome(
             reporter, "cust:hash", 1, outcome, "f1", cycle=1)
@@ -249,7 +379,7 @@ class ReportHeadlessOutcomeTest(unittest.TestCase):
         self.assertEqual(label, "PARTIAL")
 
     def test_escalated_makes_zero_reporter_calls_and_sets_ttl(self):
-        reporter = _FakeReporter()
+        reporter = FakeReporter()
         outcome = main.HeadlessOutcome(main.ProcessOutcome.ESCALATED)
         label, expire = main._report_headless_outcome(
             reporter, "cust:hash", 1, outcome, "f1", cycle=5)
@@ -259,7 +389,7 @@ class ReportHeadlessOutcomeTest(unittest.TestCase):
         self.assertEqual(expire, 5 + main._ESCALATE_MEMO_TTL_CYCLES)
 
     def test_failed_retryable_makes_zero_reporter_calls_and_no_memo(self):
-        reporter = _FakeReporter()
+        reporter = FakeReporter()
         outcome = main.HeadlessOutcome(main.ProcessOutcome.FAILED, retryable=True)
         label, expire = main._report_headless_outcome(
             reporter, "cust:hash", 1, outcome, "f1", cycle=1)
@@ -267,7 +397,7 @@ class ReportHeadlessOutcomeTest(unittest.TestCase):
         self.assertIsNone(label)  # 不記（3秒自癒窗）
 
     def test_failed_not_retryable_makes_zero_reporter_calls_but_memos(self):
-        reporter = _FakeReporter()
+        reporter = FakeReporter()
         outcome = main.HeadlessOutcome(main.ProcessOutcome.FAILED, retryable=False)
         label, expire = main._report_headless_outcome(
             reporter, "cust:hash", 1, outcome, "f1", cycle=1)
@@ -275,25 +405,30 @@ class ReportHeadlessOutcomeTest(unittest.TestCase):
         self.assertEqual(label, "FAILED")  # 記（per epoch、隨重投放行）
 
     def test_missing_epoch_success_makes_zero_reporter_calls(self):
-        reporter = _FakeReporter()
+        reporter = FakeReporter()
         outcome = main.HeadlessOutcome(main.ProcessOutcome.SUCCESS)
         label, expire = main._report_headless_outcome(
             reporter, "cust:hash", None, outcome, "f1", cycle=1)
         self.assertEqual(reporter.report_posted_calls, [])  # epoch欠落→零呼出
+        # simcodex Round 2 #1: 実際には報告していないので "SUCCESS" と偽記しない
+        self.assertEqual(label, main._MEMO_LABEL_EPOCH_MISSING)
+        self.assertNotEqual(label, "SUCCESS")
 
     def test_missing_epoch_dead_letter_makes_zero_reporter_calls(self):
-        reporter = _FakeReporter()
+        reporter = FakeReporter()
         payload = {"stage": "ocr", "error_class": "NON_RETRYABLE", "message": "x"}
         outcome = main.HeadlessOutcome(main.ProcessOutcome.DEAD_LETTER,
                                        dead_letter_payload=payload)
         label, expire = main._report_headless_outcome(
             reporter, "cust:hash", None, outcome, "f1", cycle=1)
         self.assertEqual(reporter.report_dead_letter_calls, [])  # epoch欠落→零呼出
+        self.assertEqual(label, main._MEMO_LABEL_EPOCH_MISSING)
+        self.assertNotEqual(label, "DEAD_LETTER")
 
     def test_rejected_result_still_only_calls_once_no_retry(self):
         # REJECTED（stale epoch 等）でも SS は不重試——firestore_report 側が
         # 一回の事務で完結する契約（本モジュールはただ一度呼ぶだけ）。
-        class _RejectingReporter(_FakeReporter):
+        class _RejectingReporter(FakeReporter):
             def report_posted(self, job_id, *, lease_epoch):
                 self.report_posted_calls.append((job_id, lease_epoch))
                 return "REJECTED"  # 呼出し回数だけが契約、戻り値は判断材料にしない
@@ -308,242 +443,172 @@ class ReportHeadlessOutcomeTest(unittest.TestCase):
 # DoD①②⑤⑥⑨: _process_one_file 統合（main() for file in files: の抽出体）
 # ============================================================
 
+@contextmanager
+def _patch_file_processing(*, process_return=True, download_return="local.pdf",
+                           duplicate_return=False, headless=True, path_exists=False):
+    """ProcessOneFileTest 共用の patch 足場（simcodex Round 1 #11、12 メソッド
+    近同 5 行複製の集約）。download_file/process_file/move_file/
+    is_duplicate_file/os.path.exists を一括 patch し、Mock を
+    `types.SimpleNamespace` で返す（各テストは戻り値の属性で呼出しを検証）。
+    headless=True なら config.headless_mode も True に固定する
+    （UI 経路テストは headless=False で main.config 自体を触らない）。
+    """
+    with ExitStack() as stack:
+        dl = stack.enter_context(
+            patch.object(main, "download_file", return_value=download_return))
+        pf = stack.enter_context(
+            patch.object(main, "process_file", return_value=process_return))
+        mv = stack.enter_context(patch.object(main, "move_file"))
+        dup = stack.enter_context(
+            patch.object(main, "is_duplicate_file", return_value=duplicate_return))
+        stack.enter_context(patch("os.path.exists", return_value=path_exists))
+        if headless:
+            stack.enter_context(
+                patch.object(main.config, "headless_mode", return_value=True))
+        yield types.SimpleNamespace(
+            download_file=dl, process_file=pf, move_file=mv, is_duplicate_file=dup)
+
+
 class ProcessOneFileTest(unittest.TestCase):
     def _writer(self):
         return FakeWriter()
 
+    def _call(self, writer, reporter, *, file=None, headless_memo=None,
+             intake_state_memo=None, cycle=1):
+        _call_process_one_file(
+            writer, reporter, file=file, headless_memo=headless_memo,
+            intake_state_memo=intake_state_memo, cycle=cycle)
+
     def test_success_calls_report_posted_and_never_moves(self):
-        reporter = _FakeReporter({"cust:hash": _job("cust:hash", lease_epoch=9)})
+        reporter = FakeReporter({"cust:hash": _job("cust:hash", lease_epoch=9)})
         writer = self._writer()
         headless_memo = {}
-        with patch.object(main, "download_file", return_value="local.pdf") as dl, \
-             patch.object(main, "process_file",
-                          return_value=main.HeadlessOutcome(main.ProcessOutcome.SUCCESS)), \
-             patch.object(main, "move_file") as mv, \
-             patch.object(main, "is_duplicate_file") as dup, \
-             patch.object(main.config, "headless_mode", return_value=True), \
-             patch("os.path.exists", return_value=False):
-            main._process_one_file(
-                service=None, writer=writer, reporter=reporter,
-                file=_file(), input_folder_id="in", doc_type="receipt",
-                processed_folder_id="processed", split_pdf_folder_id="split",
-                quarantine_alerted={}, headless_memo=headless_memo, cycle=1)
-        dl.assert_called_once()
-        mv.assert_not_called()                      # DoD①: move 零呼出
-        dup.assert_not_called()                      # DoD⑥: is_duplicate_file 零呼出
+        with _patch_file_processing(
+                process_return=main.HeadlessOutcome(main.ProcessOutcome.SUCCESS)) as p:
+            self._call(writer, reporter, headless_memo=headless_memo)
+        p.download_file.assert_called_once()
+        p.move_file.assert_not_called()               # DoD①: move 零呼出
+        p.is_duplicate_file.assert_not_called()        # DoD⑥: is_duplicate_file 零呼出
         self.assertEqual(reporter.report_posted_calls, [("cust:hash", 9)])
         self.assertEqual(headless_memo[("cust:hash", 9, "f1")]["outcome"], "SUCCESS")
 
     def test_dead_letter_calls_report_dead_letter_and_never_moves(self):
-        reporter = _FakeReporter({"cust:hash": _job("cust:hash", lease_epoch=2)})
+        reporter = FakeReporter({"cust:hash": _job("cust:hash", lease_epoch=2)})
         writer = self._writer()
         payload = {"stage": "ocr", "error_class": "NON_RETRYABLE", "message": "x"}
-        with patch.object(main, "download_file", return_value="local.pdf"), \
-             patch.object(main, "process_file",
-                          return_value=main.HeadlessOutcome(
-                              main.ProcessOutcome.DEAD_LETTER, dead_letter_payload=payload)), \
-             patch.object(main, "move_file") as mv, \
-             patch.object(main.config, "headless_mode", return_value=True), \
-             patch("os.path.exists", return_value=False):
-            main._process_one_file(
-                service=None, writer=writer, reporter=reporter,
-                file=_file(), input_folder_id="in", doc_type="receipt",
-                processed_folder_id="processed", split_pdf_folder_id="split",
-                quarantine_alerted={}, headless_memo={}, cycle=1)
-        mv.assert_not_called()
+        outcome = main.HeadlessOutcome(
+            main.ProcessOutcome.DEAD_LETTER, dead_letter_payload=payload)
+        with _patch_file_processing(process_return=outcome) as p:
+            self._call(writer, reporter)
+        p.move_file.assert_not_called()
         self.assertEqual(reporter.report_dead_letter_calls, [("cust:hash", 2, payload)])
 
     def test_partial_makes_zero_reporter_calls_and_never_moves(self):
-        reporter = _FakeReporter({"cust:hash": _job("cust:hash")})
+        reporter = FakeReporter({"cust:hash": _job("cust:hash")})
         writer = self._writer()
-        with patch.object(main, "download_file", return_value="local.pdf"), \
-             patch.object(main, "process_file",
-                          return_value=main.HeadlessOutcome(main.ProcessOutcome.PARTIAL)), \
-             patch.object(main, "move_file") as mv, \
-             patch.object(main.config, "headless_mode", return_value=True), \
-             patch("os.path.exists", return_value=False):
-            main._process_one_file(
-                service=None, writer=writer, reporter=reporter,
-                file=_file(), input_folder_id="in", doc_type="receipt",
-                processed_folder_id="processed", split_pdf_folder_id="split",
-                quarantine_alerted={}, headless_memo={}, cycle=1)
-        mv.assert_not_called()
+        outcome = main.HeadlessOutcome(main.ProcessOutcome.PARTIAL)
+        with _patch_file_processing(process_return=outcome) as p:
+            self._call(writer, reporter)
+        p.move_file.assert_not_called()
         self.assertEqual(reporter.report_posted_calls, [])
         self.assertEqual(reporter.report_dead_letter_calls, [])
 
     def test_escalated_makes_zero_reporter_calls_and_never_moves(self):
-        reporter = _FakeReporter({"cust:hash": _job("cust:hash")})
+        reporter = FakeReporter({"cust:hash": _job("cust:hash")})
         writer = self._writer()
-        with patch.object(main, "download_file", return_value="local.pdf"), \
-             patch.object(main, "process_file",
-                          return_value=main.HeadlessOutcome(main.ProcessOutcome.ESCALATED)), \
-             patch.object(main, "move_file") as mv, \
-             patch.object(main.config, "headless_mode", return_value=True), \
-             patch("os.path.exists", return_value=False):
-            main._process_one_file(
-                service=None, writer=writer, reporter=reporter,
-                file=_file(), input_folder_id="in", doc_type="receipt",
-                processed_folder_id="processed", split_pdf_folder_id="split",
-                quarantine_alerted={}, headless_memo={}, cycle=1)
-        mv.assert_not_called()
+        outcome = main.HeadlessOutcome(main.ProcessOutcome.ESCALATED)
+        with _patch_file_processing(process_return=outcome) as p:
+            self._call(writer, reporter)
+        p.move_file.assert_not_called()
         self.assertEqual(reporter.report_posted_calls, [])
 
     def test_missing_epoch_success_zero_reporter_calls_and_never_moves(self):
         # job に lease_epoch キーが無い旧 schema 想定 → epoch=None（違約態）
-        reporter = _FakeReporter({"cust:hash": {"posting_id": "cust:hash",
+        reporter = FakeReporter({"cust:hash": {"posting_id": "cust:hash",
                                                 "current_state": "POSTING_IN_PROGRESS"}})
         writer = self._writer()
-        with patch.object(main, "download_file", return_value="local.pdf"), \
-             patch.object(main, "process_file",
-                          return_value=main.HeadlessOutcome(main.ProcessOutcome.SUCCESS)), \
-             patch.object(main, "move_file") as mv, \
-             patch.object(main.config, "headless_mode", return_value=True), \
-             patch("os.path.exists", return_value=False):
-            main._process_one_file(
-                service=None, writer=writer, reporter=reporter,
-                file=_file(), input_folder_id="in", doc_type="receipt",
-                processed_folder_id="processed", split_pdf_folder_id="split",
-                quarantine_alerted={}, headless_memo={}, cycle=1)
-        mv.assert_not_called()
+        outcome = main.HeadlessOutcome(main.ProcessOutcome.SUCCESS)
+        headless_memo = {}
+        with _patch_file_processing(process_return=outcome) as p:
+            self._call(writer, reporter, headless_memo=headless_memo)
+        p.move_file.assert_not_called()
         self.assertEqual(reporter.report_posted_calls, [])  # epoch 欠落→零呼出
+        # simcodex Round 2 #1: memo に "SUCCESS" と偽記していないことを確認
+        self.assertEqual(headless_memo[("cust:hash", None, "f1")]["outcome"],
+                         main._MEMO_LABEL_EPOCH_MISSING)
 
     def test_memo_hit_skips_download_and_process_file(self):
-        reporter = _FakeReporter({"cust:hash": _job("cust:hash", lease_epoch=1)})
+        reporter = FakeReporter({"cust:hash": _job("cust:hash", lease_epoch=1)})
         writer = self._writer()
         headless_memo = {("cust:hash", 1, "f1"):
                          {"outcome": "FAILED", "folder_id": "in", "expire_cycle": None}}
-        with patch.object(main, "download_file") as dl, \
-             patch.object(main, "process_file") as pf, \
-             patch.object(main.config, "headless_mode", return_value=True):
-            main._process_one_file(
-                service=None, writer=writer, reporter=reporter,
-                file=_file(), input_folder_id="in", doc_type="receipt",
-                processed_folder_id="processed", split_pdf_folder_id="split",
-                quarantine_alerted={}, headless_memo=headless_memo, cycle=1)
-        dl.assert_not_called()   # DoD⑦: 零下載
-        pf.assert_not_called()   # DoD⑦: 零OCR（process_file 呼出も無い）
+        with _patch_file_processing() as p:
+            self._call(writer, reporter, headless_memo=headless_memo)
+        p.download_file.assert_not_called()   # DoD⑦: 零下載
+        p.process_file.assert_not_called()    # DoD⑦: 零OCR（process_file 呼出も無い）
 
     def test_intake_state_not_posting_in_progress_skips_download(self):
-        reporter = _FakeReporter({"cust:hash": _job("cust:hash", current_state="POSTED")})
+        reporter = FakeReporter({"cust:hash": _job("cust:hash", current_state="POSTED")})
         writer = self._writer()
-        with patch.object(main, "download_file") as dl, \
-             patch.object(main, "process_file") as pf, \
-             patch.object(main.config, "headless_mode", return_value=True):
-            main._process_one_file(
-                service=None, writer=writer, reporter=reporter,
-                file=_file(), input_folder_id="in", doc_type="receipt",
-                processed_folder_id="processed", split_pdf_folder_id="split",
-                quarantine_alerted={}, headless_memo={}, cycle=1)
-        dl.assert_not_called()
-        pf.assert_not_called()
+        with _patch_file_processing() as p:
+            self._call(writer, reporter)
+        p.download_file.assert_not_called()
+        p.process_file.assert_not_called()
 
     def test_headless_mode_never_calls_is_duplicate_file(self):
-        reporter = _FakeReporter({"cust:hash": _job("cust:hash")})
+        reporter = FakeReporter({"cust:hash": _job("cust:hash")})
         writer = self._writer()
-        with patch.object(main, "download_file", return_value="local.pdf"), \
-             patch.object(main, "process_file",
-                          return_value=main.HeadlessOutcome(main.ProcessOutcome.SUCCESS)), \
-             patch.object(main, "move_file"), \
-             patch.object(main, "is_duplicate_file") as dup, \
-             patch.object(main.config, "headless_mode", return_value=True), \
-             patch("os.path.exists", return_value=False):
-            main._process_one_file(
-                service=None, writer=writer, reporter=reporter,
-                file=_file(), input_folder_id="in", doc_type="receipt",
-                processed_folder_id="processed", split_pdf_folder_id="split",
-                quarantine_alerted={}, headless_memo={}, cycle=1)
-        dup.assert_not_called()
+        outcome = main.HeadlessOutcome(main.ProcessOutcome.SUCCESS)
+        with _patch_file_processing(process_return=outcome) as p:
+            self._call(writer, reporter)
+        p.is_duplicate_file.assert_not_called()
 
     def test_ui_path_true_outcome_still_moves_file(self):
         # UI 版（reporter=None）は既存挙動不変: True→move、is_duplicate_file は
         # 通常経路で呼ばれ、False なら move されない。
         writer = self._writer()
-        with patch.object(main, "download_file", return_value="local.pdf"), \
-             patch.object(main, "process_file", return_value=True), \
-             patch.object(main, "move_file") as mv, \
-             patch.object(main, "is_duplicate_file", return_value=False) as dup, \
-             patch("os.path.exists", return_value=False):
-            main._process_one_file(
-                service=None, writer=writer, reporter=None,
-                file=_file(), input_folder_id="in", doc_type="receipt",
-                processed_folder_id="processed", split_pdf_folder_id="split",
-                quarantine_alerted={}, headless_memo={}, cycle=1)
-        dup.assert_called_once()
-        mv.assert_called_once()
+        with _patch_file_processing(process_return=True, headless=False) as p:
+            self._call(writer, None)
+        p.is_duplicate_file.assert_called_once()
+        p.move_file.assert_called_once()
         self.assertEqual(writer.start_new_file_calls[0][2], "invoice.pdf")
 
     def test_ui_path_duplicate_file_moves_and_skips_processing(self):
         writer = self._writer()
-        with patch.object(main, "is_duplicate_file", return_value=True), \
-             patch.object(main, "move_file") as mv, \
-             patch.object(main, "download_file") as dl, \
-             patch.object(main, "process_file") as pf:
-            main._process_one_file(
-                service=None, writer=writer, reporter=None,
-                file=_file(), input_folder_id="in", doc_type="receipt",
-                processed_folder_id="processed", split_pdf_folder_id="split",
-                quarantine_alerted={}, headless_memo={}, cycle=1)
-        mv.assert_called_once()
-        dl.assert_not_called()
-        pf.assert_not_called()
+        with _patch_file_processing(duplicate_return=True, headless=False) as p:
+            self._call(writer, None)
+        p.move_file.assert_called_once()
+        p.download_file.assert_not_called()
+        p.process_file.assert_not_called()
 
     def test_ui_path_false_outcome_does_not_move(self):
         writer = self._writer()
-        with patch.object(main, "download_file", return_value="local.pdf"), \
-             patch.object(main, "process_file", return_value=False), \
-             patch.object(main, "move_file") as mv, \
-             patch.object(main, "is_duplicate_file", return_value=False), \
-             patch("os.path.exists", return_value=False):
-            main._process_one_file(
-                service=None, writer=writer, reporter=None,
-                file=_file(), input_folder_id="in", doc_type="receipt",
-                processed_folder_id="processed", split_pdf_folder_id="split",
-                quarantine_alerted={}, headless_memo={}, cycle=1)
-        mv.assert_not_called()
+        with _patch_file_processing(process_return=False, headless=False) as p:
+            self._call(writer, None)
+        p.move_file.assert_not_called()
 
     def test_unsupported_format_skips_download_without_separator(self):
         # 3. 格式過濾（既存挙動: 未対応拡張子は download_file にすら進まない）
         writer = self._writer()
         file = {"id": "f1", "name": "invoice.exe",
                 "properties": {"sandevistan_posting_id": "cust:hash"}}
-        with patch.object(main, "download_file") as dl, \
-             patch.object(main, "process_file") as pf, \
-             patch.object(main, "is_duplicate_file", return_value=False):
-            main._process_one_file(
-                service=None, writer=writer, reporter=None,
-                file=file, input_folder_id="in", doc_type="receipt",
-                processed_folder_id="processed", split_pdf_folder_id="split",
-                quarantine_alerted={}, headless_memo={}, cycle=1)
-        dl.assert_not_called()
-        pf.assert_not_called()
+        with _patch_file_processing(headless=False) as p:
+            self._call(writer, None, file=file)
+        p.download_file.assert_not_called()
+        p.process_file.assert_not_called()
 
     def test_flush_always_called(self):
         writer = self._writer()
-        with patch.object(main, "download_file", return_value="local.pdf"), \
-             patch.object(main, "process_file", return_value=True), \
-             patch.object(main, "move_file"), \
-             patch.object(main, "is_duplicate_file", return_value=False), \
-             patch("os.path.exists", return_value=False):
-            main._process_one_file(
-                service=None, writer=writer, reporter=None,
-                file=_file(), input_folder_id="in", doc_type="receipt",
-                processed_folder_id="processed", split_pdf_folder_id="split",
-                quarantine_alerted={}, headless_memo={}, cycle=1)
+        with _patch_file_processing(process_return=True, headless=False):
+            self._call(writer, None)
         self.assertEqual(writer.flush_calls, 1)
 
     def test_local_temp_file_removed_when_it_exists(self):
         writer = self._writer()
-        with patch.object(main, "download_file", return_value="local.pdf"), \
-             patch.object(main, "process_file", return_value=True), \
-             patch.object(main, "move_file"), \
-             patch.object(main, "is_duplicate_file", return_value=False), \
-             patch("os.path.exists", return_value=True), \
+        with _patch_file_processing(process_return=True, headless=False,
+                                    path_exists=True), \
              patch("os.remove") as rm:
-            main._process_one_file(
-                service=None, writer=writer, reporter=None,
-                file=_file(), input_folder_id="in", doc_type="receipt",
-                processed_folder_id="processed", split_pdf_folder_id="split",
-                quarantine_alerted={}, headless_memo={}, cycle=1)
+            self._call(writer, None)
         rm.assert_called_once_with("local.pdf")
 
 
