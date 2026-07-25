@@ -158,22 +158,34 @@ class HeadlessRerunFixture:
     Firestore/Sheets は永続、という本番の崩潰復帰を再現）。
     """
 
-    def __init__(self, base=DEFAULT_BASE, uploader=DEFAULT_UPLOADER):
+    def __init__(self, base=DEFAULT_BASE, uploader=DEFAULT_UPLOADER, reporter=None):
         self.fs = FakeFirestore()
         self.writer = FakeWriter()
         self.base = base
         self.uploader = uploader
+        # B4 T5 適配（IP-305 斷點續跑）: report 層の fake（任意、既定 None＝
+        # 従来通り process_file 層のみ駆動）。設定時は run() が
+        # main._report_headless_outcome も駆動し、report_log に記録する。
+        self.reporter = reporter
+        self.report_log: list = []
 
     def new_ledger(self, runner=None):
         return make_ledger(self.fs, self.writer, self.base, runner)
 
-    def run(self, page_yields, *, crash_commit_on=None, crash_confirm=False):
+    def run(self, page_yields, *, crash_commit_on=None, crash_confirm=False,
+           lease_epoch=None, cycle=1, file_id="fixture-file"):
         """1 回の process_file 実行（毎回 new_ledger＝プロセス再起動を模す）。
 
         crash_commit_on=N → N 回目の commit_page で RuntimeError（append 直前 kill）。
         crash_confirm=True → CONFIRMED 直前（post_page の 2 回目 txn）で 1 度 kill。
         どちらも None/False なら正常実行。kill モードは注入層が違う（writer 差替 vs
         runner 差替）ため分岐するが、実行本体は 1 つの run_headless に集約する。
+
+        self.reporter が設定されていれば、process_file の戻り値
+        （HeadlessOutcome）を main._report_headless_outcome へそのまま渡し
+        （lease_epoch/cycle 指定可）、report_log に (outcome_label, expire_cycle)
+        を追記する——IP-305 の断点続跑シナリオで「report 層まで通した」ことを
+        同一夾具で検証できるようにする（B4 Plan T5、夾具適配は明示許容）。
         """
         writer = self.writer
         runner = None
@@ -204,11 +216,18 @@ class HeadlessRerunFixture:
             runner = flaky
 
         try:
-            return run_headless(writer, self.new_ledger(runner), page_yields,
-                                self.base, self.uploader)
+            outcome = run_headless(writer, self.new_ledger(runner), page_yields,
+                                   self.base, self.uploader)
         finally:
             if restore is not None:
                 restore()
+
+        if self.reporter is not None:
+            label, expire = main._report_headless_outcome(
+                self.reporter, self.base, lease_epoch, outcome, file_id, cycle)
+            self.report_log.append((label, expire))
+
+        return outcome
 
     def landed_rows(self):
         return self.writer.sheets.get(_TAB, [])
