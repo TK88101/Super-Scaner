@@ -531,6 +531,21 @@ class ProcessOneFileTest(unittest.TestCase):
                 quarantine_alerted={}, headless_memo={}, cycle=1)
         self.assertEqual(writer.flush_calls, 1)
 
+    def test_local_temp_file_removed_when_it_exists(self):
+        writer = self._writer()
+        with patch.object(main, "download_file", return_value="local.pdf"), \
+             patch.object(main, "process_file", return_value=True), \
+             patch.object(main, "move_file"), \
+             patch.object(main, "is_duplicate_file", return_value=False), \
+             patch("os.path.exists", return_value=True), \
+             patch("os.remove") as rm:
+            main._process_one_file(
+                service=None, writer=writer, reporter=None,
+                file=_file(), input_folder_id="in", doc_type="receipt",
+                processed_folder_id="processed", split_pdf_folder_id="split",
+                quarantine_alerted={}, headless_memo={}, cycle=1)
+        rm.assert_called_once_with("local.pdf")
+
 
 if __name__ == "__main__":
     unittest.main()
