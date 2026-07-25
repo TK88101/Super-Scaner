@@ -103,9 +103,20 @@ def page(page_num, total, vendor, amount, extra=None):
             "page_bytes": b"x"}
 
 
-def error_page(page_num, total):
-    """再試可能な頁エラー（_page_error）の pipeline yield 相当 dict。"""
-    return {"result": {"_page_error": True}, "page_num": page_num,
+def error_page(page_num, total, error_class="CONTENT"):
+    """頁エラー（_page_error）の pipeline yield 相当 dict（B4 T3/T4/T5 適配）。
+
+    error_class 既定 "CONTENT"（占位頁として頁緩衝に入り書込対象になる、
+    旧 error_page 呼び出し元の「部分失敗でも可視化されて処理は続く」という
+    意図を新語義でも保つ）。"RETRYABLE"/"UNKNOWN" 指定で暫時故障/未知故障
+    （零書込）を模せる。error_class=None は _error_class キー自体を省略し、
+    消費側デフォルト（main._classify_page_result_shape の "UNKNOWN" 倒し、
+    B4 Plan §2.1）を検証する経路に使う。
+    """
+    result: dict = {"_page_error": True, "entries": [], "_unrecognized": True}
+    if error_class is not None:
+        result["_error_class"] = error_class
+    return {"result": result, "page_num": page_num,
             "total_pages": total, "page_bytes": b""}
 
 

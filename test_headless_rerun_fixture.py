@@ -16,11 +16,11 @@ from headless_rerun_fixture import HeadlessRerunFixture, pages
 class FixtureDrivesIdempotencyTest(unittest.TestCase):
     def test_dod1_double_run_no_new_rows(self):
         fx = HeadlessRerunFixture()
-        self.assertIs(fx.run(pages(3)), main.ProcessOutcome.SUCCESS)
+        self.assertIs(fx.run(pages(3)).outcome, main.ProcessOutcome.SUCCESS)
         self.assertEqual(fx.landed_row_count(), 3)
         appends = fx.append_calls()
 
-        self.assertIs(fx.run(pages(3)), main.ProcessOutcome.SUCCESS)  # 二跑
+        self.assertIs(fx.run(pages(3)).outcome, main.ProcessOutcome.SUCCESS)  # 二跑
         self.assertEqual(fx.landed_row_count(), 3)          # 零新增行
         self.assertEqual(fx.append_calls(), appends)        # append ゼロ増
 
@@ -35,7 +35,7 @@ class FixtureDrivesIdempotencyTest(unittest.TestCase):
                 self.assertEqual(fx.landed_row_count(), kill_page - 1)
 
                 out = fx.run(pages(3))  # 再跑（正常）
-                self.assertIs(out, main.ProcessOutcome.SUCCESS)
+                self.assertIs(out.outcome, main.ProcessOutcome.SUCCESS)
                 sheet = fx.landed_rows()
                 self.assertEqual(len(sheet), 3)                       # 半書なし・重複なし
                 self.assertEqual([r[1] for r in sheet], ["店1", "店2", "店3"])
@@ -48,7 +48,7 @@ class FixtureDrivesIdempotencyTest(unittest.TestCase):
         self.assertEqual(fx.landed_row_count(), 1)   # landed 済み・台賬 PENDING
 
         out = fx.run(pages(1))                        # 再跑
-        self.assertIs(out, main.ProcessOutcome.SUCCESS)
+        self.assertIs(out.outcome, main.ProcessOutcome.SUCCESS)
         self.assertEqual(fx.landed_row_count(), 1)   # 補 CONFIRMED・重複なし
 
     def test_multi_page_scales(self):

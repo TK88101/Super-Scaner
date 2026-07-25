@@ -4,6 +4,7 @@ import time
 import io
 import random
 import re
+from dataclasses import dataclass
 from enum import Enum
 
 # Windows console encoding fix
@@ -356,15 +357,41 @@ def is_duplicate_file(service, md5_checksum, processed_folder_id):
 
 
 class ProcessOutcome(Enum):
-    """headless process_file の三態（定稿 Plan §9 D4' #11）。UI 経路は現状 bool を返す。"""
+    """headless process_file の五態（B4 Plan §2.3、PARTIAL/DEAD_LETTER 追加）。
+    UI 経路は現状 bool を返す。"""
 
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
     ESCALATED = "ESCALATED"
+    PARTIAL = "PARTIAL"
+    DEAD_LETTER = "DEAD_LETTER"
+
+
+@dataclass(frozen=True)
+class HeadlessOutcome:
+    """process_file(ledger=...) の戻り値（headless 専有、B4 Plan §2.3、T3/T4 共用）。
+
+    outcome：ProcessOutcome。
+    retryable：outcome が FAILED のとき、RETRYABLE 頁由来なら True（3秒自癒窗・
+    memo 不記）、UNKNOWN 頁由来なら False（memo 記、控制面重投でのみ再試行）。
+    他 outcome では意味を持たない（既定 False）——T4 の memo 書込み判定材料。
+    dead_letter_payload：outcome が DEAD_LETTER のときのみ非 None
+    （reporter.report_dead_letter(error=...) にそのまま渡す、§2.3 payload 釘死）。
+    """
+
+    outcome: ProcessOutcome
+    retryable: bool = False
+    dead_letter_payload: dict | None = None
 
 
 def _extract_tickets(results):
-    """頁内の各 result を F59 対账 advisory の 1 票 TicketSummary へ（去重键には非使用）。"""
+    """頁内の各 result を F59 対账 advisory の 1 票 TicketSummary へ（去重键には非使用）。
+
+    ticket_count の語義釘死（B4 Plan §2.2）＝有効入賬票数のみ。entries が空の
+    result（占位頁・認識不能頁）は票として数えない——占位頁の台賬記録が
+    ticket_count=0 になることで、後続の重跑輪が「真に入賬済み」か「占位頁」
+    かを confirmed_ticket_count() の値だけで自証できる。
+    """
     from posting_ledger import TicketSummary
     from receipt_aggregation import sum_row_amounts
     return [
@@ -373,7 +400,7 @@ def _extract_tickets(results):
             amount=sum_row_amounts(r.get("entries", []) or []),
             vendor=r.get("vendor", "") or "",
         )
-        for r in results
+        for r in results if r.get("entries")
     ]
 
 
@@ -383,7 +410,9 @@ def _flush_page(writer, ledger, base, doc_type, uploader_name, page_num,
 
     check_page で SKIP（既 CONFIRMED/witness PRESENT）→ 何も書かない（硬去重）。
     ESCALATE（witness 不確実）→ 呼出側でファイル保持・回報せず。WRITE → build_page_write
-    →（PENDING→append→CONFIRMED）を ledger.post_page が原子封装。
+    →（PENDING→append→CONFIRMED）を ledger.post_page が原子封装。results が
+    全件 entries 空（占位頁）でも build_page_write は _build_unrecognized_block
+    で占位行 1 行を天然生成する（sheets_output.py 零改動、B4 Plan §2.2）。
     """
     from posting_ledger import derive_page_id, PageDecision, PagePostingSummary
     from sheets_output import compute_page_fingerprint
@@ -416,13 +445,171 @@ def _flush_page(writer, ledger, base, doc_type, uploader_name, page_num,
     return "written"
 
 
+# B4 Plan §2.3: 頁級 outcome の分類（"種別" 文字列、main 内部専用の軽量タグ）。
+_PLACEHOLDER_KINDS = frozenset({"PLACEHOLDER_WRITTEN", "PLACEHOLDER_PRIOR"})
+_POSTED_KINDS = frozenset({"POSTED_NOW", "POSTED_PRIOR"})
+
+
+def _classify_page_result_shape(results):
+    """頁緩衝（同一 page_num の全 yield）の形状を分類する（§2.2/§2.3、純関数）。
+
+    戻り値は (kind, detail) のいずれか：
+        ("error", "RETRYABLE"|"UNKNOWN") — 頁エラー（transport/未知例外、単独 result）
+        ("content_error", None)          — 頁エラー（CONTENT、票面不可読、単独 result）
+        ("valid", None)                  — 全 result が有効仕訳（entries 非空）
+        ("placeholder", None)            — 全 result が認識不能（entries 空、非エラー）
+        ("escalate", reason)             — 不変式破れ（混型頁/error 共存、頁号重現とは別軸）
+
+    _error_class 欠落／未知値は保守的に "UNKNOWN"（B4 Plan §2.1 消費側デフォルト
+    ——CONTENT/DEAD_LETTER には倒さない、認証エラー等の全夾 DEAD_LETTER 風暴防止）。
+    """
+    error_results = [r for r in results if r.get("_page_error")]
+    if error_results:
+        if len(results) != 1:
+            # 同頁に error と他 result が並存（現行 ocr_engine では起こらないが
+            # 将来の生成器変更に対する防御的不変式、Codex 初審 #14 と同族）
+            return ("escalate", "mixed_error_and_other_result")
+        error_class = error_results[0].get("_error_class") or "UNKNOWN"
+        if error_class not in ("RETRYABLE", "UNKNOWN", "CONTENT"):
+            error_class = "UNKNOWN"
+        if error_class == "CONTENT":
+            return ("content_error", None)
+        return ("error", error_class)
+
+    valid = [r for r in results if r.get("entries")]
+    zero = [r for r in results if not r.get("entries")]
+    if valid and zero:
+        # 混型頁（Codex 複審 #14 採択）: ticket_count>0 が完全性を自証できなく
+        # なるため、書込せず即座に人工核へ委ねる
+        return ("escalate", "mixed_valid_and_placeholder_result")
+    return ("valid", None) if valid else ("placeholder", None)
+
+
+def _apply_content_error_override(result, filename, page_num, total_pages):
+    """CONTENT 頁の占位行文言を釘死する（B4 Plan §2.2、既存 dict は破壊しない）。"""
+    return {
+        **result,
+        "memo": f"⚠ ページ処理エラー p{page_num}/{total_pages} 手動再スキャン要",
+        "vendor": filename,
+        "date": "",
+    }
+
+
+def _prior_page_kind(ledger, page_id):
+    """check_page が SKIP を返した頁の身分を confirmed_ticket_count で自証する（§2.2）。
+
+    >0 → POSTED_PRIOR（真に入賬済み）／==0 → PLACEHOLDER_PRIOR（恆失敗頁）。
+    None（CONFIRMED 記録が読めない理論上の縁——check_page が SKIP を返す以上
+    通常到達しない）は誠實優先で保守側（POSTED を騙らない）扱いにする。
+    """
+    count = ledger.confirmed_ticket_count(page_id)
+    if count is None:
+        return "PLACEHOLDER_PRIOR"
+    return "POSTED_PRIOR" if count > 0 else "PLACEHOLDER_PRIOR"
+
+
+def _classify_and_flush_page(writer, ledger, resolver, base, doc_type,
+                             uploader_name, filename, page_num, total_pages,
+                             results, page_bytes_list):
+    """1 頁分の形状分類→（必要なら）査重・記帳。戻り値は main 内部の軽量タグ:
+        ("ESCALATE", reason) — 呼出側は即座に ProcessOutcome.ESCALATED
+        (kind, None)         — 頁級 outcome（§2.3 頁級モデルの値集合）
+
+    URL 解決（resolver.resolve）は書込対象と確定した result にのみ行う——
+    RETRYABLE/UNKNOWN（零書込・今回限り）や escalate 局面で無駄な単頁 PDF
+    アップロードを起こさない（旧実装は _page_error を即 continue していたため
+    そもそも解決していなかった、その保証を新モデルでも保つ）。
+    """
+    from posting_ledger import derive_page_id, PageDecision
+
+    page_id = derive_page_id(base, page_num)
+    shape, detail = _classify_page_result_shape(results)
+
+    if shape == "escalate":
+        return ("ESCALATE", detail)
+
+    if shape == "error":
+        # #1c: 前輪で既に CONFIRMED 済みの頁なら、今回の一時故障で檔級語義を
+        # 翻さない（再 OCR は既定口徑——process_pipeline に start_page は渡さない）
+        decision = ledger.check_page(page_id)
+        if decision is PageDecision.SKIP:
+            return (_prior_page_kind(ledger, page_id), None)
+        if decision is PageDecision.ESCALATE:
+            return ("ESCALATE", "ledger_witness_ambiguous")
+        return (detail, None)  # 未確認頁のみ今回の一時故障を反映（零書込）
+
+    if shape == "content_error":
+        results = [_apply_content_error_override(
+            results[0], filename, page_num, total_pages)]
+
+    is_placeholder = shape in ("content_error", "placeholder")
+
+    urls = [resolver.resolve(page_num, total_pages, pb) for pb in page_bytes_list]
+    for result in results:
+        entries = result.get("entries", [])
+        print(f"📄 [{page_num}/{total_pages}] 取引先: {result.get('vendor')} | "
+              f"仕訳: {len(entries)}行")
+
+    outcome = _flush_page(writer, ledger, base, doc_type, uploader_name,
+                          page_num, results, urls)
+    if outcome == "escalate":
+        return ("ESCALATE", "ledger_witness_ambiguous")
+    if outcome == "written":
+        return ("PLACEHOLDER_WRITTEN" if is_placeholder else "POSTED_NOW", None)
+    return (_prior_page_kind(ledger, page_id), None)  # "skipped"
+
+
+def _build_dead_letter_payload(total_pages, failed_page_nums):
+    """DEAD_LETTER report_dead_letter(error=...) の payload（B4 Plan §2.3 釘死）。
+
+    技術字段のみ（頁碼/件数/固定 stage・error_class）。ファイル名/客戶名/金額/
+    例外原文は一切含めない（basic-design/03 §3 日誌白名単、事故排障最小欄位集）。
+    """
+    pages_str = ",".join(f"p{n}" for n in failed_page_nums)
+    return {
+        "stage": "ocr",
+        "error_class": "NON_RETRYABLE",
+        "message": (f"all_pages_unreadable: {len(failed_page_nums)}/"
+                    f"{total_pages} pages [{pages_str}]"),
+    }
+
+
+def _aggregate_file_outcome(page_kinds, ordered_page_nums, total_pages):
+    """檔級終態を頁級 outcome から短絡順位で決定する（B4 Plan §2.3 終態マトリクス、
+    ESCALATE は呼出側で頁単位に即返しているためここには現れない）。
+
+    優先順位：RETRYABLE 頁存在 → UNKNOWN 頁存在 → 全頁占位（DEAD_LETTER）→
+    一部頁占位（PARTIAL）→ 全頁 POSTED（SUCCESS）。
+    """
+    if not ordered_page_nums:
+        return HeadlessOutcome(ProcessOutcome.FAILED)  # total_pages==0（稀有、現状維持）
+
+    kinds = [page_kinds[n] for n in ordered_page_nums]
+
+    if "RETRYABLE" in kinds:
+        return HeadlessOutcome(ProcessOutcome.FAILED, retryable=True)
+    if "UNKNOWN" in kinds:
+        return HeadlessOutcome(ProcessOutcome.FAILED, retryable=False)
+
+    if all(k in _PLACEHOLDER_KINDS for k in kinds):
+        failed_page_nums = [n for n in ordered_page_nums
+                            if page_kinds[n] in _PLACEHOLDER_KINDS]
+        payload = _build_dead_letter_payload(total_pages, failed_page_nums)
+        return HeadlessOutcome(ProcessOutcome.DEAD_LETTER, dead_letter_payload=payload)
+    if any(k in _PLACEHOLDER_KINDS for k in kinds):
+        return HeadlessOutcome(ProcessOutcome.PARTIAL)
+    return HeadlessOutcome(ProcessOutcome.SUCCESS)
+
+
 def _process_file_headless(service, writer, file_path, uploader_name, base,
                            ledger, doc_type, drive_file_id, split_pdf_folder_id):
-    """HEADLESS_MODE の頁級緩衝集約経路（IP-304）。三態 ProcessOutcome を返す（#11）。
+    """HEADLESS_MODE の頁級緩衝集約経路（IP-304/IP-306）。HeadlessOutcome を返す。
 
-    process_pipeline の yield を page_num で連続緩衝し、頁境界で flush（查重→原子書込）。
-    緩衝は一頁分のみ（CLAUDE.md メモリ硬約束、頁 flush 後に解放）。page_num の再登場は
-    ESCALATE（#6 連続性 contract、静默拆頁禁）。
+    process_pipeline の yield を page_num で連続緩衝し、頁境界で flush（形状分類→
+    査重→原子書込）。緩衝は一頁分のみ（CLAUDE.md メモリ硬約束、頁 flush 後に解放）。
+    占位頁（CONTENT/認識不能）は continue で読み飛ばさず、正常頁と同じ頁緩衝→
+    頁原子書込の経路を通る（B4 Plan §2.2、旧・檔級聚合占位行塊は廃止済み）。
+    page_num の再登場は ESCALATE（#6 連続性 contract、静默拆頁禁）。
     """
     filename = os.path.basename(file_path)
     base_url = _drive_view_url(drive_file_id) if drive_file_id else ""
@@ -430,98 +617,63 @@ def _process_file_headless(service, writer, file_path, uploader_name, base,
         service, base_url, filename, split_pdf_folder_id, drive_file_id)
 
     buffered_num = None
+    buffered_total_pages = None
     buffered_results = []
-    buffered_urls = []
+    buffered_page_bytes = []
     seen_pages = set()
-    error_pages = 0
-    failed_page_nums = []
-    total_count = 0
+    page_kinds: dict[int, str] = {}
+    ordered_page_nums: list[int] = []
+    file_total_pages = 0
 
-    def flush(page_num_, results_, urls_):
-        """緩衝頁を記帳。ESCALATE なら ProcessOutcome.ESCALATED、それ以外は None。"""
+    def flush(page_num_, total_pages_, results_, page_bytes_):
+        """緩衝頁を分類→（必要なら）記帳。("ESCALATE", reason) か (kind, None) か None を返す。"""
         if not results_:
             return None
-        outcome = _flush_page(writer, ledger, base, doc_type, uploader_name,
-                              page_num_, results_, urls_)
-        return ProcessOutcome.ESCALATED if outcome == "escalate" else None
+        return _classify_and_flush_page(
+            writer, ledger, resolver, base, doc_type, uploader_name, filename,
+            page_num_, total_pages_, results_, page_bytes_)
 
     for page in process_pipeline(file_path, doc_type=doc_type):
         result = page["result"]
         page_num = page["page_num"]
         total_pages = page["total_pages"]
+        file_total_pages = total_pages
 
         # 頁境界：page_num が変わったら前頁を flush してから当頁の緩衝を開始
         if buffered_num is not None and page_num != buffered_num:
-            esc = flush(buffered_num, buffered_results, buffered_urls)
-            if esc is not None:
-                return esc
+            classified = flush(buffered_num, buffered_total_pages,
+                               buffered_results, buffered_page_bytes)
+            if classified is not None:
+                kind, reason = classified
+                if kind == "ESCALATE":
+                    return HeadlessOutcome(ProcessOutcome.ESCALATED)
+                page_kinds[buffered_num] = kind
+                ordered_page_nums.append(buffered_num)
             seen_pages.add(buffered_num)
             buffered_results = []
-            buffered_urls = []
+            buffered_page_bytes = []
 
         # #6 連続性 contract：処理済み頁番号の再登場（静默拆頁）は ESCALATE
         if page_num in seen_pages:
             print(f"🚨 頁番号 {page_num} が非連続に再登場 → ESCALATE（拆頁前提破れ）")
-            return ProcessOutcome.ESCALATED
+            return HeadlessOutcome(ProcessOutcome.ESCALATED)
 
         buffered_num = page_num
-        total_count += 1
-
-        if result.get("_page_error"):
-            error_pages += 1
-            failed_page_nums.append(page_num)
-            continue  # 頁エラーは Sheets 書込まず（現状踏襲）
-
-        entries = result.get("entries", [])
-        print(f"📄 [{page_num}/{total_pages}] 取引先: {result.get('vendor')} | "
-              f"仕訳: {len(entries)}行")
-        page_bytes = page.get("page_bytes")
-        source_url = resolver.resolve(page_num, total_pages, page_bytes)
+        buffered_total_pages = total_pages
         result["uploader"] = uploader_name
         buffered_results.append(result)
-        buffered_urls.append(source_url)
+        buffered_page_bytes.append(page.get("page_bytes"))
 
-    esc = flush(buffered_num, buffered_results, buffered_urls)
-    if esc is not None:
-        return esc
+    classified = flush(buffered_num, buffered_total_pages,
+                       buffered_results, buffered_page_bytes)
+    if classified is not None:
+        kind, reason = classified
+        if kind == "ESCALATE":
+            return HeadlessOutcome(ProcessOutcome.ESCALATED)
+        page_kinds[buffered_num] = kind
+        ordered_page_nums.append(buffered_num)
 
-    # 部分ページエラー（成功頁は台賬 CONFIRMED 済）: 失敗頁を占位行で可視化してから
-    # 歸檔する。UI 経路と同一挙動——headless で失敗頁を静默に落とさない（silent loss
-    # 防止）。
-    #
-    # 既知の非幂等窗口（IP-306/B4 の職責、本批では代拍せず）: この占位行は頁級台賬の
-    # 外で書くため、append 後・move 前に崩潰／move 失敗すると再跑で成功頁は SKIP される
-    # が占位行だけ再追加され重複し得る。ただし重複するのは人工再スキャン警告行のみ
-    # （真の仕訳行は台賬保護下で不重複）で cosmetic。占位行の終態記録
-    # （POSTED_PARTIAL/failed_pages の Firestore 化＝幂等键）は F06-How 未確定で
-    # IP-306/B4 の設計事項。UI 経路も同型の非幂等を持つ（既存・許容）。
-    if 0 < error_pages < total_count:
-        failed_pages_str = ",".join(f"p{n}" for n in failed_page_nums)
-        try:
-            writer.append_entries(
-                employee_name=uploader_name,
-                doc_type=doc_type,
-                entries_data={
-                    "entries": [],
-                    "_unrecognized": True,
-                    "memo": f"⚠ ページ処理エラー {error_pages}/{total_count}頁 "
-                            f"[{failed_pages_str}] 手動再スキャン要",
-                    "date": "",
-                    "vendor": filename,
-                    "uploader": uploader_name,
-                },
-                source_url=base_url,
-            )
-        except Exception as e:
-            # 占位行すら書けない（transient Sheets 障害）→ 失敗頁の可視記録が無い
-            # ままの歸檔は silent loss。SUCCESS を返さずファイル保持して次輪再試行へ
-            # （成功頁は台賬 CONFIRMED 済みで再跑時 SKIP、重複しない）。
-            print(f"⚠️ 部分エラー占位行の書き込み失敗 → ファイル保持: {e}")
-            return ProcessOutcome.FAILED
-
-    if total_count == 0 or error_pages == total_count:
-        return ProcessOutcome.FAILED  # 解析失敗/全頁エラー → ファイル保持
-    return ProcessOutcome.SUCCESS
+    return _aggregate_file_outcome(page_kinds, ordered_page_nums, file_total_pages)
 
 
 def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
@@ -885,12 +1037,16 @@ def main():
                     )
 
                     if ledger is not None:
-                        # headless 三態（#11）。ESCALATE は POSTED 回報せず・move せず・
-                        # ファイル保持（打刻停止で控制面 reconciliation が停滞→POST_UNKNOWN）。
-                        if outcome is ProcessOutcome.SUCCESS:
+                        # headless 五態（B4 Plan §2.3）。HeadlessOutcome.outcome を
+                        # 取り出す——本ブロックは T3 時点の暫定適配（move の要否・
+                        # reporter 回報・memo・intake 白名単の本接線は IP-308/T4）。
+                        h_outcome = outcome.outcome
+                        if h_outcome is ProcessOutcome.SUCCESS:
                             move_file(service, file_id, input_folder_id, processed_folder_id)
-                        elif outcome is ProcessOutcome.ESCALATED:
+                        elif h_outcome is ProcessOutcome.ESCALATED:
                             print("🚨 ESCALATE: ファイル保持・回報せず（控制面へ委ねる）")
+                        elif h_outcome in (ProcessOutcome.PARTIAL, ProcessOutcome.DEAD_LETTER):
+                            print(f"⚠️ {h_outcome.value}: ファイル保持（IP-308 回報接線待ち）。")
                         else:
                             print("⚠️ ファイル処理失敗（保持）。")
                     elif outcome:
