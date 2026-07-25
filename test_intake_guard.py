@@ -679,10 +679,11 @@ class HeadlessIntakeGateTest(unittest.TestCase):
         file = {"id": "f1"}
 
         with patch.dict(os.environ, {"HEADLESS_MODE": "0"}):
-            should, base = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
+            should, base, epoch = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
 
         self.assertTrue(should)
         self.assertIsNone(base)
+        self.assertIsNone(epoch)
         reporter.get_job.assert_not_called()
         reporter.write_alert.assert_not_called()
         service.files.return_value.update.assert_not_called()
@@ -697,7 +698,7 @@ class HeadlessIntakeGateTest(unittest.TestCase):
 
         with patch.dict(os.environ, {"HEADLESS_MODE": "1", "QUARANTINE_FOLDER_ID": "Q_FOLDER"}), \
                 redirect_stdout(io.StringIO()):
-            should, base = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
+            should, base, epoch = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
 
         self.assertFalse(should)
         kwargs = service.files.return_value.update.call_args.kwargs
@@ -708,14 +709,19 @@ class HeadlessIntakeGateTest(unittest.TestCase):
     def test_headless_process_decision_returns_true_without_moving(self):
         service = self._make_service()
         reporter = MagicMock()
-        reporter.get_job.return_value = {"posting_id": "base-1"}
+        # current_state 必須（IP-308/T4 状態白名単、B4 Plan §2.4）——
+        # POSTING_IN_PROGRESS のみ本輪の処理を許す。
+        reporter.get_job.return_value = {
+            "posting_id": "base-1", "lease_epoch": 4,
+            "current_state": "POSTING_IN_PROGRESS"}
         file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-1"}}
 
         with patch.dict(os.environ, {"HEADLESS_MODE": "1", "QUARANTINE_FOLDER_ID": "Q_FOLDER"}):
-            should, base = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
+            should, base, epoch = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
 
         self.assertTrue(should)
         self.assertEqual(base, "base-1")
+        self.assertEqual(epoch, 4)
         service.files.return_value.update.assert_not_called()
 
     def test_get_job_and_write_alert_are_bound_to_reporter_methods(self):
@@ -753,12 +759,12 @@ class HeadlessIntakeGateTest(unittest.TestCase):
 
         with patch.dict(os.environ, {"HEADLESS_MODE": "1", "QUARANTINE_FOLDER_ID": "Q_FOLDER"}), \
                 redirect_stdout(io.StringIO()):
-            first, _ = main._headless_intake_gate(
+            first, _, _ = main._headless_intake_gate(
                 service, file, "INPUT_FOLDER", reporter, alerted=alerted)
             self.assertFalse(first)
             self.assertIn("f1", alerted, "初回 move 失敗直後は memo に残るはず")
 
-            second, _ = main._headless_intake_gate(
+            second, _, _ = main._headless_intake_gate(
                 service, file, "INPUT_FOLDER", reporter, alerted=alerted)
 
         self.assertFalse(second)

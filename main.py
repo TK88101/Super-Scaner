@@ -296,16 +296,26 @@ def _init_headless_reporter():
     return firestore_report.build_reporter_from_env()
 
 
-def _headless_intake_gate(service, file, input_folder_id, reporter, alerted=None):
-    """監視フォルダ入口守衛（IP-303）を1ファイルに適用し (続行可, base) を返す。
+# B4 Plan §2.4: 契約が授権する記帳窓口はこの状態のみ（IP-303 注記④の完全実装）。
+# POSTED/POST_UNKNOWN/DEAD_LETTER/終態/欠落 None は控制面の管轄——SS は無租約
+# 状態で書込まない（POST_UNKNOWN は控制面の重投で POSTING_IN_PROGRESS に戻り
+# 自然に放行される）。
+_INTAKE_ALLOWED_JOB_STATE = "POSTING_IN_PROGRESS"
 
-    非 HEADLESS_MODE では常に (True, None)（副作用なし）。HEADLESS_MODE では
+
+def _headless_intake_gate(service, file, input_folder_id, reporter, alerted=None):
+    """監視フォルダ入口守衛（IP-303）+ 状態白名単（IP-308/T4、§2.4）を1ファイルに
+    適用し (続行可, base, lease_epoch) を返す。
+
+    非 HEADLESS_MODE では常に (True, None, None)（副作用なし）。HEADLESS_MODE では
     intake_guard.handle_intake_gate の裁決を橋渡しし、PROCESS 時のみ base posting_id
-    を第2要素で通す（IP-304 が頁級台賬の job_key に使う、#14）。base の中身には
-    関知しない。
+    ＋lease_epoch を通す（IP-304 が頁級台賬の job_key に、IP-308 が report_posted/
+    report_dead_letter の epoch 引数に使う）。intake_guard 自体の五分岐判定は
+    零改動——状態白名単はこの消費側でのみ適用する（should_process=True でも
+    job_state が POSTING_IN_PROGRESS でなければ本輪は処理をスキップする）。
     """
     if not config.headless_mode():
-        return True, None
+        return True, None, None
     result = intake_guard.handle_intake_gate(
         file,
         get_job=reporter.get_job,
@@ -314,7 +324,202 @@ def _headless_intake_gate(service, file, input_folder_id, reporter, alerted=None
             service, file["id"], input_folder_id, config.quarantine_folder_id()),
         alerted=alerted,
     )
-    return result.should_process, result.base
+    if not result.should_process:
+        return False, result.base, result.lease_epoch
+    if result.job_state != _INTAKE_ALLOWED_JOB_STATE:
+        print(f"入口守衛: 状態非対象 file_id={file.get('id')} "
+              f"job_state={result.job_state!r} → 本輪スキップ（不下載不OCR不打刻）")
+        return False, result.base, result.lease_epoch
+    return True, result.base, result.lease_epoch
+
+
+# B4 Plan §2.4: ESCALATED memo の TTL（≈20輪。SCAN_INTERVAL=3s 前提で約60s、
+# 契約相当の再試行窓——probe 例外分型は採らず check_page 遭遇時の自然な
+# witness 再照合に委ねる、Plan 附録B #7 裁決）。
+_ESCALATE_MEMO_TTL_CYCLES = 20
+
+
+def _prune_headless_memo(memo, folder_id, files):
+    """剪枝按夾（B4 Plan §2.4、DoD⑦）。
+
+    この夾の list_files が成功した今回に限り、この夾に属す memo 項のうち
+    今回の一覧に無い file_id を剪定する。呼出元は list_files 成功後にのみ
+    本関数を呼ぶ前提——「夾列舉失敗不剪」は呼出順序だけで自然に満たされる
+    （本関数自体に try/except は不要）。
+    """
+    seen_ids = {f["id"] for f in files}
+    stale_keys = [key for key, value in memo.items()
+                  if value.get("folder_id") == folder_id and key[2] not in seen_ids]
+    for key in stale_keys:
+        del memo[key]
+
+
+def _headless_memo_skip(memo, key, cycle):
+    """memo 命中判定（B4 Plan §2.4）。命中かつ TTL 未過期なら True（本輪スキップ）。
+
+    ESCALATED は expire_cycle を持ち、過期（cycle >= expire_cycle）なら memo
+    から削除して False を返す（重試を許可——費用防護は同進程内の緩衝に過ぎず
+    正確性は担わない、と docstring で明示された設計どおり）。TTL 無し
+    （expire_cycle=None）のエントリは epoch が変わるまで（＝別 key になるまで）
+    恆に命中し続ける。
+    """
+    entry = memo.get(key)
+    if entry is None:
+        return False
+    expire_cycle = entry.get("expire_cycle")
+    if expire_cycle is not None and cycle >= expire_cycle:
+        del memo[key]
+        return False
+    return True
+
+
+def _record_headless_memo(memo, key, outcome_label, folder_id, expire_cycle=None):
+    """memo へ書込む（B4 Plan §2.4、値＝{outcome, folder_id, expire_cycle}）。"""
+    memo[key] = {"outcome": outcome_label, "folder_id": folder_id,
+                 "expire_cycle": expire_cycle}
+
+
+def _report_headless_outcome(reporter, base, lease_epoch, outcome, file_id, cycle):
+    """HeadlessOutcome を回報接線へ渡す（B4 Plan §2.3、IP-308 本体）。
+
+    戻り値 (outcome_label, expire_cycle)。outcome_label が None なら memo に
+    記録しない（RETRYABLE 由来の FAILED——3秒自癒窗）。epoch 欠落（違約態）は
+    一律零 reporter 呼出し＋警告日誌＋ファイル保持（#3）。回報結果
+    （APPLIED/ALREADY_DONE/REJECTED）の事後処置は firestore_report._report が
+    内部で完結する（診断 print＋REJECTED 時の alert 書込）——本関数は呼ぶだけで、
+    結果に応じた再試行／move は一切しない（契約：REJECTED でも SS は不重試不move）。
+    """
+    h_outcome = outcome.outcome
+    if h_outcome is ProcessOutcome.SUCCESS:
+        if lease_epoch is not None:
+            reporter.report_posted(base, lease_epoch=lease_epoch)
+        else:
+            print(f"⚠️ epoch欠落のため回報せず（違約態）file_id={file_id}")
+        return "SUCCESS", None
+    if h_outcome is ProcessOutcome.DEAD_LETTER:
+        if lease_epoch is not None:
+            reporter.report_dead_letter(
+                base, lease_epoch=lease_epoch, error=outcome.dead_letter_payload)
+        else:
+            print(f"⚠️ epoch欠落のため回報せず（違約態）file_id={file_id}")
+        return "DEAD_LETTER", None
+    if h_outcome is ProcessOutcome.PARTIAL:
+        # TBD 接縫（F06-How 未確定、正式回報は本批の非目標）: 日誌のみ豁免記録
+        print(f"⚠️ PARTIAL: 未回報（TBD接縫、F06-How未確定）file_id={file_id}")
+        return "PARTIAL", None
+    if h_outcome is ProcessOutcome.ESCALATED:
+        print("🚨 ESCALATE: ファイル保持・回報せず（控制面へ委ねる）")
+        return "ESCALATED", cycle + _ESCALATE_MEMO_TTL_CYCLES
+    # FAILED: RETRYABLE 由来は不記（3秒自癒窗）、それ以外（UNKNOWN/稀有な
+    # total_pages==0）は記（per epoch、控制面の重投でのみ再試行）
+    if outcome.retryable:
+        print("⚠️ ファイル処理失敗（一時的、次回サイクルで自癒）。")
+        return None, None
+    print("⚠️ ファイル処理失敗（保持、memo記録）。")
+    return "FAILED", None
+
+
+def _process_one_file(service, writer, reporter, file, input_folder_id, doc_type,
+                      processed_folder_id, split_pdf_folder_id, quarantine_alerted,
+                      headless_memo, cycle):
+    """1 ファイルの取り込み～記帳～終態処理（main() の for file in files: 本体を
+    可測化のため抽出、ロジック改変なし——IP-303/304/306/308 全接線の実体）。
+
+    UI 版（reporter=None）と headless 版の分岐は本関数の内部で行う。main() 側は
+    ファイル一覧の反復と本関数の呼出しのみ担う。
+    """
+    file_id = file['id']
+    file_name = file['name']
+    md5 = file.get('md5Checksum')
+
+    # 0. ヘッドレスモード入口守衛（IP-303）+ 状態白名単（IP-308/T4）: 防重檢測より
+    # 前に base posting_id ＋ job 状態を検証する。
+    should_process, base, lease_epoch = _headless_intake_gate(
+        service, file, input_folder_id, reporter, alerted=quarantine_alerted)
+    if not should_process:
+        print("=" * 30)
+        return
+
+    # 0.5 memo（費用防護、IP-308/T4、headless のみ）: 同 epoch 内で既に終態記録
+    # 済みの file は本輪スキップ（零下載零OCR）。
+    memo_key = (base, lease_epoch, file_id)
+    if reporter is not None and _headless_memo_skip(headless_memo, memo_key, cycle):
+        print(f"headless memo 命中 → 本輪スキップ file_id={file_id}")
+        print("=" * 30)
+        return
+
+    # 1. 防重檢測（UI 版のみ——headless は頁級台賬(IP-304)が硬去重を担い、
+    # SS はファイル単位の move も行わない、B4 Plan §2.6 move 出口全審計）
+    if reporter is None:
+        if is_duplicate_file(service, md5, processed_folder_id):
+            print(f"⚠️ 重複アップロードを検出: {file_name}")
+            print("   -> 処理をスキップしてアーカイブします")
+            move_file(service, file_id, input_folder_id, processed_folder_id)
+            print("=" * 30)
+            return
+
+    # 2. 獲取上傳者信息
+    user_info = file.get('lastModifyingUser', {})
+    email = user_info.get('emailAddress', '')
+    display_name = user_info.get('displayName', 'Unknown')
+
+    user_data = config.EMPLOYEE_MAP.get(email, {})
+    uploader_name = user_data.get("name", display_name)
+    chat_id = user_data.get("chat_id")
+
+    # 3. 格式過濾
+    ext = os.path.splitext(file_name)[1].lower()
+    if ext not in config.SUPPORTED_EXTENSIONS:
+        print(f"⚠️ 未対応のフォーマットです: {file_name}")
+        return
+
+    # 4. 下載與處理
+    local_path = download_file(service, file_id, file_name)
+
+    # 頁級台賬（IP-304、headless のみ）: 1 ファイル＝1 job、job_key=base。
+    # reporter と同一 Firestore client を再利用、witness probe は writer 提供。
+    ledger = None
+    if reporter is not None and base is not None:
+        from posting_ledger import PostingLedger
+        ledger = PostingLedger(
+            reporter.client, base, sheet_probe=writer.probe_page)
+
+    # PDF 間分割線 + 取引No リセットは UI 版のみ（headless は取引No を
+    # Sheets A 列から都度再構築＝崩潰重跑冪等、分割線リセットは不要・有害）。
+    if ledger is None:
+        writer.start_new_file(uploader_name, doc_type, file_name)
+
+    outcome = process_file(
+        service, writer, local_path,
+        uploader_name, chat_id,
+        doc_type=doc_type, drive_file_id=file_id,
+        split_pdf_folder_id=split_pdf_folder_id,
+        base=base, ledger=ledger,
+    )
+
+    if ledger is not None:
+        # headless 五態（B4 Plan §2.3）。move は全出口で削除済み（§2.6 全審計、
+        # SUCCESS も含め move 零呼出——回報 report_posted/report_dead_letter に
+        # 代替）。memo は outcome_label が非 None のときのみ記録する。
+        outcome_label, expire_cycle = _report_headless_outcome(
+            reporter, base, lease_epoch, outcome, file_id, cycle)
+        if outcome_label is not None:
+            _record_headless_memo(headless_memo, memo_key, outcome_label,
+                                  input_folder_id, expire_cycle)
+    elif outcome:
+        move_file(service, file_id, input_folder_id, processed_folder_id)
+    else:
+        print("⚠️ ファイル処理失敗。")
+
+    if os.path.exists(local_path):
+        os.remove(local_path)
+        print("🧹 一時ファイルを削除しました")
+
+    # 取引No はタブの A 列から都度算出するため書き戻し不要。
+    # flush() は将来の後処理フック用に呼び出しだけ残す。
+    writer.flush()
+
+    print("=" * 30)
 
 
 def is_duplicate_file(service, md5_checksum, processed_folder_id):
@@ -932,6 +1137,13 @@ def main():
     # 再実行させない（Firestore 無界重打の防止）。プロセス再起動で自然に消える。
     quarantine_alerted: dict[str, str] = {}
 
+    # headless memo（IP-308/T4、進程内快取、B4 Plan §2.4）: (base, lease_epoch,
+    # file_id) → {outcome, folder_id, expire_cycle}。同 epoch 内で既に終態記録
+    # 済みの file を次輪以降スキップし、Gemini 呼出しの無界重打を防ぐ（費用防護の
+    # みで正確性は担わない——プロセス再起動で自然に消える）。
+    headless_memo: dict = {}
+    cycle = 0
+
     active_folder_map = filter_active_folders(folder_map, writers)
     if not active_folder_map:
         # 接続できたプロファイルに入力フォルダが1つも無い状態。ループに入ると
@@ -957,9 +1169,15 @@ def main():
     while True:
         try:
             found_any = False
+            cycle += 1
 
             for input_folder_id, (doc_type, profile_key) in active_folder_map.items():
                 files = list_files(service, input_folder_id)
+
+                # 剪枝按夾（IP-308/T4、B4 Plan §2.4 DoD⑦）: list_files 成功後にのみ
+                # 呼ぶ（「夾列舉失敗不剪」は呼出順序で自然に満たす）。
+                if reporter is not None:
+                    _prune_headless_memo(headless_memo, input_folder_id, files)
 
                 if not files:
                     continue
@@ -974,95 +1192,11 @@ def main():
                       f"新しいファイルを検出しました！")
 
                 for file in files:
-                    file_id = file['id']
-                    file_name = file['name']
-                    md5 = file.get('md5Checksum')
-
-                    # 0. ヘッドレスモード入口守衛（IP-303）: 防重檢測より前に
-                    # base posting_id を検証する。無 posting_id / job 不一致件
-                    # はここで隔離夾へ退避し、以降の処理（Sheets 書込含む）へ
-                    # 進ませない。
-                    should_process, base = _headless_intake_gate(
-                        service, file, input_folder_id, reporter,
-                        alerted=quarantine_alerted)
-                    if not should_process:
-                        print("=" * 30)
-                        continue
-
-                    # 1. 防重檢測（同一プロファイルのアーカイブ内のみを見る）
-                    if is_duplicate_file(service, md5, processed_folder_id):
-                        print(f"⚠️ 重複アップロードを検出: {file_name}")
-                        print("   -> 処理をスキップしてアーカイブします")
-                        move_file(service, file_id, input_folder_id, processed_folder_id)
-                        print("=" * 30)
-                        continue
-
-                    # 2. 獲取上傳者信息
-                    user_info = file.get('lastModifyingUser', {})
-                    email = user_info.get('emailAddress', '')
-                    display_name = user_info.get('displayName', 'Unknown')
-
-                    user_data = config.EMPLOYEE_MAP.get(email, {})
-                    uploader_name = user_data.get("name", display_name)
-                    chat_id = user_data.get("chat_id")
-
-                    # 3. 格式過濾
-                    ext = os.path.splitext(file_name)[1].lower()
-                    if ext not in config.SUPPORTED_EXTENSIONS:
-                        print(f"⚠️ 未対応のフォーマットです: {file_name}")
-                        continue
-
-                    # 4. 下載與處理
-                    local_path = download_file(service, file_id, file_name)
-
-                    # 頁級台賬（IP-304、headless のみ）: 1 ファイル＝1 job、job_key=base。
-                    # reporter と同一 Firestore client を再利用、witness probe は writer 提供。
-                    ledger = None
-                    if reporter is not None and base is not None:
-                        from posting_ledger import PostingLedger
-                        ledger = PostingLedger(
-                            reporter.client, base, sheet_probe=writer.probe_page)
-
-                    # PDF 間分割線 + 取引No リセットは UI 版のみ（headless は取引No を
-                    # Sheets A 列から都度再構築＝崩潰重跑冪等、分割線リセットは不要・有害）。
-                    if ledger is None:
-                        writer.start_new_file(uploader_name, doc_type, file_name)
-
-                    outcome = process_file(
-                        service, writer, local_path,
-                        uploader_name, chat_id,
-                        doc_type=doc_type, drive_file_id=file_id,
-                        split_pdf_folder_id=profile["split_pdf_folder_id"],
-                        base=base, ledger=ledger,
-                    )
-
-                    if ledger is not None:
-                        # headless 五態（B4 Plan §2.3）。HeadlessOutcome.outcome を
-                        # 取り出す——本ブロックは T3 時点の暫定適配（move の要否・
-                        # reporter 回報・memo・intake 白名単の本接線は IP-308/T4）。
-                        h_outcome = outcome.outcome
-                        if h_outcome is ProcessOutcome.SUCCESS:
-                            move_file(service, file_id, input_folder_id, processed_folder_id)
-                        elif h_outcome is ProcessOutcome.ESCALATED:
-                            print("🚨 ESCALATE: ファイル保持・回報せず（控制面へ委ねる）")
-                        elif h_outcome in (ProcessOutcome.PARTIAL, ProcessOutcome.DEAD_LETTER):
-                            print(f"⚠️ {h_outcome.value}: ファイル保持（IP-308 回報接線待ち）。")
-                        else:
-                            print("⚠️ ファイル処理失敗（保持）。")
-                    elif outcome:
-                        move_file(service, file_id, input_folder_id, processed_folder_id)
-                    else:
-                        print("⚠️ ファイル処理失敗。")
-
-                    if os.path.exists(local_path):
-                        os.remove(local_path)
-                        print("🧹 一時ファイルを削除しました")
-
-                    # 取引No はタブの A 列から都度算出するため書き戻し不要。
-                    # flush() は将来の後処理フック用に呼び出しだけ残す。
-                    writer.flush()
-
-                    print("=" * 30)
+                    _process_one_file(
+                        service, writer, reporter, file, input_folder_id,
+                        doc_type, processed_folder_id,
+                        profile["split_pdf_folder_id"], quarantine_alerted,
+                        headless_memo, cycle)
 
             if not found_any:
                 print(".", end="", flush=True)

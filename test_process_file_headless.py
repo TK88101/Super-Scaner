@@ -194,16 +194,19 @@ class IntakeGateBaseWiringTest(unittest.TestCase):
 
         class _Rep:
             def get_job(self, base):
-                return {"posting_id": base}
+                # current_state 必須（IP-308/T4 状態白名単、B4 Plan §2.4）
+                return {"posting_id": base, "lease_epoch": 1,
+                       "current_state": "POSTING_IN_PROGRESS"}
 
             def write_alert(self, *a):
                 pass
 
         with patch.object(main.config, "headless_mode", return_value=True):
-            should, base = main._headless_intake_gate(
+            should, base, epoch = main._headless_intake_gate(
                 service=None, file=file, input_folder_id="in", reporter=_Rep())
         self.assertTrue(should)
         self.assertEqual(base, "cust:hash")
+        self.assertEqual(epoch, 1)
 
 
 # ============================================================

@@ -43,9 +43,19 @@ class FakeWriter:
         self.sheets: dict = {}      # tab_name -> [row, ...]（着地済み）
         self.append_calls = 0
         self.placeholder_calls = []  # append_entries（部分エラー占位行）の記録
+        self.start_new_file_calls = []  # UI 版のみ呼ばれる（B4 T4 適配）
+        self.flush_calls = 0            # UI/headless 共通の後処理フック（B4 T4 適配）
 
     def _tab(self, employee_name, doc_type):
         return f"{employee_name}_領収書"
+
+    def start_new_file(self, employee_name, doc_type, file_name):
+        """UI 版のみが呼ぶ PDF 間分割線＋取引No リセット（記録のみ、no-op）。"""
+        self.start_new_file_calls.append((employee_name, doc_type, file_name))
+
+    def flush(self):
+        """将来の後処理フック（本番は no-op、呼出し回数のみ記録）。"""
+        self.flush_calls += 1
 
     def append_entries(self, *, employee_name, doc_type, entries_data, source_url=""):
         """部分ページエラーの占位行書込（headless 経路が UI 経路と同一に呼ぶ）。記録のみ。"""
