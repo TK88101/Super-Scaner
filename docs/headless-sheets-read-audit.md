@@ -19,7 +19,7 @@
 | 8 | sheets_output.py:321 | `append_entries` | 寫入前 `get_all_values()` → `pre_write_count` | 定位 append 落點＋異常高亮行號。註釋所稱「重複檢測用」**已失效**（`_detect_and_highlight_duplicates` :594 為零調用死代碼，F31） | 保留（寫入配管：定位讀）。B3/IP-304 頁級原子化重構此路徑時重審 |
 | 9 | sheets_output.py:438 | `_ensure_row_capacity` | `worksheet.row_count` 屬性 | 事前擴容守衛（防自動擴容染色） | 保留（寫入配管） |
 | 10 | sheets_output.py:456 | `_sanitize_trailing_once` | `worksheet.row_count` 屬性 | 尾部空行白底消毒範圍 | 純輸出裝飾 |
-| 11 | sheets_output.py:554 | `_write_unrecognized_row` | 寫入前行數 | 占位行落點＋紅色高亮定位 | 保留（寫入配管）。**B4/IP-306 將整體廢止此獨立寫入路徑**（占位行併入頁級聚合） |
+| 11 | sheets_output.py:554 | `_write_unrecognized_row` | 寫入前行數 | 占位行落點＋紅色高亮定位 | **B4/IP-306 已廢止 headless 側此路徑（2026-07-25）**：headless 對 `append_entries` 的呼叫歸零，占位行併入頁級原子寫（`build_page_write` 零行分支）、受 `{base}:p{n}` 台賬去重保護。本函數保留供 UI 版（行為零改動） |
 
 標色標黃等裝飾邏輯（`_apply_anomaly_highlight`、`_write_legend` 等，sheets_output.py:288 起）只寫不讀，維持「純輸出裝飾、不承載流程語義」定位（工單既定口徑）。
 

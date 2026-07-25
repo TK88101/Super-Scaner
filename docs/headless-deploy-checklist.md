@@ -35,7 +35,7 @@
 | `OUTPUT_SPREADSHEET_ID` | `config.py:9` | 必須 |
 | `BACKUP_SPREADSHEET_ID` | `config.py:10` | 現行どおり（GAS `daily_backup.gs` 側で使用） |
 | `FOLDER_RECEIPT_ID` 等（文書タイプ別） | `config.py:234`（`load_folder_map`） | 現行どおり必須 |
-| `PROCESSED_FOLDER_ID` | `config.py:184` | 現行どおり（headless の成功路径 move 禁用は B4/IP-308 で扱う） |
+| `PROCESSED_FOLDER_ID` | `config.py:184` | UI 版のみ使用。**B4/IP-308 実装済（2026-07-25）**：`HEADLESS_MODE=1` では成功路径 move 全廃（重複件検出 `is_duplicate_file` も停用）——SS は書賬＋`report_posted`（`lease_epoch` 携行）のみ、歸檔搬運は控制面。隔離夾 move（入口守衛）が唯一の例外。終態件の再掃防止＝進程内 memo（epoch 感知・TTL 付、跨進程正確性は台賬側）＋intake 状態白名単（`current_state=="POSTING_IN_PROGRESS"` のみ処理） |
 | `SPLIT_PDF_FOLDER_ID` | `config.py:192` | **必須（契約 §6）**——Sheets `source_url` の永続リンク先。制御面の帰档/清掃はこの夾に触れてはならない |
 | `INPUT_FOLDER_ID` | `config.py:245` | legacy 互換（単一夾時代）。新規環境では文書タイプ別キーを使う |
 | `OCR_STRATEGY` / `OCR_CONFIDENCE_THRESHOLD` / `OCR_MODEL_TIER` / `OCR_MAX_SIDE` / `DOC_LOW_CONFIDENCE_THRESHOLD` | `config.py:13-32` | 任意（既定値あり） |
