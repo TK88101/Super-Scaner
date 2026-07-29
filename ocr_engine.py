@@ -1251,8 +1251,23 @@ PROMPTS = {
 # ============================================================
 
 def _determine_credit_account(pay_method, doc_category="receipt"):
-    """支払方法とドキュメントカテゴリから貸方科目を決定"""
-    # 顧客確認済み: 領収書・請求書とも貸方は「未払金」に統一
+    """支払方法とドキュメントカテゴリから貸方科目を決定。
+
+    **無条件で「未払金」を返す。これは意図的。** 引数 pay_method /
+    doc_category は呼出側の形を変えないために受け取るだけで、参照しない。
+
+    顧客確認済み: 領収書・請求書とも貸方は「未払金」に統一。SS は「何の費用が
+    発生したか」だけを担い、「どの財布から出たか」は担わない——後者は
+    MoneyForward 側で口座連携と突合して消し込む運用（社会保険料を口座振替
+    資料として処理するのと同じ思想）。
+
+    **再議しないこと（2026-07-30 ユーザー裁定:「不用改動了，員工就是這樣
+    要求的」）。** payment_method が現金でも貸方が未払金になるのは仕様であり
+    判定失敗ではない。`_build_entries_from_receipt_legacy`（旧フォーマット兜底）と
+    `_build_entries_from_purchase_invoice` は本関数を通らず独自に現金／普通預金へ
+    分岐しており統一規則と食い違うが、社員の運用がそれで成立しているため
+    現状維持と裁定された。三者を揃える提案は却下済み。
+    """
     return "未払金"
 
 
@@ -1449,7 +1464,11 @@ def _build_entries_from_receipt_legacy(raw_data):
     entries = []
     debit_account = raw_data.get("debit_account", "消耗品費")
 
-    # 貸方科目決定
+    # 貸方科目決定（_determine_credit_account の「一律未払金」とは意図的に別ロジック。
+    # 統一規則の導入前からある旧フォーマット兜底経路で、社員の運用がこれで
+    # 成立しているため現状維持と裁定済み——2026-07-30 ユーザー裁定
+    # 「不用改動了，員工就是這樣要求的」。_determine_credit_account の
+    # docstring 参照。揃える提案は却下済みなので再議しないこと）
     pay_method = str(raw_data.get("payment_method", "現金"))
     credit_account = "現金"
     if any(x in pay_method for x in ["クレジット", "Credit", "Card", "VISA", "Master"]):
@@ -1494,7 +1513,10 @@ def _build_entries_from_purchase_invoice(raw_data):
     entries = []
     items = raw_data.get("items", [])
 
-    # 貸方科目決定
+    # 貸方科目決定（_determine_credit_account の「一律未払金」とは意図的に別ロジック。
+    # 請求書側は支払手段で分岐する運用のまま——2026-07-30 ユーザー裁定
+    # 「不用改動了，員工就是這樣要求的」。_determine_credit_account の
+    # docstring 参照。揃える提案は却下済みなので再議しないこと）
     pay_method = str(raw_data.get("payment_method", "振込"))
     credit_account = "買掛金"
     if "振込" in pay_method or "口座" in pay_method:
