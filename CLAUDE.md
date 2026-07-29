@@ -85,7 +85,32 @@ Drive 原生预览忽略 `#page=N`，故每页拆成单页 PDF 上传到 `SPLIT_
 - 全页失败 → `Failed`，**保留文件** 供下次重试 (不写 Sheets 占位行，防重复)
 - 部分页失败 → 成功页已写，失败页写占位行，文件**归档** (防重试产生重复行)
 - 判定用 `count == error_pages` 而非 `total_entries==0` (封筒/パンフ页本就 entries=0)
-- `_is_envelope_page`: 封筒/送付状/挨拶状等自动跳过
+
+### 页面绝不无音消失（IP-401，2026-07-30）
+生产事故：客户上传 54 张、仕訳只有 53 件。小型热敏领収証被 PaddleOCR 读成
+「☆领収证☆」(繁简误认)，`_is_envelope_page` 仅凭 OCR 文本单独否决了 Gemini
+已正确读出的结果，`continue` 跳过 → Sheets 上连占位行都没有 → 只能靠数张数发现。
+
+现行不变式：**进入逐页循环的每一页，必定 yield 至少一条**。
+- `_is_envelope_page` 已从「前置拒否権」降级为「事后说明器」：只在 Gemini
+  组不出 entries 时用来分类原因，绝不能否决已有 entries 的页（`_yield_page_results`）
+- 它是 best-effort 启发式，仅限 RECEIPT + PDF 逐页循环（`envelope_filter=True`）；
+  尾段（单页 PDF/图片）不启用
+- 除外页 → `_excluded_page` + `_exclude_destination` 决定去向：封筒走监査タブ
+  `_除外ページ監査`（7 列，**タブ名必须 `_` 开头**否则 GAS 每晚 22:00 删除），
+  社保通知書走 MF タブ。**去向由 producer 声明，不要在 main 里按 reason 猜**
+- entries 有效但封筒信号命中 → `_audit_signal`，照常记账 + 监査タブ留「分岐」
+- `process_pipeline` 与 `main.process_file` 双方都做页覆盖突合，缺页写监査タブ
+  「欠落」行（控制台 print 在无人值守的迷你 PC 上等于无声）
+- 整形阶段异常只影响当页（`_mark`/`next()` 包在 try 内），不会连累后续页
+
+### 社会保険料通知書は仕訳を作らない（IP-401 T6）
+社员共通规则：社保一律不上传，走口座振替资料处理。券面同时印有当月「納入告知額」
+与前月「領収済額」两口，Gemini 会两口都记账 → 与银行侧双重计上。
+`_is_social_insurance_notice` 命中即零仕訳，只在 MF タブ写提示行（顾客必看到）。
+与封筒不同，它是**确定的业务规则**：全 doc_type、全经路常时有效，entries 有效也短路。
+关键词收紧过：「納入告知額」单独不发火（労働保険等公共徴収通知的通用语，误爆会给
+无关文书贴上错误标签并吞掉其会计数据）。
 
 ### Google API 共享盘适配
 所有 Drive 调用带 `supportsAllDrives=True` + `includeItemsFromAllDrives=True` — **list 缺这两个会静默返回 0 件 (无报错)**。5xx 用 `_call_with_retry` 指数退避。Service Account 无法新建 Drive 文件，Spreadsheet/文件夹须手动预建并共享给 SA。
