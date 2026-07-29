@@ -633,14 +633,56 @@ _PAMPHLET_KEYWORDS = ["制度", "仕組み", "チャート", "についてのご
                       "処分の流れ", "についての留意", "についてのお知らせ"]
 
 
+# PaddleOCR が日本語漢字を簡体字に取り違えたときの照合用写像（IP-401 T3）。
+# **一方向・比較専用**。表示や Sheets へ書き出すテキストには絶対に適用しない
+# （canonical direction が無い双方向置換は元テキストを壊す）。
+# 実事故: 「☆領収証☆」→「☆领収证☆」で構造キーワード「領収」に失配した。
+#
+# 収録基準は「本番で実際に観測された誤読」のみ。憶測で簡体字全域を畳むと
+# 別語に化けて誤分類を増やすため広げない。纳/录 は本ファイル内の既存の
+# 場当たり対処（_extract_date_from_ocr の "纳期限"、_extract_invoice_num_from_ocr
+# の 登[録录]番号）が、同じ誤読が既に観測済みであることを示している。
+_SIMPLIFIED_TO_JP = {
+    "领": "領",
+    "证": "証",
+    "收": "収",
+    "请": "請",
+    "买": "買",
+    "计": "計",
+    "纳": "納",
+    "录": "録",
+}
+
+_SIMPLIFIED_TRANS = str.maketrans(_SIMPLIFIED_TO_JP)
+
+
+def _normalize_for_keyword_match(text):
+    """キーワード照合専用にテキストを正規化する（比較用、表示用ではない）。
+
+    NFKC で全角英数字・記号を畳んだうえで、PaddleOCR がよく取り違える簡体字を
+    日本語字形へ一方向に寄せる。写像表に無い文字は触らない（過剰変換すると
+    別語に化けて誤分類を生む）。
+    """
+    return unicodedata.normalize("NFKC", text or "").translate(_SIMPLIFIED_TRANS)
+
+
 def _is_envelope_page(ocr_text, raw_data):
     """不要ページ（封筒・送付状・裏面メモ・挨拶状・説明書）を検出する。
+
+    best-effort の分類器であり、これ単体を票の採否に使ってはいけない
+    （IP-401: 本関数の単独否決が本番で1票を無音欠落させた）。現在の役割は
+    「entries を組めなかったページ」を監査タブ行きにするか赤い認識不能行に
+    するかの理由分類のみ（Plan §3.1）。
+
+    照合は全キーワード群を同一の normalized_text に対して行う。片側だけ
+    正規化すると同じ誤認識が判定の一方にしか効かず一貫性を欠く（§3.4）。
+
     NOTE: 空白ページや documents=[] は認識不能として扱い、ここでは除外しない。
     """
     if not ocr_text:
         return False
 
-    text_lower = ocr_text.replace(" ", "")
+    text_lower = _normalize_for_keyword_match(ocr_text).replace(" ", "")
     has_financial_kw = any(kw in text_lower for kw in _FINANCIAL_KEYWORDS)
 
     # 封筒: 封筒キーワードあり + 金額関連なし
@@ -667,8 +709,10 @@ def _is_envelope_page(ocr_text, raw_data):
         return True
 
     # 裏面メモ/カード控え裏面/手書きメモ: 短いテキスト（60文字未満）+ 領収書構造なし
-    # 正式な領収書は必ず「領収」「合計」等の構造キーワードを持つため、
-    # それがなければ金額の有無に関わらずメモとして除外
+    # かつては「正式な領収書は必ず構造キーワードを持つ」と断定していたが、
+    # IP-401 の事故（小型サーマル領収証が「领収证」と誤読され構造キーワードに
+    # 失配、55文字でメモ扱い）がこれを反証した。best-effort のヒューリスティック
+    # であり、閾値 60 にも強い根拠は無い（Plan §3.6）。
     _receipt_structure = ["領収", "請求書", "合計", "小計", "お買上"]
     has_receipt_structure = any(kw in text_lower for kw in _receipt_structure)
     if len(clean_text) < 60 and not has_receipt_structure:
