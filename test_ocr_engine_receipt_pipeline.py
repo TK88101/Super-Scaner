@@ -154,6 +154,74 @@ class JsonParseFailurePageVisibilityTest(unittest.TestCase):
         vision.assert_called_once_with(b"%PDF-p1", "application/pdf", mock.ANY)
 
 
+class PageFormattingExceptionIsolationTest(unittest.TestCase):
+    """IP-401 T0: 整形段階 (_yield_page_results) の例外はそのページに閉じ込める。
+
+    従来 `_yield_page_results` の消費は逐頁 `try` の**外**にあり、畸形 Gemini
+    JSON 等で整形が例外を投げると最外層の `except` まで飛び、**PDF の残り
+    全ページが無音で消えた**（元の封筒無音棄却より重大な欠落）。
+
+    NOTE: `main` 分支の消費側 (`main.py:347`) は `_page_error` のみで分岐する。
+    Plan の DoD(R4) が要求する `_error_class` は sandevistan 側の機構であり
+    本分支には存在しないため、断言対象は `_page_error` + 例外型を含む memo。
+    """
+
+    def _run_with_failing_formatter(self, failing_page_num):
+        """指定ページの整形だけが例外を投げるよう _yield_page_results を差替える。"""
+        real = ocr_engine._yield_page_results
+        calls = {"n": 0}
+
+        def fake(doc_type, raw_data, ocr_text, ocr_conf, prefix=""):
+            calls["n"] += 1
+            if calls["n"] == failing_page_num:
+                # 下の for に yield があるため本関数は既に generator function。
+                # よって raise は「呼び出し時」ではなく「消費時」に届く——
+                # 実際の整形例外（next() の内側で発生）と同じタイミング。
+                raise ValueError("畸形 JSON: items が dict ではない")
+            for entry in real(doc_type, raw_data, ocr_text, ocr_conf, prefix=prefix):
+                yield entry
+
+        route = [
+            (_valid_receipt_raw(), _VALID_OCR_TEXT, 0.95),
+            (_valid_receipt_raw(), _VALID_OCR_TEXT, 0.95),
+        ]
+        with mock.patch.object(ocr_engine, "_yield_page_results", side_effect=fake):
+            pages, _ = _run_receipt_pipeline(route)
+        return pages
+
+    def test_formatting_error_isolated_to_its_own_page(self):
+        # Arrange / Act: p1 の整形だけが例外
+        pages = self._run_with_failing_formatter(failing_page_num=1)
+
+        # Assert: p1 は _page_error 占位行、p2 は巻き添えにならず正常 yield
+        self.assertEqual(len(pages), 2)
+        by_page = {p["page_num"]: p for p in pages}
+        self.assertTrue(by_page[1]["result"].get("_page_error"))
+        self.assertTrue(by_page[1]["result"].get("_unrecognized"))
+        self.assertEqual(by_page[1]["result"]["entries"], [])
+        self.assertIn("ValueError", by_page[1]["result"]["memo"])
+        self.assertFalse(by_page[2]["result"].get("_page_error"))
+        self.assertEqual(len(by_page[2]["result"]["entries"]), 1)
+
+    def test_formatting_error_on_last_page_keeps_earlier_pages(self):
+        # Arrange / Act: p2 の整形だけが例外（先行ページが既に yield 済みの状況）
+        pages = self._run_with_failing_formatter(failing_page_num=2)
+
+        # Assert: p1 の成果は保持され、p2 だけが占位行になる
+        self.assertEqual(len(pages), 2)
+        by_page = {p["page_num"]: p for p in pages}
+        self.assertEqual(len(by_page[1]["result"]["entries"]), 1)
+        self.assertTrue(by_page[2]["result"].get("_page_error"))
+
+    def test_formatting_error_page_carries_page_bytes(self):
+        # Arrange / Act
+        pages = self._run_with_failing_formatter(failing_page_num=1)
+
+        # Assert: 占位行から原票ページへ辿れる（他の失敗経路と同じ契約）
+        by_page = {p["page_num"]: p for p in pages}
+        self.assertEqual(by_page[1].get("page_bytes"), b"%PDF-p1")
+
+
 class ReceiptEnvelopePageStillSkippedTest(unittest.TestCase):
     """Session 16 裁決: 封筒フィルタ (_is_envelope_page) は
     doc_type == DocType.RECEIPT 限定に変更されたが、RECEIPT 自体の既存挙動

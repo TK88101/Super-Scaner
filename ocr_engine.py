@@ -1731,6 +1731,31 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix=""):
     yield _build_doc_result(doc_type, raw_data, builder(raw_data))
 
 
+def _page_error_payload(memo, page_num, total_pages, page_bytes):
+    """ページ失敗時の占位 yield ペイロードを組み立てる（逐頁ループ 3 経路共通）。
+
+    「ページ処理エラー」「AI応答のJSON解析失敗」「整形処理エラー」の 3 経路が
+    同一形状の dict を逐字コピーで持っていた。占位行の契約（`_page_error` /
+    `_unrecognized` / `page_bytes`）は消費側 `main.process_file` の成否判定と
+    原票リンク生成に直結するため、1 箇所でも取りこぼすと無音欠落に戻る。
+    単一の出所にまとめて漂移を防ぐ。
+    """
+    return {
+        "result": {
+            "date": "",
+            "vendor": "",
+            "invoice_num": "",
+            "memo": memo,
+            "entries": [],
+            "_unrecognized": True,
+            "_page_error": True,
+        },
+        "page_num": page_num,
+        "total_pages": total_pages,
+        "page_bytes": page_bytes,
+    }
+
+
 def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, start_page=1):
     """
     文書を分析し、仕訳データを逐次 yield するジェネレータ。
@@ -1802,20 +1827,9 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                     except Exception as page_err:
                         failed_pages += 1
                         print(f"{prefix}❌ ページ処理エラーのためスキップ: {type(page_err).__name__}: {str(page_err)[:120]}")
-                        yield {
-                            "result": {
-                                "date": "",
-                                "vendor": "",
-                                "invoice_num": "",
-                                "memo": f"ページ処理エラー: {type(page_err).__name__}",
-                                "entries": [],
-                                "_unrecognized": True,
-                                "_page_error": True,
-                            },
-                            "page_num": idx,
-                            "total_pages": total,
-                            "page_bytes": page_data,
-                        }
+                        yield _page_error_payload(
+                            f"ページ処理エラー: {type(page_err).__name__}",
+                            idx, total, page_data)
                         gc.collect()
                         continue
 
@@ -1825,20 +1839,8 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                         # このページのデータが無音欠落する（例外経路と同扱い）
                         failed_pages += 1
                         print(f"{prefix}⚠️ AIの応答がJSONではありませんでした")
-                        yield {
-                            "result": {
-                                "date": "",
-                                "vendor": "",
-                                "invoice_num": "",
-                                "memo": "AI応答のJSON解析失敗",
-                                "entries": [],
-                                "_unrecognized": True,
-                                "_page_error": True,
-                            },
-                            "page_num": idx,
-                            "total_pages": total,
-                            "page_bytes": page_data,
-                        }
+                        yield _page_error_payload(
+                            "AI応答のJSON解析失敗", idx, total, page_data)
                         gc.collect()
                         continue
 
@@ -1856,8 +1858,30 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
 
                     # OCR オーバーライド → doc_type別ルーティング → result dict 整形
                     # は _yield_page_results に一本化済み（尾段と共通ロジック）
-                    for entry in _yield_page_results(
-                            doc_type, page_raw_data, ocr_text, ocr_conf, prefix=prefix):
+                    #
+                    # IP-401 T0: 整形段階の例外境界。
+                    # ここは以前 `for entry in _yield_page_results(...)` を裸で
+                    # 回しており、逐頁 try の**外**だった。畸形 Gemini JSON 等で
+                    # 整形が例外を投げると最外層の except まで飛び、そのページ
+                    # だけでなく **PDF の残り全ページが無音で消えた**。
+                    # next() を try で包み、例外は当該ページの占位行に閉じ込めて
+                    # 次ページへ進む。yield 自体は try の外に置き、消費側から
+                    # throw/close された例外を誤って握り潰さないようにする。
+                    page_iter = _yield_page_results(
+                        doc_type, page_raw_data, ocr_text, ocr_conf, prefix=prefix)
+                    while True:
+                        try:
+                            entry = next(page_iter)
+                        except StopIteration:
+                            break
+                        except Exception as fmt_err:
+                            failed_pages += 1
+                            print(f"{prefix}❌ 整形処理エラー: "
+                                  f"{type(fmt_err).__name__}: {str(fmt_err)[:120]}")
+                            yield _page_error_payload(
+                                f"整形処理エラー: {type(fmt_err).__name__}",
+                                idx, total, page_data)
+                            break
                         yield {
                             "result": entry,
                             "page_num": idx,
