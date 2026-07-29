@@ -19,7 +19,8 @@ from ocr_engine import (
     EXCLUDE_DEST_AUDIT_TAB, EXCLUDE_DEST_MF_TAB, process_pipeline,
 )
 from sheets_output import (
-    AUDIT_VERDICT_BRANCH, AUDIT_VERDICT_EXCLUDED, SheetsOutputWriter,
+    AUDIT_VERDICT_BRANCH, AUDIT_VERDICT_EXCLUDED, AUDIT_VERDICT_MISSING,
+    SheetsOutputWriter,
 )
 from notifier import send_notification
 from doc_types import DocType, DOC_TYPE_CONFIG
@@ -463,10 +464,15 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
     excluded_page_nums = []
     failed_page_notes = {}  # {page_num: 具体的な説明} 占位行で汎用文言に埋もれさせない
 
+    seen_page_nums = set()
+    last_total_pages = 0
+
     for page in process_pipeline(file_path, doc_type=doc_type):
         result = page["result"]
         page_num = page["page_num"]
         total_pages = page["total_pages"]
+        seen_page_nums.add(page_num)
+        last_total_pages = total_pages
         count += 1
         # 再試可能なページエラーは Sheets へ書き込まない
         # （全頁失敗時は Failed を返しファイルを保持するため、
@@ -543,6 +549,28 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
         total_amount += page_amount
         vendor_names.append(result.get('vendor', ''))
         total_entries += len(entries)
+
+    # ページカバレッジ突合（IP-401 §8-中7）。ocr_engine 側も同じ検査をして
+    # 警告を出すが、本番機は無人の Windows ミニ PC で誰も控制台を見ておらず
+    # （Chatwork 通知も monitoring も廃止済み、CLAUDE.md 参照）、02:00 の
+    # 再起動で流れる。哨戒が控制台にしか出ないなら哨戒していないのと同じ。
+    # 顧客・運用者が実際に見る監査タブへ持続化する。
+    # 成否判定は変えない（§8-中7 の裁決どおり警告のみ、P2 繰延）。
+    missing_pages = sorted(set(range(1, last_total_pages + 1)) - seen_page_nums)
+    if missing_pages:
+        print(f"⚠️ ページカバレッジ警告: {len(missing_pages)}/{last_total_pages}頁が"
+              f"一度も出力されませんでした {missing_pages}")
+        try:
+            sheets_writer.append_audit_row(
+                filename=filename,
+                page_num=missing_pages[0],
+                verdict=AUDIT_VERDICT_MISSING,
+                reason=f"page_coverage_gap:{missing_pages}",
+                ocr_text_len=0,
+                source_url=base_url,
+            )
+        except Exception as e:
+            print(f"⚠️ カバレッジ警告の監査タブ記録に失敗: {e}")
 
     # 全ページがエラー → 上流障害とみなし Failed（再試行対象として残す）
     # count == error_pages で判定（total_entries ではない）:

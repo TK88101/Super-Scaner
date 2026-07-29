@@ -236,6 +236,48 @@ class AuditTabRoutingTest(unittest.TestCase):
         self.assertEqual(writer.events, ["entries", "audit"])
 
 
+class PageCoverageSentinelTest(unittest.TestCase):
+    """IP-401 §8-中7: 出力されなかったページを監査タブへ持続化する。
+
+    本番機は無人の Windows ミニ PC で誰も控制台を見ていない（Chatwork 通知も
+    monitoring も廃止済み）。哨戒が print だけなら哨戒していないのと同じ。
+    """
+
+    def test_missing_page_is_recorded_in_audit_tab(self):
+        # Arrange: 3頁の PDF なのに p2 が一度も出力されなかった
+        pages = [_page(_valid_result(), 1, 3), _page(_valid_result(), 3, 3)]
+
+        # Act
+        _, writer = _run_process_file(pages)
+
+        # Assert: 欠落として監査タブに1行
+        gaps = [a for a in writer.audit_calls if a["verdict"] == "欠落"]
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("2", gaps[0]["reason"])
+
+    def test_no_audit_row_when_all_pages_present(self):
+        # Arrange
+        pages = [_page(_valid_result(), 1, 2), _page(_valid_result(), 2, 2)]
+
+        # Act
+        _, writer = _run_process_file(pages)
+
+        # Assert
+        self.assertEqual(writer.audit_calls, [])
+
+    def test_sentinel_failure_does_not_break_processing(self):
+        # Arrange: 監査タブ書込が落ちても記帳は成功のまま
+        writer = _RecordingWriter(audit_error=RuntimeError("Sheets 500"))
+        pages = [_page(_valid_result(), 1, 3), _page(_valid_result(), 3, 3)]
+
+        # Act
+        ok, writer = _run_process_file(pages, writer=writer)
+
+        # Assert
+        self.assertTrue(ok)
+        self.assertEqual(len(writer.calls), 2)
+
+
 class SocialInsuranceNoticeRoutingTest(unittest.TestCase):
     """IP-401 T6 / §3.8: 社会保険料通知書だけは MF タブへ提示行を書く。
 

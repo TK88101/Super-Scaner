@@ -2020,6 +2020,24 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                 print(f"📄 大型PDF対応: {total}ページを分割解析します")
                 yielded = 0
                 failed_pages = 0
+                # IP-401 §8-中7: 一度でも何かを yield したページ番号。
+                # 「無音でページが消える」バグ全般に対する最終哨戒であり、
+                # 個別の欠落経路（封筒・整形例外）を塞いだ後も、将来また別の
+                # 経路で欠落が生まれたときに気づけるようにする。
+                # 裁決により警告のみ（成否判定は変えない、P2 繰延）。
+                seen_pages = set()
+
+                def _mark(payload):
+                    """出力を記録してから payload を返す（yield と対で使う）。
+
+                    記録と yield を1つの式にまとめる。別々の文にすると、将来
+                    yield 地点を増やしたときに記録だけ書き忘れ——哨戒自身が
+                    「成功したページを欠落と誤報する」という、まさに防ぎたい
+                    種類の欠陥を生む。ページ番号は payload から取るので
+                    ずれようがない。
+                    """
+                    seen_pages.add(payload["page_num"])
+                    return payload
 
                 for page_info in itertools.chain([first_page], page_gen):
                     idx = page_info["page_num"]
@@ -2041,9 +2059,9 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                     except Exception as page_err:
                         failed_pages += 1
                         print(f"{prefix}❌ ページ処理エラーのためスキップ: {type(page_err).__name__}: {str(page_err)[:120]}")
-                        yield _page_error_payload(
+                        yield _mark(_page_error_payload(
                             f"ページ処理エラー: {type(page_err).__name__}",
-                            idx, total, page_data)
+                            idx, total, page_data))
                         gc.collect()
                         continue
 
@@ -2053,8 +2071,8 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                         # このページのデータが無音欠落する（例外経路と同扱い）
                         failed_pages += 1
                         print(f"{prefix}⚠️ AIの応答がJSONではありませんでした")
-                        yield _page_error_payload(
-                            "AI応答のJSON解析失敗", idx, total, page_data)
+                        yield _mark(_page_error_payload(
+                            "AI応答のJSON解析失敗", idx, total, page_data))
                         gc.collect()
                         continue
 
@@ -2090,18 +2108,27 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                             failed_pages += 1
                             print(f"{prefix}❌ 整形処理エラー: "
                                   f"{type(fmt_err).__name__}: {str(fmt_err)[:120]}")
-                            yield _page_error_payload(
+                            yield _mark(_page_error_payload(
                                 f"整形処理エラー: {type(fmt_err).__name__}",
-                                idx, total, page_data)
+                                idx, total, page_data))
                             break
-                        yield {
+                        yield _mark({
                             "result": entry,
                             "page_num": idx,
                             "total_pages": total,
                             "page_bytes": page_data,
-                        }
+                        })
                         yielded += 1
                     gc.collect()
+
+                # ページカバレッジ突合（IP-401 §8-中7）
+                # 個別の欠落経路を塞いだ後の最終哨戒。将来また別経路で無音
+                # 欠落が生まれたときに、顧客が枚数を数えるより先に気づく。
+                missing = sorted(set(range(start_page, total + 1)) - seen_pages)
+                if missing:
+                    print(f"⚠️ ページカバレッジ警告: {len(missing)}/{total}頁が"
+                          f"一度も出力されませんでした {missing} "
+                          f"（無音欠落の疑い。処理は継続します）")
 
                 if yielded > 0:
                     print(

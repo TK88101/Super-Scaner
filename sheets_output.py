@@ -31,6 +31,7 @@ AUDIT_HEADERS = ["日時", "ファイル名", "ページ", "判定", "理由", "
 # 「判定」列の値。理由（reason）は機械可読な英字キー、判定は人が読む日本語。
 AUDIT_VERDICT_EXCLUDED = "除外"   # 仕訳を作らず MF 区にも書かなかったページ
 AUDIT_VERDICT_BRANCH = "分岐"     # MF には正常記帳したが封筒シグナルも命中した
+AUDIT_VERDICT_MISSING = "欠落"    # 一度も出力されなかったページ（無音欠落の疑い）
 
 if not AUDIT_TAB_NAME.startswith("_"):
     # import 時に落とす。命名規約を破ると監査タブが毎晩 22:00 に GAS へ削除され、
