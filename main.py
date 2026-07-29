@@ -335,6 +335,8 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
     total_entries = 0
     error_pages = 0
     failed_page_nums = []
+    excluded_pages = 0
+    excluded_page_nums = []
 
     for page in process_pipeline(file_path, doc_type=doc_type):
         result = page["result"]
@@ -347,6 +349,20 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
         if result.get("_page_error"):
             error_pages += 1
             failed_page_nums.append(page_num)
+            continue
+
+        # IP-401 T1: 封筒等の除外ページは MF データ区に一切書かない。
+        # ここで continue しないと entries=[] かつ _unrecognized 無しのため
+        # sheets_output の最終防衛 (_write_unrecognized_row) に落ち、取引No を
+        # 消費して赤い「認識不能」占位行が MF 区に混ざる（Plan §3.2 違反）。
+        # error_pages には数えない（除外は失敗ではない）。count には既に
+        # 数えており、全頁封筒でも count>0 → Failed 無限リトライを回避する。
+        # 留痕先（監査タブ）への振り分けは T2 で実装する。
+        if result.get("_excluded_page"):
+            excluded_pages += 1
+            excluded_page_nums.append(page_num)
+            print(f"📨 [{page_num}/{total_pages}] 除外ページ "
+                  f"({result.get('_exclude_reason', 'unknown')}) → MF区には書きません")
             continue
 
         entries = result.get('entries', [])
@@ -413,6 +429,9 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
     if count > 0:
         vendor_list = ", ".join(v for v in vendor_names if v)
         print(f"\n✅ 処理完了: {count}文書 / {total_entries}仕訳")
+        if excluded_pages:
+            excluded_pages_str = ",".join(f"p{n}" for n in excluded_page_nums)
+            print(f"📨 除外ページ: {excluded_pages}/{count}頁 [{excluded_pages_str}]")
         if partial_error:
             failed_pages_str = ",".join(f"p{n}" for n in failed_page_nums)
             print(f"⚠️ 部分ページエラー: {error_pages}/{count}頁失敗 [{failed_pages_str}]")

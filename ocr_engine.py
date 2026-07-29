@@ -1682,7 +1682,26 @@ def _route_ocr_strategy(
     return raw_data, ocr_text, ocr_conf
 
 
-def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix=""):
+def _blank_result(date="", vendor="", **markers):
+    """entries を持たない result dict（認識不能・除外ページ）を組み立てる。
+
+    `_page_error_payload` はページ封筒（page_num 等を含む外側）を作るのに対し、
+    こちらは result dict そのもの。両者とも「占位行の形状を 1 箇所に集約して
+    漂移を防ぐ」という同じ意図で、markers に `_unrecognized=True` や
+    `_excluded_page=True` / `_exclude_reason=...` を渡し分ける。
+    """
+    return {
+        "date": date,
+        "vendor": vendor,
+        "invoice_num": "",
+        "memo": "",
+        "entries": [],
+        **markers,
+    }
+
+
+def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
+                        envelope_filter=False):
     """1ページ分の解析結果を doc_type 別に整形して result dict を yield する。
 
     process_pipeline の「PDF 逐頁ループ」と「単ページ PDF/画像（尾段）」は
@@ -1693,8 +1712,14 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix=""):
     一本化し、呼び出し側は page_num/total_pages/page_bytes 等のページメタ
     情報を付与してラップするだけにする。
 
-    封筒/非領収書ページ判定 (_is_envelope_page) はループ側のみの関心事のため
-    ここには含めない（尾段には元々その判定が存在しない——挙動を変えない）。
+    IP-401 T1: 封筒/非領収書ページ判定 (_is_envelope_page) は本関数へ移設された。
+    ただし §3.5 の裁決により有効なのは PDF 逐頁ループから
+    `envelope_filter=True` で呼ばれたときだけで、尾段（単頁 PDF・画像）は
+    既定の False のまま——尾段には元々この判定が無く、挙動を変えない。
+
+    Args:
+        envelope_filter: True なら RECEIPT の封筒/不要ページ判定を有効化する。
+            PDF 逐頁ループ専用（§3.5）。
 
     Yields:
         dict: result dict そのもの（page_num 等は含まない。呼び出し側が付与）
@@ -1704,20 +1729,45 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix=""):
     if doc_type == DocType.RECEIPT:
         page_results = _normalize_receipt_results(
             raw_data, prefix=prefix, ocr_confidence=ocr_conf)
+
+        # ── IP-401 T1: 封筒判定を「前置拒否権」から「事後説明器」へ ──
+        # 旧実装は Gemini 呼び出しの直後・整形の前にこの判定を置き、命中したら
+        # continue で無音 skip していた。PaddleOCR の誤認識テキストだけを見て
+        # Gemini の成果を単独で否決できる構造であり、Strategy C（交差検証）の
+        # 設計意図がこの一点で潰れていた。実際に舞鶴パークの小型サーマル
+        # 領収証（「領収証」→「领収证」と誤認識）が無音で消えている。
+        #
+        # 改後は entries を組めたかどうかを先に見る。組めていれば棄却経路は
+        # 存在しない（目標1が構造的に達成される）。組めなかったときだけ
+        # 封筒判定を「なぜ空だったのか」の分類器として使う。
+        is_envelope = bool(
+            envelope_filter and _is_envelope_page(ocr_text, raw_data))
+
         if not page_results:
+            if is_envelope:
+                # 除外はするが**無音にはしない**。呼び出し側が監査タブへ回す。
+                # _page_error は立てない: これは失敗ではなく正常な除外であり、
+                # 立てると main が Failed 判定 → ファイル保持 → 無限リトライ。
+                print(f"{prefix}📨 封筒/非領収書ページとして除外（監査タブに記録）")
+                yield _blank_result(_excluded_page=True,
+                                    _exclude_reason="envelope")
+                return
             print(f"{prefix}⚠️ 有効な仕訳エントリが見つかりません → 認識不能として記録")
             p_date, p_vendor = _extract_partial_data(raw_data)
-            yield {
-                "date": p_date,
-                "vendor": p_vendor,
-                "invoice_num": "",
-                "memo": "",
-                "entries": [],
-                "_unrecognized": True,
-            }
+            yield _blank_result(date=p_date, vendor=p_vendor,
+                                _unrecognized=True)
             return
-        for entry in page_results:
-            yield entry
+
+        # entries は有効だが封筒シグナルも命中 → 記帳は止めず（Gemini 優先＝
+        # 交差検証の設計意図）、人手抽査用に監査タブへ「分岐」を残す。
+        # Gemini が本物の封筒に偽 entry を捏造する可能性への担保（§6）。
+        # 記録はページ単位で 1 行にしたいので先頭 result にだけ付ける。
+        if is_envelope:
+            yield {**page_results[0],
+                   "_audit_signal": "envelope_signal_with_entries"}
+            yield from page_results[1:]
+        else:
+            yield from page_results
         return
 
     # ── 非領収書（請求書系・給与明細）: builder 適用 ──
@@ -1844,18 +1894,15 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                         gc.collect()
                         continue
 
-                    # ── 封筒・非領収書ページ検出（コードレベル強制フィルタ）──
-                    # Session 16 裁決: この判定の構造キーワード（「領収」「請求書」
-                    # 「合計」等）は領収書向けに調整されたヒューリスティックであり、
-                    # 給与明細等の非領収書ページ（短文の明細ページ等）に誤爆すると
-                    # skip（yield されない）→ count==0 → Failed → 無限リトライ、
-                    # あるいは無音のページ欠落を引き起こす。よって RECEIPT に限定
-                    # する。非領収書の実際の封筒/送付状ページは _build_doc_result
-                    # の _unrecognized 占位行で可視化・アーカイブされるため兜は残る。
-                    if doc_type == DocType.RECEIPT and _is_envelope_page(ocr_text, page_raw_data):
-                        print(f"{prefix}📨 封筒/非領収書ページを検出、スキップします")
-                        continue
-
+                    # ── 封筒・非領収書ページ検出 ──
+                    # IP-401 T1: ここにあった「判定して continue（無音 skip）」は
+                    # 廃止。判定は _yield_page_results の内側へ移設し、
+                    # 「entries を組めなかったページの理由分類器」に降格した
+                    # （envelope_filter=True）。無音 skip は顧客が枚数を数える
+                    # までしか発見手段がなく、実際に本番で1票欠落している。
+                    # Session 16 の RECEIPT 限定裁決は移設先でも維持される
+                    # （判定は RECEIPT 分岐の内側にしか無い）。
+                    #
                     # OCR オーバーライド → doc_type別ルーティング → result dict 整形
                     # は _yield_page_results に一本化済み（尾段と共通ロジック）
                     #
@@ -1868,7 +1915,8 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                     # 次ページへ進む。yield 自体は try の外に置き、消費側から
                     # throw/close された例外を誤って握り潰さないようにする。
                     page_iter = _yield_page_results(
-                        doc_type, page_raw_data, ocr_text, ocr_conf, prefix=prefix)
+                        doc_type, page_raw_data, ocr_text, ocr_conf, prefix=prefix,
+                        envelope_filter=True)
                     while True:
                         try:
                             entry = next(page_iter)
