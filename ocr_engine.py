@@ -721,6 +721,106 @@ def _is_envelope_page(ocr_text, raw_data):
     return False
 
 
+# ── 社会保険料通知書の検出（IP-401 T6 / Plan §3.8）──
+# 「保険料納入告知額・領収済額通知書」は券面に当月の納入告知額と前月の
+# 領収済額の2口が印字されており、Gemini は両方を仕訳化してしまう（顧客の表に
+# 実在した誤り: 319,000円 × 2行）。
+#
+# 社員からの共通ルール宣言（2026-07-30、最優先）:
+#   「社会保険料に関する会計処理はアップロードせずに口座振替資料として処理する」
+# 口座振替側で既に記帳される以上、SS 側が当月分を1行作れば二重計上になる。
+# よって**仕訳は一切作らない**。
+#
+# 封筒判定との違い（意図的）:
+#   封筒     = ヒューリスティック。誤爆が怖いので適用範囲を絞る（§3.5）
+#   社会保険 = 確定した業務ルール。全 doc_type・全経路で常時有効にする。
+#              顧客が「今後スキャンしない」と述べてもコードはそれに依存しない
+#              （§7-5 ユーザー裁定: 「你不能去賭它掃不掃」）
+#
+# 誤爆の代償は「静かに消える」より重い。仕訳が0件になるうえ MF タブに
+# 「社会保険料通知書です」という**断定的に誤ったラベル**が顧客向けに書かれる。
+# よって単独で発火させるのは社会保険に固有の複合語だけに限る。
+# 特に「納入告知額」は単独では発火させない——「納入告知書/納入告知額」は
+# 日本の公的機関の徴収通知に広く使われる一般語であり、労働保険料（労働局）等
+# 顧客ルールの対象外の文書まで巻き込む。必ず機関名・保険種別と共起させる。
+_SOCIAL_INSURANCE_STRONG = ["保険料納入告知額", "領収済額通知書"]
+# 単独では別文書（年金定期便・各種お知らせ・労働保険）に誤爆するため
+# 組み合わせで判定する。ペア内の全語が揃って初めて成立。
+_SOCIAL_INSURANCE_WEAK_PAIRS = [
+    ("日本年金機構", "保険料"),
+    ("納入告知額", "厚生年金"),
+    ("納入告知額", "健康保険"),
+    ("納入告知額", "日本年金機構"),
+]
+
+# Gemini 側の取引先名による交差確認。PaddleOCR がキーワードを読み崩しても
+# （改行分断・写像表外の異体字）Gemini が機関名を拾えていれば救える。
+#
+# ただし取引先名**単独では成立させない**。年金機構は通知書以外の文書
+# （年金定期便・各種お知らせ）も送ってくるため、単独条件にすると
+# 「日本年金機構からのお知らせ」——キーワード判定が意図的に弾いている文書——が
+# Gemini の vendor だけで吞まれてしまう。必ず OCR 側の裏付けと組み合わせる。
+_SOCIAL_INSURANCE_VENDORS = ["日本年金機構", "年金事務所"]
+# 取引先名の裏付けとして OCR 側に最低限必要な語（単独では弱すぎる語群）
+_SOCIAL_INSURANCE_CORROBORATION = ["保険料", "納入告知", "領収済額"]
+
+SOCIAL_INSURANCE_REASON = "social_insurance_notice"
+SOCIAL_INSURANCE_MEMO = (
+    "⚠ 社会保険料通知書です。口座振替資料として処理してください"
+    "（仕訳は作成していません）"
+)
+
+# 除外ページの留痕先。理由（なぜ除外したか）と行き先（どこに書くか）は別の
+# 関心事なので、理由文字列から行き先を推測させない。R2 の先例（分岐記録に
+# _exclude_reason を流用せず _audit_signal を新設した）と同じ方針。
+EXCLUDE_DEST_AUDIT_TAB = "audit_tab"   # 封筒等。MF 区を汚さず監査タブへ
+EXCLUDE_DEST_MF_TAB = "mf_tab"         # 運用ルール違反の通知。顧客が必ず見る場所へ
+
+
+def _is_social_insurance_notice(ocr_text, raw_data=None):
+    """社会保険料の納入告知額・領収済額通知書を検出する。
+
+    日本年金機構の定型書式なので券面キーワードが主判定。照合は §3.4 の
+    正規化を共用し PaddleOCR の簡体字誤読に耐える。
+
+    加えて Gemini の取引先名でも交差確認する。OCR だけに頼ると、キーワードが
+    改行で分断されたり写像表外の異体字で崩れたときに見逃し、社会保険料の
+    仕訳が作られて口座振替側と二重計上になる（§3.8 が防ぎたい事態そのもの）。
+    Strategy C の交差検証の精神をここでも使う。
+    """
+    # 空白は「全部」落とす。PaddleOCR は券面のレイアウトどおりに改行を入れるので
+    # 「保険料納入\n告知額」のようにキーワードが行またぎで分断されうる。半角空白
+    # だけ落とす実装だと、まさにその分断で検出を取りこぼし、禁止されている
+    # 社会保険料の仕訳が生成されて口座振替側と二重計上になる。
+    text = re.sub(r'\s+', '', _normalize_for_keyword_match(ocr_text))
+    if any(kw in text for kw in _SOCIAL_INSURANCE_STRONG):
+        return True
+    if any(all(kw in text for kw in pair)
+           for pair in _SOCIAL_INSURANCE_WEAK_PAIRS):
+        return True
+
+    # 取引先名は「裏付け」であって単独の陽性シグナルではない（上のコメント参照）
+    return (_has_social_insurance_vendor(raw_data)
+            and any(kw in text for kw in _SOCIAL_INSURANCE_CORROBORATION))
+
+
+def _has_social_insurance_vendor(raw_data):
+    """Gemini が返した取引先名が年金機構系かを見る（交差確認用）。"""
+    if not isinstance(raw_data, dict):
+        return False
+    vendors = [raw_data.get("vendor", "")]
+    for doc in raw_data.get("documents") or []:
+        if isinstance(doc, dict):
+            vendors.append(doc.get("vendor", ""))
+    for vendor in vendors:
+        if not vendor:
+            continue
+        normalized = re.sub(r'\s+', '', _normalize_for_keyword_match(vendor))
+        if any(kw in normalized for kw in _SOCIAL_INSURANCE_VENDORS):
+            return True
+    return False
+
+
 def _extract_partial_data(raw_data):
     """認識不能ページから部分データ（日付・取引先）を抽出"""
     date = ""
@@ -1770,6 +1870,23 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
     """
     _apply_ocr_overrides(raw_data, ocr_text, prefix)
 
+    # ── IP-401 T6: 社会保険料通知書は仕訳を一切作らない（§3.8）──
+    # 封筒判定と違い entries の有無を見ない。Gemini はこの券面から堂々と
+    # 2口の仕訳を作ってしまう（それが実際の誤りだった）ので、「entries が
+    # 空のときだけ効く」設計では止まらない。業務ルールとして先に短絡する。
+    # doc_type も envelope_filter も問わない: どのフォルダへ投げられても、
+    # 単頁画像でも成立させる（顧客がスキャンしない前提に賭けない）。
+    if _is_social_insurance_notice(ocr_text, raw_data):
+        print(f"{prefix}🏥 社会保険料通知書を検出 → 仕訳を作成せず提示行のみ")
+        yield _blank_result(
+            memo=SOCIAL_INSURANCE_MEMO,
+            _excluded_page=True,
+            _exclude_reason=SOCIAL_INSURANCE_REASON,
+            _exclude_destination=EXCLUDE_DEST_MF_TAB,
+            _ocr_text_len=len(ocr_text or ""),
+        )
+        return
+
     if doc_type == DocType.RECEIPT:
         page_results = _normalize_receipt_results(
             raw_data, prefix=prefix, ocr_confidence=ocr_conf)
@@ -1795,6 +1912,7 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
                 print(f"{prefix}📨 封筒/非領収書ページとして除外（監査タブに記録）")
                 yield _blank_result(_excluded_page=True,
                                     _exclude_reason="envelope",
+                                    _exclude_destination=EXCLUDE_DEST_AUDIT_TAB,
                                     _ocr_text_len=len(ocr_text or ""))
                 return
             print(f"{prefix}⚠️ 有効な仕訳エントリが見つかりません → 認識不能として記録")

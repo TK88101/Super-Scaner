@@ -23,6 +23,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(__file__))
 
 import main
+import ocr_engine
 from doc_types import DocType
 
 
@@ -73,6 +74,7 @@ def _valid_result():
 
 def _excluded_result(reason="envelope", ocr_text_len=55):
     return {"entries": [], "_excluded_page": True, "_exclude_reason": reason,
+            "_exclude_destination": ocr_engine.EXCLUDE_DEST_AUDIT_TAB,
             "_ocr_text_len": ocr_text_len}
 
 
@@ -232,6 +234,123 @@ class AuditTabRoutingTest(unittest.TestCase):
         # Assert: 単一時系列で順序そのものを断言する
         # （別リストの件数だけ見るテストは順序を入れ替えても通ってしまう）
         self.assertEqual(writer.events, ["entries", "audit"])
+
+
+class SocialInsuranceNoticeRoutingTest(unittest.TestCase):
+    """IP-401 T6 / §3.8: 社会保険料通知書だけは MF タブへ提示行を書く。
+
+    封筒（監査タブ行き）とは性質が違う。これは正常な除外ではなく**運用ルール
+    違反の通知**であり、顧客が必ず目にする場所でなければ意味がない。
+    """
+
+    def _notice_page(self):
+        return _page({
+            "entries": [],
+            "memo": ocr_engine.SOCIAL_INSURANCE_MEMO,
+            "_excluded_page": True,
+            "_exclude_reason": ocr_engine.SOCIAL_INSURANCE_REASON,
+            "_exclude_destination": ocr_engine.EXCLUDE_DEST_MF_TAB,
+            "_ocr_text_len": 90,
+        }, 1, 1)
+
+    def test_unknown_destination_defaults_to_audit_tab(self):
+        """行き先が宣言されていない result は監査タブへ倒す（MF 区を汚さない）。"""
+        # Arrange: _exclude_destination を持たない古い形の result
+        page = _page({"entries": [], "_excluded_page": True,
+                      "_exclude_reason": "envelope"}, 1, 1)
+
+        # Act
+        _, writer = _run_process_file([page])
+
+        # Assert
+        self.assertEqual(writer.calls, [])
+        self.assertEqual(len(writer.audit_calls), 1)
+
+    def test_writes_placeholder_to_mf_tab_not_audit_tab(self):
+        # Arrange / Act
+        ok, writer = _run_process_file([self._notice_page()])
+
+        # Assert: MF タブに1行、監査タブには書かない
+        self.assertTrue(ok)
+        self.assertEqual(len(writer.calls), 1)
+        self.assertEqual(writer.audit_calls, [])
+
+    def test_placeholder_carries_the_guidance_memo(self):
+        # Arrange / Act
+        _, writer = _run_process_file([self._notice_page()])
+
+        # Assert: 顧客が読む文言がそのまま摘要に載る
+        self.assertEqual(writer.calls[0]["memo"],
+                         ocr_engine.SOCIAL_INSURANCE_MEMO)
+
+    def test_placeholder_has_no_entries_and_no_amount(self):
+        """DoD: 占位行の金額列・科目列が空で、MF インポート時に金額を持ち込まない。"""
+        # Arrange / Act
+        _, writer = _run_process_file([self._notice_page()])
+
+        # Assert: entries が空 = 金額行が1本も無い。_unrecognized 経路で書かれる
+        data = writer.calls[0]
+        self.assertEqual(data["entries"], [])
+        self.assertTrue(data.get("_unrecognized"))
+
+    def test_failed_notice_write_is_not_swallowed_into_success(self):
+        """提示行はこのページの唯一の出力。書けなければ成功扱いにしない。
+
+        握り潰すと Success 判定でファイルが歸檔され、顧客は社会保険料通知書を
+        上げたことも記帳されなかったことも知る術がなくなる。
+        """
+        # Arrange: MF タブへの書き込みが失敗する
+        class _FailingWriter(_RecordingWriter):
+            def append_entries(self, employee_name, doc_type, entries_data,
+                               source_url):
+                raise RuntimeError("Sheets 500")
+
+        # Act: 全頁が社会保険料通知書で、その書込が全部失敗
+        ok, writer = _run_process_file([self._notice_page()],
+                                       writer=_FailingWriter())
+
+        # Assert: Failed → ファイル保持 → 次回再試行
+        self.assertFalse(ok)
+
+    def test_mixed_file_keeps_the_specific_notice_in_the_fallback_row(self):
+        """混在ファイルは既存語義どおり歸檔されるが、情報は落とさない。
+
+        再試行すると成功頁の仕訳が重複するため歸檔は変えられない（CLAUDE.md
+        「部分页失败 → 归档（防重试产生重复行）」）。代わりに占位行へ
+        「どの頁が何だったか」を残す。
+        """
+        # Arrange: p1=社会保険料通知書（MF書込が失敗）/ p2=正常な領収書
+        class _NoticeFailingWriter(_RecordingWriter):
+            def append_entries(self, employee_name, doc_type, entries_data,
+                               source_url):
+                if entries_data.get("memo") == ocr_engine.SOCIAL_INSURANCE_MEMO:
+                    raise RuntimeError("Sheets 500")
+                super().append_entries(employee_name, doc_type, entries_data,
+                                       source_url)
+
+        notice = self._notice_page()
+        notice["page_num"], notice["total_pages"] = 1, 2
+
+        # Act
+        ok, writer = _run_process_file(
+            [notice, _page(_valid_result(), 2, 2)],
+            writer=_NoticeFailingWriter())
+
+        # Assert: 歸檔されるが、占位行に社会保険料通知書だった旨が残る
+        self.assertTrue(ok)
+        placeholders = [c for c in writer.calls if c.get("_unrecognized")]
+        self.assertEqual(len(placeholders), 1)
+        self.assertIn("p1:", placeholders[0]["memo"])
+        self.assertIn("社会保険料通知書", placeholders[0]["memo"])
+
+    def test_envelope_exclusion_still_goes_to_audit_tab(self):
+        """回帰保護: 封筒は従来通り監査タブ（MF には書かない）。"""
+        # Arrange / Act
+        _, writer = _run_process_file([_page(_excluded_result(), 1, 1)])
+
+        # Assert
+        self.assertEqual(writer.calls, [])
+        self.assertEqual(len(writer.audit_calls), 1)
 
 
 if __name__ == "__main__":

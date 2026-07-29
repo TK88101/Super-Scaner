@@ -15,7 +15,9 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from googleapiclient.errors import HttpError
 # 引入我們的模塊
-from ocr_engine import process_pipeline
+from ocr_engine import (
+    EXCLUDE_DEST_AUDIT_TAB, EXCLUDE_DEST_MF_TAB, process_pipeline,
+)
 from sheets_output import (
     AUDIT_VERDICT_BRANCH, AUDIT_VERDICT_EXCLUDED, SheetsOutputWriter,
 )
@@ -340,6 +342,70 @@ def _build_unrecognized_placeholder(uploader_name, filename, memo):
     }
 
 
+def _record_excluded_page(sheets_writer, resolver, result, uploader_name,
+                          doc_type, filename, page_num, total_pages):
+    """除外ページの留痕を、result が宣言した行き先へ書く。
+
+    行き先は producer（ocr_engine）が `_exclude_destination` で宣言する。
+    理由文字列から行き先を推測しない——理由（なぜ除外したか）と行き先
+    （どこに書くか）は別の関心事であり、reason の増加に合わせて main 側の
+    分岐を書き足し忘れる事故を避ける。
+
+      audit_tab（封筒等）: MF 区を汚さない。取引No も消費しない
+      mf_tab（社会保険料通知書）: 正常な除外ではなく**運用ルール違反の通知**
+        であり、顧客が必ず目にする場所でなければ意味がない（§3.8）
+
+    除外ページのために Drive へ単ページ PDF を上げるのは割に合わないので、
+    リンクはアップロード無しの #page= アンカーで足りる。
+    """
+    reason = result.get("_exclude_reason", "unknown")
+    destination = result.get("_exclude_destination", EXCLUDE_DEST_AUDIT_TAB)
+    source_url = resolver.anchor_url(page_num, total_pages)
+
+    if destination == EXCLUDE_DEST_MF_TAB:
+        # entries が空なので金額列・科目列は空のまま
+        # = MF インポート時に金額を持ち込まない。
+        print(f"🏥 [{page_num}/{total_pages}] 除外ページ ({reason}) "
+              f"→ MFタブに提示行（仕訳は作成しません）")
+        try:
+            sheets_writer.append_entries(
+                employee_name=uploader_name,
+                doc_type=doc_type,
+                entries_data=_build_unrecognized_placeholder(
+                    uploader_name, filename, result.get("memo", "")),
+                source_url=source_url,
+            )
+        except Exception as e:
+            # この提示行はこのページの**唯一の出力**であり、監査タブ行のような
+            # 「あれば嬉しい」記録ではない。握り潰すと Success 判定でファイルが
+            # 歸檔され、顧客は社会保険料通知書を上げたことも、それが記帳
+            # されなかったことも知る術がなくなる。失敗として上へ返し、
+            # 再試行対象（ファイル保持）に載せる。
+            print(f"❌ 除外ページの提示行の書き込み失敗 ({reason}): {e}")
+            return False
+        return True
+
+    print(f"📨 [{page_num}/{total_pages}] 除外ページ ({reason}) "
+          f"→ 監査タブに記録（MF区には書きません）")
+    try:
+        sheets_writer.append_audit_row(
+            filename=filename,
+            page_num=page_num,
+            verdict=AUDIT_VERDICT_EXCLUDED,
+            reason=reason,
+            ocr_text_len=result.get("_ocr_text_len", 0),
+            source_url=source_url,
+        )
+    except Exception as e:
+        # §3.7: 真の除外は監査タブが唯一の留痕。失敗したら MF の赤い
+        # 認識不能占位行へ退避して必ず可視化する（無音欠落に戻さない）。
+        print(f"⚠️ 監査タブ書き込み失敗 → MF区の認識不能行へ退避: {e}")
+        _write_audit_fallback_row(
+            sheets_writer, uploader_name, doc_type, filename,
+            page_num, reason, source_url)
+    return True
+
+
 def _write_audit_fallback_row(sheets_writer, uploader_name, doc_type, filename,
                               page_num, reason, source_url):
     """監査タブ書込に失敗した除外ページを MF 区の認識不能行へ退避する（§3.7）。
@@ -395,6 +461,7 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
     failed_page_nums = []
     excluded_pages = 0
     excluded_page_nums = []
+    failed_page_notes = {}  # {page_num: 具体的な説明} 占位行で汎用文言に埋もれさせない
 
     for page in process_pipeline(file_path, doc_type=doc_type):
         result = page["result"]
@@ -416,30 +483,23 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
         # error_pages には数えない（除外は失敗ではない）。count には既に
         # 数えており、全頁封筒でも count>0 → Failed 無限リトライを回避する。
         if result.get("_excluded_page"):
+            recorded = _record_excluded_page(
+                sheets_writer, resolver, result, uploader_name, doc_type,
+                filename, page_num, total_pages)
+            if not recorded:
+                # 留痕を残せなかった除外は「静かに消えた」のと同じ。除外として
+                # 数えず失敗として扱う。全頁がこれならファイル保持→再試行。
+                # 混在ファイルは既存語義どおり歸檔されるが（再試行すると成功頁の
+                # 仕訳が重複するため）、そのとき書かれる占位行に「どの頁が何
+                # だったか」を残し、汎用文言で情報を落とさないようにする。
+                error_pages += 1
+                failed_page_nums.append(page_num)
+                failed_page_notes[page_num] = (
+                    result.get("memo")
+                    or f"除外ページ({result.get('_exclude_reason', 'unknown')})")
+                continue
             excluded_pages += 1
             excluded_page_nums.append(page_num)
-            reason = result.get("_exclude_reason", "unknown")
-            print(f"📨 [{page_num}/{total_pages}] 除外ページ ({reason}) "
-                  f"→ 監査タブに記録（MF区には書きません）")
-            # 除外ページのために Drive へ単ページ PDF を上げるのは割に合わない
-            # ので、アップロード無しの #page= アンカーで足りる（anchor_url）。
-            source_url = resolver.anchor_url(page_num, total_pages)
-            try:
-                sheets_writer.append_audit_row(
-                    filename=filename,
-                    page_num=page_num,
-                    verdict=AUDIT_VERDICT_EXCLUDED,
-                    reason=reason,
-                    ocr_text_len=result.get("_ocr_text_len", 0),
-                    source_url=source_url,
-                )
-            except Exception as e:
-                # §3.7: 真の除外は監査タブが唯一の留痕。失敗したら MF の赤い
-                # 認識不能占位行へ退避して必ず可視化する（無音欠落に戻さない）。
-                print(f"⚠️ 監査タブ書き込み失敗 → MF区の認識不能行へ退避: {e}")
-                _write_audit_fallback_row(
-                    sheets_writer, uploader_name, doc_type, filename,
-                    page_num, reason, source_url)
             continue
 
         entries = result.get('entries', [])
@@ -512,7 +572,9 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
                 entries_data=_build_unrecognized_placeholder(
                     uploader_name, filename,
                     f"⚠ ページ処理エラー {error_pages}/{count}頁 "
-                    f"[{failed_pages_str}] 手動再スキャン要"),
+                    f"[{failed_pages_str}] 手動再スキャン要"
+                    + "".join(f" / p{n}: {note}"
+                              for n, note in sorted(failed_page_notes.items()))),
                 source_url=base_url,
             )
         except Exception as e:
