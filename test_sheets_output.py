@@ -13,8 +13,12 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+import gspread
+
 from doc_types import DocType
-from sheets_output import _build_description, SheetsOutputWriter
+from sheets_output import (
+    AUDIT_HEADERS, AUDIT_TAB_NAME, _build_description, SheetsOutputWriter,
+)
 
 
 class BuildDescriptionTest(unittest.TestCase):
@@ -542,6 +546,169 @@ class AppendEntriesSilentLossGuardTest(unittest.TestCase):
         self.assertEqual(len(written), 1)
         self.assertEqual(written[0][18],
                          "⚠ ページ処理エラー 2/8頁 手動再スキャン要")
+
+
+class _FakeAuditWorksheet:
+    """監査タブ用の worksheet スタブ（ヘッダ1行のみの素のタブ）。"""
+
+    def __init__(self, values=None):
+        self._values = [list(r) for r in values] if values is not None else []
+        self.appended = []
+        self.row_count = 1000
+        self.added_rows = 0
+
+    def get_all_values(self):
+        return [list(r) for r in self._values]
+
+    def row_values(self, idx):
+        return list(self._values[idx - 1]) if len(self._values) >= idx else []
+
+    def append_row(self, row, value_input_option=None):
+        self._values.append(list(row))
+
+    def append_rows(self, rows, value_input_option=None):
+        self.appended.extend(rows)
+        self._values.extend([list(r) for r in rows])
+
+    def add_rows(self, n):
+        self.added_rows += n
+        self.row_count += n
+
+
+class _FakeSpreadsheet:
+    """worksheet 取得/作成だけを提供するスプレッドシート代役。"""
+
+    def __init__(self, existing=None):
+        self._sheets = dict(existing or {})
+        self.created = []
+
+    def worksheet(self, title):
+        if title not in self._sheets:
+            raise gspread.exceptions.WorksheetNotFound(title)
+        return self._sheets[title]
+
+    def add_worksheet(self, title, rows, cols):
+        ws = _FakeAuditWorksheet()
+        self._sheets[title] = ws
+        self.created.append({"title": title, "rows": rows, "cols": cols})
+        return ws
+
+
+def _make_audit_writer(existing=None):
+    """gspread 認証を回避した、監査タブ用の SheetsOutputWriter。"""
+    writer = SheetsOutputWriter.__new__(SheetsOutputWriter)
+    writer._ws_cache = {}
+    writer._tab_has_data = {}
+    writer._tab_next_txn = {}
+    writer._tabs_sanitized = set()
+    writer.spreadsheet = _FakeSpreadsheet(existing)
+    return writer
+
+
+class AuditTabTest(unittest.TestCase):
+    """IP-401 T2: 除外ページの留痕先＝独立監査タブ。
+
+    MF データ区（仕訳タブ）には書かない。取引No・行 fingerprint を消費して
+    MF インポートデータを汚すため（Plan §3.2）。ただし無音で消すのも不可なので
+    専用タブへ追記する。
+    """
+
+    def test_tab_name_starts_with_underscore(self):
+        """GAS の backupAllTabs_ は '_' 始まり以外の全タブを退避後に**削除**する
+        （gas/daily_backup_ido.gs の deleteSourceTabs_）。通常名で作ると監査タブが
+        毎晩 22:00 に消える。"""
+        self.assertTrue(AUDIT_TAB_NAME.startswith("_"),
+                        f"監査タブ名は '_' 始まり必須: {AUDIT_TAB_NAME}")
+
+    def test_creates_tab_with_audit_headers_not_mf_headers(self):
+        # Arrange: 監査タブが存在しない
+        writer = _make_audit_writer()
+
+        # Act
+        with redirect_stdout(io.StringIO()):
+            writer.append_audit_row(filename="r.pdf", page_num=1,
+                                    verdict="除外", reason="envelope",
+                                    ocr_text_len=55, source_url="https://x/1")
+
+        # Assert: MF 凡例4行や MF_HEADERS ではなく 7 列の監査 schema
+        created = writer.spreadsheet.created
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0]["title"], AUDIT_TAB_NAME)
+        self.assertEqual(created[0]["cols"], len(AUDIT_HEADERS))
+        ws = writer.spreadsheet.worksheet(AUDIT_TAB_NAME)
+        self.assertEqual(ws.get_all_values()[0], AUDIT_HEADERS)
+
+    def test_appends_row_with_expected_columns(self):
+        # Arrange
+        writer = _make_audit_writer()
+
+        # Act
+        with redirect_stdout(io.StringIO()):
+            writer.append_audit_row(filename="r.pdf", page_num=3,
+                                    verdict="除外", reason="envelope",
+                                    ocr_text_len=55, source_url="https://x/3")
+
+        # Assert: 日時以外の 6 列を固定（日時は実行時刻なので形だけ確認）
+        ws = writer.spreadsheet.worksheet(AUDIT_TAB_NAME)
+        row = ws.appended[-1]
+        self.assertEqual(len(row), len(AUDIT_HEADERS))
+        self.assertEqual(row[1:], ["r.pdf", 3, "除外", "envelope", 55, "https://x/3"])
+        self.assertRegex(row[0], r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}$")
+
+    def test_existing_tab_with_wrong_header_is_not_overwritten(self):
+        """R1: 既存タブのヘッダが想定と違う場合は上書きせずエラー報告。"""
+        # Arrange: 誰かが同名タブを別 schema で作っていた
+        stale = _FakeAuditWorksheet([["取引No", "取引日", "借方勘定科目"]])
+        writer = _make_audit_writer({AUDIT_TAB_NAME: stale})
+
+        # Act / Assert: 破壊せず例外
+        with redirect_stdout(io.StringIO()):
+            with self.assertRaises(Exception):
+                writer.append_audit_row(filename="r.pdf", page_num=1,
+                                        verdict="除外", reason="envelope",
+                                        ocr_text_len=55, source_url="")
+        self.assertEqual(stale.get_all_values(),
+                         [["取引No", "取引日", "借方勘定科目"]])
+
+    def test_headerless_tab_is_self_healed_not_rejected(self):
+        """add_worksheet 成功・ヘッダ書込失敗で残った空タブから自己回復する。
+
+        ここを schema 不一致で撥ねると、監査機能が永久に MF 退避行へ落ち、
+        人手で表を直すまで復旧しない（Codex P1 指摘）。空タブなら誰のデータも
+        壊さないので書き直す。
+        """
+        # Arrange: 前回の初期化が中断してヘッダ無しタブだけ残った状態
+        orphan = _FakeAuditWorksheet([])
+        writer = _make_audit_writer({AUDIT_TAB_NAME: orphan})
+
+        # Act
+        with redirect_stdout(io.StringIO()):
+            writer.append_audit_row(filename="r.pdf", page_num=1,
+                                    verdict="除外", reason="envelope",
+                                    ocr_text_len=55, source_url="")
+
+        # Assert: ヘッダが復元され、監査行も書けている
+        values = orphan.get_all_values()
+        self.assertEqual(values[0], AUDIT_HEADERS)
+        self.assertEqual(len(values), 2)
+
+    def test_existing_tab_with_correct_header_is_reused(self):
+        # Arrange
+        existing = _FakeAuditWorksheet([list(AUDIT_HEADERS),
+                                        ["2026/07/29 10:00:00", "old.pdf", 1,
+                                         "除外", "envelope", 40, ""]])
+        writer = _make_audit_writer({AUDIT_TAB_NAME: existing})
+
+        # Act
+        with redirect_stdout(io.StringIO()):
+            writer.append_audit_row(filename="new.pdf", page_num=2,
+                                    verdict="分岐",
+                                    reason="envelope_signal_with_entries",
+                                    ocr_text_len=120, source_url="https://x/2")
+
+        # Assert: 新規作成せず追記のみ
+        self.assertEqual(writer.spreadsheet.created, [])
+        self.assertEqual(len(existing.get_all_values()), 3)
 
 
 if __name__ == "__main__":

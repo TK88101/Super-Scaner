@@ -16,7 +16,9 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from googleapiclient.errors import HttpError
 # 引入我們的模塊
 from ocr_engine import process_pipeline
-from sheets_output import SheetsOutputWriter
+from sheets_output import (
+    AUDIT_VERDICT_BRANCH, AUDIT_VERDICT_EXCLUDED, SheetsOutputWriter,
+)
 from notifier import send_notification
 from doc_types import DocType, DOC_TYPE_CONFIG
 import config
@@ -184,6 +186,22 @@ class PageUrlResolver:
                   f"{type(e).__name__}: {str(e)[:120]} → 新規アップロードで継続")
             self._existing = {}
 
+    def anchor_url(self, page_num: int, total_pages: int) -> str:
+        """アップロードせず `#page=` アンカーだけを返す（診断用途）。
+
+        除外ページ（封筒等）の監査タブ行はあくまで可観測性設備であり、その
+        ために Drive へ単ページ PDF を1枚ずつアップロードするのは割に合わない
+        （100頁中20頁が封筒なら 20 回の余計な Drive 書込）。人がページを特定
+        できれば足りるので、resolve() が失敗時に倒す劣化先と同じ形を最初から
+        使う。既に他の理由で解決済みならその URL を再利用する。
+        """
+        if total_pages <= 1 or not self._base_url:
+            return self._base_url
+        cached = self._cache.get(page_num)
+        if cached:
+            return cached
+        return f"{self._base_url}#page={page_num}"
+
     def resolve(self, page_num: int, total_pages: int,
                 page_bytes: bytes | None) -> str:
         # 単ページ文書 / base_url 無し → アップロード不要、そのまま返す
@@ -305,6 +323,46 @@ def is_duplicate_file(service, md5_checksum, processed_folder_id):
 # CSV 関連関数は sheets_output.py に移行済み (廃止)
 
 
+def _build_unrecognized_placeholder(uploader_name, filename, memo):
+    """MF 区に書く「認識不能」占位行の entries_data を組み立てる。
+
+    同じ形状が process_file 内に複数箇所（部分ページエラー・除外ページの退避）
+    あり、逐字コピーだと契約変更時の同期漏れを招く。vendor にファイル名を
+    入れるのは、行だけ見てどの原票の話か分かるようにするため。
+    """
+    return {
+        "entries": [],
+        "_unrecognized": True,
+        "memo": memo,
+        "date": "",
+        "vendor": filename,
+        "uploader": uploader_name,
+    }
+
+
+def _write_audit_fallback_row(sheets_writer, uploader_name, doc_type, filename,
+                              page_num, reason, source_url):
+    """監査タブ書込に失敗した除外ページを MF 区の認識不能行へ退避する（§3.7）。
+
+    監査タブは可観測性設備であり帳簿データではないが、真の除外ページにとっては
+    **唯一の留痕**である。そこが落ちたら無音欠落に逆戻りするため、MF 区を汚す
+    コストを払ってでも人の目に触れる場所へ出す。退避行自体の書込も失敗したら
+    ログに残すしかない（それ以上の保底経路はない）。
+    """
+    try:
+        sheets_writer.append_entries(
+            employee_name=uploader_name,
+            doc_type=doc_type,
+            entries_data=_build_unrecognized_placeholder(
+                uploader_name, filename,
+                f"⚠ 除外ページ p{page_num} ({reason}) "
+                f"監査タブ書き込み失敗のため退避"),
+            source_url=source_url,
+        )
+    except Exception as e:
+        print(f"❌ 除外ページの退避行も書き込めませんでした（留痕なし）: {e}")
+
+
 def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
                   doc_type=DocType.RECEIPT, drive_file_id=None,
                   split_pdf_folder_id=""):
@@ -351,18 +409,37 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
             failed_page_nums.append(page_num)
             continue
 
-        # IP-401 T1: 封筒等の除外ページは MF データ区に一切書かない。
-        # ここで continue しないと entries=[] かつ _unrecognized 無しのため
-        # sheets_output の最終防衛 (_write_unrecognized_row) に落ち、取引No を
-        # 消費して赤い「認識不能」占位行が MF 区に混ざる（Plan §3.2 違反）。
+        # IP-401 T1/T2: 封筒等の除外ページは MF データ区に一切書かず、独立の
+        # 監査タブへ留痕する。MF 区に書くと取引No・行 fingerprint を消費して
+        # MF インポートデータを汚す（Plan §3.2）。かといって無音で消すと顧客は
+        # 枚数を数えるまで気づけない（本件 IP-401 の事故そのもの）。
         # error_pages には数えない（除外は失敗ではない）。count には既に
         # 数えており、全頁封筒でも count>0 → Failed 無限リトライを回避する。
-        # 留痕先（監査タブ）への振り分けは T2 で実装する。
         if result.get("_excluded_page"):
             excluded_pages += 1
             excluded_page_nums.append(page_num)
-            print(f"📨 [{page_num}/{total_pages}] 除外ページ "
-                  f"({result.get('_exclude_reason', 'unknown')}) → MF区には書きません")
+            reason = result.get("_exclude_reason", "unknown")
+            print(f"📨 [{page_num}/{total_pages}] 除外ページ ({reason}) "
+                  f"→ 監査タブに記録（MF区には書きません）")
+            # 除外ページのために Drive へ単ページ PDF を上げるのは割に合わない
+            # ので、アップロード無しの #page= アンカーで足りる（anchor_url）。
+            source_url = resolver.anchor_url(page_num, total_pages)
+            try:
+                sheets_writer.append_audit_row(
+                    filename=filename,
+                    page_num=page_num,
+                    verdict=AUDIT_VERDICT_EXCLUDED,
+                    reason=reason,
+                    ocr_text_len=result.get("_ocr_text_len", 0),
+                    source_url=source_url,
+                )
+            except Exception as e:
+                # §3.7: 真の除外は監査タブが唯一の留痕。失敗したら MF の赤い
+                # 認識不能占位行へ退避して必ず可視化する（無音欠落に戻さない）。
+                print(f"⚠️ 監査タブ書き込み失敗 → MF区の認識不能行へ退避: {e}")
+                _write_audit_fallback_row(
+                    sheets_writer, uploader_name, doc_type, filename,
+                    page_num, reason, source_url)
             continue
 
         entries = result.get('entries', [])
@@ -381,6 +458,25 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
             entries_data=result,
             source_url=source_url,
         )
+
+        # IP-401 T2/R2: entries は有効だが封筒シグナルも命中したページ。
+        # 記帳は止めず（Gemini 優先＝Strategy C 交差検証の設計意図）、Gemini が
+        # 本物の封筒に偽 entry を捏造した場合に備えて人手抽査用の「分岐」を
+        # 監査タブへ残す。書込順序は MF が先・監査が後（帳簿を人質に取らせない）。
+        audit_signal = result.get("_audit_signal")
+        if audit_signal:
+            try:
+                sheets_writer.append_audit_row(
+                    filename=filename,
+                    page_num=page_num,
+                    verdict=AUDIT_VERDICT_BRANCH,
+                    reason=audit_signal,
+                    ocr_text_len=result.get("_ocr_text_len", 0),
+                    source_url=source_url,
+                )
+            except Exception as e:
+                # §3.7: MF は既に正しく書けており帳簿は正しい。監査は諦める。
+                print(f"⚠️ 監査タブへの分岐記録に失敗（記帳は成功）: {e}")
 
         # 軽量サマリーのみ保持（フル結果は GC 対象）
         page_amount = sum(int(e.get('amount', 0)) for e in entries)
@@ -413,14 +509,10 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
             sheets_writer.append_entries(
                 employee_name=uploader_name,
                 doc_type=doc_type,
-                entries_data={
-                    "entries": [],
-                    "_unrecognized": True,
-                    "memo": f"⚠ ページ処理エラー {error_pages}/{count}頁 [{failed_pages_str}] 手動再スキャン要",
-                    "date": "",
-                    "vendor": filename,
-                    "uploader": uploader_name,
-                },
+                entries_data=_build_unrecognized_placeholder(
+                    uploader_name, filename,
+                    f"⚠ ページ処理エラー {error_pages}/{count}頁 "
+                    f"[{failed_pages_str}] 手動再スキャン要"),
                 source_url=base_url,
             )
         except Exception as e:

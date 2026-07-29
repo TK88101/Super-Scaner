@@ -1750,7 +1750,8 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
                 # 立てると main が Failed 判定 → ファイル保持 → 無限リトライ。
                 print(f"{prefix}📨 封筒/非領収書ページとして除外（監査タブに記録）")
                 yield _blank_result(_excluded_page=True,
-                                    _exclude_reason="envelope")
+                                    _exclude_reason="envelope",
+                                    _ocr_text_len=len(ocr_text or ""))
                 return
             print(f"{prefix}⚠️ 有効な仕訳エントリが見つかりません → 認識不能として記録")
             p_date, p_vendor = _extract_partial_data(raw_data)
@@ -1764,7 +1765,8 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
         # 記録はページ単位で 1 行にしたいので先頭 result にだけ付ける。
         if is_envelope:
             yield {**page_results[0],
-                   "_audit_signal": "envelope_signal_with_entries"}
+                   "_audit_signal": "envelope_signal_with_entries",
+                   "_ocr_text_len": len(ocr_text or "")}
             yield from page_results[1:]
         else:
             yield from page_results
