@@ -105,6 +105,15 @@ def process_pdfs_with_strategy(pdf_paths, strategy):
             print(f"\n--- Page {page_idx+1}/{len(reader.pages)} ---")
             page_yielded = False
             for page in process_pipeline(tmp_path, doc_type=DocType.RECEIPT, ocr_strategy=strategy):
+                # IP-401: 除外ページ（封筒等）は精度比較の母数に入れない。
+                # 以前は封筒判定が continue で無音 skip していたため自然に
+                # 除外されていたが、現在は _excluded_page 付きで必ず yield
+                # される。そのまま集計すると「封筒を読み間違えた」扱いになり
+                # 戦略比較の数字が歪む。
+                if page["result"].get("_excluded_page"):
+                    print(f"  📨 除外ページとして集計対象外 "
+                          f"({page['result'].get('_exclude_reason')})")
+                    continue
                 all_results.append(page["result"])
                 page_yielded = True
 

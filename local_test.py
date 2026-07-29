@@ -26,7 +26,8 @@ if sys.platform == "win32":
 load_dotenv()
 
 from ocr_engine import process_pipeline
-from sheets_output import SheetsOutputWriter
+from sheets_output import AUDIT_VERDICT_EXCLUDED, SheetsOutputWriter
+from ocr_engine import EXCLUDE_DEST_AUDIT_TAB, EXCLUDE_DEST_MF_TAB
 from doc_types import DocType, DOC_TYPE_CONFIG
 import config
 import argparse
@@ -87,6 +88,7 @@ def process_local_file(file_info, sheets_writer, strategy=None, start_page=1):
     total_entries = 0
     error_pages = 0
     failed_page_nums = []
+    excluded_pages = 0
     first_write_done = False
     for page in process_pipeline(file_path, doc_type=doc_type, ocr_strategy=strategy, start_page=start_page):
         r = page["result"]
@@ -99,6 +101,45 @@ def process_local_file(file_info, sheets_writer, strategy=None, start_page=1):
         if r.get("_page_error"):
             error_pages += 1
             failed_page_nums.append(page_num)
+            continue
+
+        # IP-401: 除外ページは main.process_file と同じ語義で振り分ける。
+        # ここを実装し忘れると、封筒ページが entries=[] かつ _unrecognized 無しの
+        # ため sheets_output の最終防衛に落ち、MF 区に赤い認識不能行として
+        # 混入する（実際に本 smoke test で発覚した）。process_pipeline の消費者は
+        # main.process_file と本関数の2つあり、片方だけ直すと必ず漂移する
+        # ——CLAUDE.md の ENTRY_BUILDERS 未登録事故と同族。
+        if r.get("_excluded_page"):
+            excluded_pages += 1
+            reason = r.get("_exclude_reason", "unknown")
+            destination = r.get("_exclude_destination", EXCLUDE_DEST_AUDIT_TAB)
+            if destination == EXCLUDE_DEST_MF_TAB:
+                print(f"🏥 [{page_num}/{total_pages}] 除外ページ ({reason}) "
+                      f"→ MFタブに提示行（仕訳は作成しません）")
+                if not first_write_done:
+                    sheets_writer.start_new_file("LocalTest", doc_type, file_name)
+                    first_write_done = True
+                sheets_writer.append_entries(
+                    employee_name="LocalTest",
+                    doc_type=doc_type,
+                    entries_data={
+                        "entries": [], "_unrecognized": True,
+                        "memo": r.get("memo", ""), "date": "",
+                        "vendor": file_name, "uploader": "LocalTest",
+                    },
+                    source_url="",
+                )
+            else:
+                print(f"📨 [{page_num}/{total_pages}] 除外ページ ({reason}) "
+                      f"→ 監査タブに記録（MF区には書きません）")
+                sheets_writer.append_audit_row(
+                    filename=file_name,
+                    page_num=page_num,
+                    verdict=AUDIT_VERDICT_EXCLUDED,
+                    reason=reason,
+                    ocr_text_len=r.get("_ocr_text_len", 0),
+                    source_url="",
+                )
             continue
 
         if total_pages > 1:
