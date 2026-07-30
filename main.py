@@ -21,8 +21,8 @@ from ocr_engine import (
     EXCLUDE_DEST_AUDIT_TAB, EXCLUDE_DEST_MF_TAB, process_pipeline,
 )
 from sheets_output import (
-    AUDIT_VERDICT_BRANCH, AUDIT_VERDICT_EXCLUDED, AUDIT_VERDICT_MISSING,
-    SheetsOutputWriter,
+    AUDIT_VERDICT_BRANCH, AUDIT_VERDICT_DRIFT, AUDIT_VERDICT_EXCLUDED,
+    AUDIT_VERDICT_MISSING, SheetsOutputWriter,
 )
 from notifier import send_notification
 from doc_types import DocType, DOC_TYPE_CONFIG
@@ -766,6 +766,44 @@ def _flush_page(writer, ledger, page_id, doc_type, uploader_name, page_num,
 # B4 Plan §2.3: 頁級 outcome の分類（"種別" 文字列、main 内部専用の軽量タグ）。
 _PLACEHOLDER_KINDS = frozenset({"PLACEHOLDER_WRITTEN", "PLACEHOLDER_PRIOR"})
 
+# IP-402 §4.1/§4.5: 除外ページ（封筒・社会保険料通知書）の頁級 kind。
+# 占位（読めなかった）とは別物——本来記帳すべきでない頁なので、檔級終態の
+# 母数から除く。
+#
+# 分類 drift（過去輪の占位 page doc がある頁を今輪 excluded と判定）にも
+# 専用 kind は与えない（第3版 Plan は EXCLUDED_DRIFT を置いていたが、
+# simcodex Round 1 の指摘を Codex が支持して撤回）。理由: 頁級 kind は
+# `_aggregate_file_outcome` への一過性の入力であって履歴の記録ではない。
+# drift の事実は監査行（AUDIT_VERDICT_DRIFT ＋ `drift:<prior>-><current>`）と
+# 既存の page doc が持続的に持っており、集約層に別名を増やすと「網羅的に
+# kind を分岐する後続コードは EXCLUDED_DRIFT が EXCLUDED の別名だと憶えて
+# いなければならない」という負債だけが残る。
+_EXCLUDED_KINDS = frozenset({"EXCLUDED"})
+
+
+def _classify_excluded_results(results):
+    """除外 result を 1 件以上含む頁の形状を決める（IP-402 §4.1 の混型不変式）。
+
+    戻り値は ("excluded", destination) か ("escalate", reason)。
+
+    現行 producer は除外を単独 yield＋即 return するので混型は起きない。
+    `_yield_page_results` の変更で崩れうる不変式としてここに固定する
+    （既存の "mixed_valid_and_placeholder_result" と同じ扱い）——書込先が
+    一意でない頁を推測で書くくらいなら、書かずに人手へ渡す。
+    """
+    others = [r for r in results if not r.get("_excluded_page")]
+    if others:
+        if any(_has_entries(r) for r in others):
+            return ("escalate", "mixed_excluded_and_valid")
+        return ("escalate", "mixed_excluded_and_placeholder")
+
+    # others が空＝results 全件が除外。改めて絞り込む必要はない。
+    destinations = {r.get("_exclude_destination") or EXCLUDE_DEST_AUDIT_TAB
+                    for r in results}
+    if len(destinations) != 1:
+        return ("escalate", "mixed_exclude_destinations")
+    return ("excluded", destinations.pop())
+
 
 def _classify_page_result_shape(results):
     """頁緩衝（同一 page_num の全 yield）の形状を分類する（§2.2/§2.3、純関数）。
@@ -773,6 +811,7 @@ def _classify_page_result_shape(results):
     戻り値は (kind, detail) のいずれか：
         ("error", "RETRYABLE"|"UNKNOWN") — 頁エラー（transport/未知例外、単独 result）
         ("content_error", None)          — 頁エラー（CONTENT、票面不可読、単独 result）
+        ("excluded", destination)        — 除外ページ（封筒/社会保険料、IP-402 §4.1）
         ("valid", None)                  — 全 result が有効仕訳（entries 非空）
         ("placeholder", None)            — 全 result が認識不能（entries 空、非エラー）
         ("escalate", reason)             — 不変式破れ（混型頁/error 共存、頁号重現とは別軸）
@@ -792,6 +831,12 @@ def _classify_page_result_shape(results):
         if error_class == "CONTENT":
             return ("content_error", None)
         return ("error", error_class)
+
+    # 除外ページ（IP-402 §4.1）。error の後・valid/placeholder の前に判定する
+    # ——除外は entries 空なので、ここを通さないと占位頁に化けて MF 区へ赤い
+    # 占位行が書かれる（IP-402 が是正する誤認そのもの）。
+    if any(r.get("_excluded_page") for r in results):
+        return _classify_excluded_results(results)
 
     has_valid = any(_has_entries(r) for r in results)
     has_placeholder = any(not _has_entries(r) for r in results)
@@ -825,6 +870,90 @@ def _prior_page_kind(ledger, page_id):
     return "POSTED_PRIOR" if count > 0 else "PLACEHOLDER_PRIOR"
 
 
+def _write_excluded_audit_row(writer, resolver, results, filename, page_num,
+                              total_pages, verdict, reason):
+    """除外ページの留痕を監査タブへ 1 行書く（headless 専用）。成功なら True。
+
+    UI 版（`_record_excluded_page`）は監査タブが落ちたら MF の赤い占位行へ
+    退避するが、headless では退避しない（§4.4）——控制面という別の可視化先が
+    あるので、障害時に帳簿を汚してまで留痕する必要がない。失敗は握り潰さず
+    False で返し、呼出側が ESCALATE（ファイル保持・未回報）にする。
+
+    単ページ PDF は上げない（anchor_url）——除外ページのために Drive 書込を
+    1 頁ずつ増やすのは割に合わない（UI 版と同じ判断）。
+    """
+    try:
+        writer.append_audit_row(
+            filename=filename,
+            page_num=page_num,
+            verdict=verdict,
+            reason=reason,
+            ocr_text_len=max((r.get("_ocr_text_len") or 0) for r in results),
+            source_url=resolver.anchor_url(page_num, total_pages),
+        )
+    except Exception as e:
+        print(f"❌ 監査タブへの除外記録に失敗 → ESCALATE（MF へは退避しない）: {e}")
+        return False
+    return True
+
+
+def _handle_excluded_page(writer, ledger, resolver, page_id, destination,
+                          filename, page_num, total_pages, results):
+    """除外ページ 1 頁分（IP-402 §4.2/§4.3/§4.4）。戻り値は (kind, detail)。
+
+    MF 区へは一切書かない——`_flush_page` を通さないので post_page /
+    build_page_write / commit_page のいずれも呼ばれず、取引No も消費しない。
+    行き先が `mf_tab`（社会保険料通知書）でも headless では書かない：外部可見・
+    append-only の副作用には硬冪等が要るが、その器（effect 記録）は §9 へ繰延
+    したので、副作用そのものを起こさないことで要件を満たす。
+
+    page doc も作らない——除外を載せると `_prior_page_kind` が
+    `ticket_count==0` を見て占位頁と同一視し、B4 の身分自証（>0 真データ /
+    ==0 占位）が揺らぐ。ただし **check_page は必ず見る**。載せないことと
+    参照しないことは別で、見ないと過去輪の記帳事実を見落とす。
+    """
+    decision = ledger.check_page(page_id)
+    if decision is PageDecision.ESCALATE:
+        # 診断ログは呼出側（_record_page_classification）が reason 付きで
+        # 1 回出す。ここで出すと同一事象が二重に流れる。
+        return ("ESCALATE", "ledger_witness_ambiguous")
+
+    if decision is PageDecision.SKIP:
+        # 過去輪に page doc がある＝今輪の「除外」と食い違う（分類 drift）。
+        # 黙って捨てず、MF に残る旧行（仕訳 or 占位）と今輪の判定が矛盾して
+        # いる事実を監査タブへ残して人手の突合材料にする。ESCALATE にはしない
+        # ——60秒 TTL の無限再 OCR を招くだけで、自癒の見込みが無い（§1.4）。
+        prior = _prior_page_kind(ledger, page_id)
+        drift_reason = f"drift:{prior}->EXCLUDED"
+        if not _write_excluded_audit_row(
+                writer, resolver, results, filename, page_num, total_pages,
+                AUDIT_VERDICT_DRIFT, drift_reason):
+            return ("ESCALATE", "audit_write_failed")
+        print(f"🔀 [{page_num}/{total_pages}] 分類変化 ({drift_reason}) → 監査タブに記録")
+        # POSTED_PRIOR は維持する——MF に実在する仕訳行は分類が変わっても
+        # 消えない。EXCLUDED に倒すと「零記帳」と集計され、実際には記帳済み
+        # なのに終態が嘘になる（この kind は檔級終態を実際に変える）。
+        # 占位行（PLACEHOLDER_PRIOR）は記帳ではなく「読めなかった」警告な
+        # ので、今輪のより正確な判定で上書きしてよい——こちらは終態を変え
+        # ないので専用 kind を作らず素の EXCLUDED を返す（drift の事実は
+        # 直前に書いた監査行が持つ、_EXCLUDED_KINDS の注記参照）。
+        return (prior if prior == "POSTED_PRIOR" else "EXCLUDED", None)
+
+    # 同頁に複数の除外 result が来た場合は理由を出現順に去重して連結する。
+    # destination 不一致は escalate（行き先を推測で決めない）だが、reason は
+    # 純粋な診断文字列で分岐に影響しないので、人手へ回すより落とさず全部
+    # 残すほうが監査の役に立つ。
+    reason = ",".join(dict.fromkeys(
+        (r.get("_exclude_reason") or "unknown") for r in results))
+    print(f"📨 [{page_num}/{total_pages}] 除外ページ ({reason}, 宣言先={destination}) "
+          f"→ 監査タブに記録（headless は MF 区に一切書きません）")
+    if not _write_excluded_audit_row(
+            writer, resolver, results, filename, page_num, total_pages,
+            AUDIT_VERDICT_EXCLUDED, reason):
+        return ("ESCALATE", "audit_write_failed")
+    return ("EXCLUDED", None)
+
+
 def _classify_and_flush_page(writer, ledger, resolver, base, doc_type,
                              uploader_name, filename, page_num, total_pages,
                              results, page_bytes_list):
@@ -854,6 +983,12 @@ def _classify_and_flush_page(writer, ledger, resolver, base, doc_type,
         if decision is PageDecision.ESCALATE:
             return ("ESCALATE", "ledger_witness_ambiguous")
         return (detail, None)  # 未確認頁のみ今回の一時故障を反映（零書込）
+
+    if shape == "excluded":
+        # IP-402: 記帳経路（_flush_page）へは入れない。detail は行き先宣言。
+        return _handle_excluded_page(
+            writer, ledger, resolver, page_id, detail, filename, page_num,
+            total_pages, results)
 
     if shape == "content_error":
         results = [_apply_content_error_override(
@@ -895,8 +1030,14 @@ def _aggregate_file_outcome(page_kinds, ordered_page_nums, total_pages):
     """檔級終態を頁級 outcome から短絡順位で決定する（B4 Plan §2.3 終態マトリクス、
     ESCALATE は呼出側で頁単位に即返しているためここには現れない）。
 
-    優先順位：RETRYABLE 頁存在 → UNKNOWN 頁存在 → 全頁占位（DEAD_LETTER）→
-    一部頁占位（PARTIAL）→ 全頁 POSTED（SUCCESS）。
+    優先順位：RETRYABLE 頁存在 → UNKNOWN 頁存在 →（以降は除外頁を母数から
+    除いて）零記帳（PARTIAL）→ 全頁占位（DEAD_LETTER）→ 一部頁占位（PARTIAL）
+    → 全頁 POSTED（SUCCESS）。
+
+    除外頁（IP-402 §4.5）は「読めなかった頁」ではなく「本来記帳すべきでない頁」
+    なので母数から除く。除いた結果が空＝零記帳のファイルは POSTED と偽らず
+    PARTIAL（裁定2）。逆に記帳頁が 1 つでもあれば、封筒が混ざっていても
+    SUCCESS でよい——最頻ケース（仕訳頁＋封筒頁）を永久非終端にしない（目標3）。
     """
     if not ordered_page_nums:
         return HeadlessOutcome(ProcessOutcome.FAILED)  # total_pages==0（稀有、現状維持）
@@ -908,12 +1049,17 @@ def _aggregate_file_outcome(page_kinds, ordered_page_nums, total_pages):
     if "UNKNOWN" in kinds:
         return HeadlessOutcome(ProcessOutcome.FAILED, retryable=False)
 
-    if all(k in _PLACEHOLDER_KINDS for k in kinds):
+    accounted = [k for k in kinds if k not in _EXCLUDED_KINDS]
+    if not accounted:
+        # 全頁除外＝零記帳。DEAD_LETTER（死信・人工介入）でも POSTED でもない。
+        return HeadlessOutcome(ProcessOutcome.PARTIAL)
+
+    if all(k in _PLACEHOLDER_KINDS for k in accounted):
         failed_page_nums = [n for n in ordered_page_nums
                             if page_kinds[n] in _PLACEHOLDER_KINDS]
         payload = _build_dead_letter_payload(total_pages, failed_page_nums)
         return HeadlessOutcome(ProcessOutcome.DEAD_LETTER, dead_letter_payload=payload)
-    if any(k in _PLACEHOLDER_KINDS for k in kinds):
+    if any(k in _PLACEHOLDER_KINDS for k in accounted):
         return HeadlessOutcome(ProcessOutcome.PARTIAL)
     return HeadlessOutcome(ProcessOutcome.SUCCESS)
 

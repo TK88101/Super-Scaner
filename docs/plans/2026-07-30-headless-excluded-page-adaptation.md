@@ -128,6 +128,7 @@ B4 批の身分自証（`~/.claude/skills/learned/frozen-schema-self-certifying-
 | 除外 ＋ 有効票 | `("escalate", "mixed_excluded_and_valid")` | 分割器の無歧義性を守る既存不変式と同思想 |
 | 除外 ＋ 占位 | `("escalate", "mixed_excluded_and_placeholder")` | 同上 |
 | 除外が複数で destination 混在 | `("escalate", "mixed_exclude_destinations")` | 行き先が一意でない頁は書かない |
+| 除外のみで `_exclude_destination` 欠落 | `("excluded", audit_tab)` | 消費側デフォルト。宣言漏れは MF を汚さない側へ倒す（`_error_class` 欠落を UNKNOWN へ倒すのと同思想） |
 | 除外 ＋ `_page_error` | error 経路が先に判定（`:783` のまま） | 異常入力への保守側デフォルト |
 
 producer の現行フローでは除外は単独 yield＋即 return なので混型は起きない。
@@ -147,7 +148,7 @@ shape == "excluded":
         record_drift_to_audit(prior)              # 監査タブへ drift 行
         if prior == "POSTED_PRIOR":
             return ("POSTED_PRIOR", None)         # 帳簿の事実を優先（下記）
-        return ("EXCLUDED_DRIFT", None)           # PLACEHOLDER_PRIOR → 今輪判定を優先
+        return ("EXCLUDED", None)                 # PLACEHOLDER_PRIOR → 今輪判定を優先
     return ("EXCLUDED", None)                     # WRITE = 未記帳。page doc は作らない
 ```
 
@@ -156,7 +157,7 @@ shape == "excluded":
 - `POSTED_PRIOR`（過去に**仕訳**を書いた頁が今回 excluded）→ **POSTED_PRIOR を維持**。
   MF に実在する仕訳行は分類が変わっても消えない。ここで EXCLUDED にすると
   「零記帳」と集計され、実際には記帳済みなのに終態が嘘になる
-- `PLACEHOLDER_PRIOR`（過去に**赤い占位行**を書いた頁が今回 excluded）→ **EXCLUDED_DRIFT**。
+- `PLACEHOLDER_PRIOR`（過去に**赤い占位行**を書いた頁が今回 excluded）→ **EXCLUDED**。
   占位行は記帳ではなく「読めなかった」という警告であり、今輪のより正確な判定
   （excluded）で上書きしてよい。ここを `PLACEHOLDER_PRIOR` のまま返すと、
   全頁除外が DEAD_LETTER に落ちて目標2・目標4 が破れる（第2輪 厳重1 の実体）
@@ -164,8 +165,24 @@ shape == "excluded":
   今輪の判定が食い違っている事実を人手が突合できるようにする。ESCALATE には
   しない——60秒 TTL の無限再 OCR を招くため（§1.4）
 
-`EXCLUDED_DRIFT` は集約では `EXCLUDED` と同じ扱い（`_EXCLUDED_KINDS` に含める）。
-kind を分けるのは監査・テスト上の識別のためで、終態計算では同一視する。
+> **撤回（2026-07-30、実装時の simcodex Round 1 ＋ Codex 裁決）**: 第3版は
+> `PLACEHOLDER_PRIOR` の drift に専用 kind `EXCLUDED_DRIFT` を与え「集約では
+> `EXCLUDED` と同じ扱い、kind を分けるのは監査・テスト上の識別のため」と
+> していた。**この専用 kind は撤回し、素の `EXCLUDED` を返す。**
+>
+> 対抗評審の論拠（採納）: 頁級 kind は `_aggregate_file_outcome` への一過性の
+> 入力であって履歴の記録ではない。drift の事実は監査行（`分類変化` ＋
+> `drift:<prior>-><current>`）と既存の page doc が持続的に持っており、集約層に
+> 100% 同義の別名を増やすと「網羅的に kind を分岐する後続コードは
+> `EXCLUDED_DRIFT` が `EXCLUDED` の別名だと憶えていなければならない」という
+> 負債だけが残る。`POSTED_PRIOR` を維持する非対称はむしろこの結論を支持する
+> ——`POSTED_PRIOR` は**檔級終態を実際に変える**（全 POSTED_PRIOR は SUCCESS、
+> 全除外は PARTIAL）が、drift 側は何も変えない。§9 の effect 記録で分岐が要る
+> なら、その判別は `_handle_excluded_page` 内の ledger 状態から直接取れる
+> （集約層まで運ぶ必要がない）。
+>
+> よって `_EXCLUDED_KINDS = frozenset({"EXCLUDED"})`。監査行の
+> `drift:<prior>-><current>` 表現と T2 の該当 DoD（文字列の断言）は**そのまま維持**。
 
 ### 4.3 headless では除外ページの MF 副作用を発生させない
 
@@ -205,7 +222,7 @@ headless では ESCALATE の60秒再試行が**望ましい**——監査書込�
 ```
 RETRYABLE 頁あり → FAILED(retryable)
 UNKNOWN 頁あり   → FAILED
-（以降、EXCLUDED_* を母数から除いた kinds で判定）
+（以降、`_EXCLUDED_KINDS`（＝`{EXCLUDED}` 一種のみ）を母数から除いた kinds で判定）
 残りが空         → PARTIAL       ← 零記帳。POSTED と偽らない（裁定2）
 残り全部が占位   → DEAD_LETTER
 残りに占位あり   → PARTIAL
@@ -232,14 +249,21 @@ UNKNOWN 頁あり   → FAILED
 - **DoD:** 除外頁で `post_page` / `build_page_write` / `commit_page` が**呼ばれない**
 - **DoD:** 除外頁でも `check_page` は**呼ばれる**
 - **DoD:** `POSTED_PRIOR` → kind は `POSTED_PRIOR` のまま、かつ監査タブに drift 行1本
-- **DoD:** `PLACEHOLDER_PRIOR` → kind は `EXCLUDED_DRIFT`、かつ監査タブに drift 行1本
+- **DoD:**（**訂正 2026-07-30**、§4.2 の撤回に伴う）`PLACEHOLDER_PRIOR` →
+  kind は素の `EXCLUDED`（専用 kind `EXCLUDED_DRIFT` は撤回）、かつ監査タブに
+  drift 行1本。drift の識別は監査行が担う
 - **DoD:**（第3輪 #6）drift 行の内容を断言する。「1行あること」だけでは突合材料に
   ならない。既存の監査7列（`日時/ファイル名/ページ/判定/理由/OCR文字数/原票URL`）の
   範囲内で、**過去輪の分類と今輪の分類の両方**が読み取れること——`判定` に
   `分類変化`、`理由` に `drift:<prior_kind>-><current_kind>`（例
   `drift:PLACEHOLDER_PRIOR->EXCLUDED`）を入れ、その文字列をテストで固定する
 - **DoD:** ledger `ESCALATE` → `("ESCALATE", "ledger_witness_ambiguous")`
-- **DoD:** `EXCLUDED_DRIFT` が `_EXCLUDED_KINDS` に含まれ、終態計算で `EXCLUDED` と同一視される
+- **DoD:**（実装時に追加）同頁に複数の除外 result（destination 一致）が来た場合の
+  留痕: reason は出現順で去重連結、`ocr_text_len` は最大値（最も読めた result）。
+  destination 不一致は escalate だが reason は分岐に影響しない診断文字列なので、
+  人手へ回すより落とさず全部残す
+- **DoD:**（**訂正 2026-07-30**）`_EXCLUDED_KINDS == frozenset({"EXCLUDED"})`——
+  除外 kind は 1 種のみで、drift 専用の別名を持たない
 
 ### T3. MF 副作用の遮断
 
@@ -260,7 +284,19 @@ UNKNOWN 頁あり   → FAILED
 - 実装: §4.5
 - **DoD:** 全頁除外 → `PARTIAL`、かつ `report_posted` / `report_dead_letter` が呼ばれない
 - **DoD:** 除外1頁＋POSTED1頁 → `SUCCESS`（目標3）
-- **DoD:** 除外1頁＋占位1頁 → `PARTIAL`
+- **DoD:**（**訂正 2026-07-30**）除外1頁＋占位1頁 → `DEAD_LETTER`。
+  第3版は当初ここを `PARTIAL` と書いていたが、それは §4.5 のアルゴリズム
+  （除外を母数から除く → 残り全部が占位 → DEAD_LETTER）と矛盾する。実装中に
+  テストで検出し、Codex へ単条快速複審を出して裁決した——**§4.5 が正・T5 の
+  当該行が誤記**。理由: 除外を除いた残りが `[占位]` なら単頁不可読 PDF と
+  意味的に同値であり、封筒が1枚混じっただけで DEAD_LETTER が PARTIAL へ
+  格下げされてはならない（除外頁は中立であって、残り頁の意味を変えない）。
+  かつ零記帳なので PARTIAL の語義「一部成功」に当たらず、PARTIAL は未回報
+  （F06-How 未決）＋memo 永久のため、本物の不可読頁が人手へ上がらないまま
+  滞留する
+- **DoD:**（上記訂正を裁決した Codex 単条複審が併せて提案した強化条項を採納）
+  **除外中立性の不変式**: 非除外頁が 1 頁以上残る限り、除外頁を足しても
+  引いても檔級終態は変わらない
 - **DoD:** 除外1頁＋RETRYABLE1頁 → `FAILED(retryable)`（短絡順位不変）
 - **DoD:** 除外を含まない既存ケースの終態が全て不変（回帰）
 
@@ -270,7 +306,7 @@ fake writer/ledger/reporter で以下5種を実測する:
 
 - **DoD:** `excluded → valid`（page doc 無し → 今輪 valid）: 通常記帳される
 - **DoD:** `excluded → placeholder`: 通常の占位経路（除外の残滞が無いこと）
-- **DoD:** `placeholder → excluded`: `EXCLUDED_DRIFT` ＋ 監査 drift 行、全頁なら PARTIAL
+- **DoD:** `placeholder → excluded`: kind は `EXCLUDED` ＋ 監査 drift 行、全頁なら PARTIAL
 - **DoD:** `valid → excluded`: `POSTED_PRIOR` 維持 ＋ 監査 drift 行
 - **DoD:** `excluded(audit) → excluded(mf_notice)`: destination が変わっても headless では
   どちらも MF 書込ゼロ（§4.3 により差が出ない）ことを固定
@@ -284,7 +320,7 @@ fake writer/ledger/reporter で以下5種を実測する:
 
 ### T8. 回帰
 
-- **DoD:** 全量（現 641）緑
+- **DoD:** 全量緑（実装前の基線 641 件を下回らない。本版完了時点で 689 件）
 - **DoD:** headless 既存（`test_process_file_headless` / `test_posting_ledger` /
   `test_headless_*` / `test_golden_*`）緑
 - **DoD:** IP-401 由来（`test_ip401_regression` 等）緑
@@ -298,6 +334,10 @@ fake writer/ledger/reporter で以下5種を実測する:
 | `main.py` | `_classify_page_result_shape` / `_classify_and_flush_page` / `_aggregate_file_outcome` | **高**（headless 終態機の中枢） |
 | `sheets_output.py` | 監査タブへ drift 行を書く呼出しのみ（MF 区・witness に触れない） | 低 |
 | `test_pipeline_consumers.py` | 振る舞いテストへ再構成 | 低 |
+| `headless_rerun_fixture.py` | 夾具拡張（`excluded_page` / `blank_result` / `yield_of` / 監査行と `build_page_write` の spy） | 低 |
+| `test_headless_excluded_page.py` | **新規**（T1-T6 ＋ 受容済み限界の記録） | 低 |
+| `test_process_file_headless.py` | 重複 helper を夾具 import へ置換（テスト内容は不変） | 低 |
+| `CLAUDE.md` | headless の除外語義が UI 版と違うことを追記（実装時に追加） | 低 |
 | `posting_ledger.py` | **変更なし** | — |
 
 本版は `posting_ledger` を無改変、新しい永続状態機ゼロ。既存 witness 機構にも触れない。
@@ -348,6 +388,14 @@ fake writer/ledger/reporter で以下5種を実測する:
 **ユーザー裁定（2026-07-30）**: 上記 #9 に沿って範囲を縮小する。裁定4（外部可見副作用の
 硬冪等）は「headless ではその副作用を発生させない」という保守的な方向で満たす。
 
+> **2026-07-30 追記（実装時）**: 上表 #1 の裁決で採用した `EXCLUDED_DRIFT`（drift 専用の
+> 頁級 kind）は実装時に撤回された（§4.2 の撤回注記）。撤回されたのは「専用 kind」という
+> **実現手段だけ**で、裁決の要点——drift を黙って捨てない／`POSTED_PRIOR` と
+> `PLACEHOLDER_PRIOR` を非対称に扱う／全頁除外を DEAD_LETTER に落とさない——は
+> そのまま維持されている。drift の識別は監査行（判定＝`分類変化`）が担う。
+> §8.1 #6（監査行に過去輪と今輪の両分類を符号化せよ）も影響を受けない——
+> `drift:<prior>-><current>` の断言は T2 の DoD として維持。
+
 ---
 
 ## 8.1 Codex 第3輪 辯論裁決（判定: **実装可**）
@@ -393,7 +441,7 @@ enableable）」。第1輪・第2輪の阻塞指摘は再提されなかった�
 | リスク | 対応 |
 |---|---|
 | 終態機改変で既存 headless テストが崩れる | T8 で全緑を DoD 化。崩れたら設計を疑う（テストを緩めない） |
-| `EXCLUDED_DRIFT` で旧占位行が MF に残ったまま終態が変わる | 監査タブへ drift 行を必ず残す（§4.2）。人手突合の材料を作る |
+| 分類 drift で旧占位行が MF に残ったまま終態が変わる | 監査タブへ drift 行（判定＝`分類変化`）を必ず残す（§4.2）。人手突合の材料を作る |
 | 全頁除外が PARTIAL で未回報のまま滞留 | §9-3 を有効化前置条件に明記。本版の範囲では控制台ログと監査タブに残る |
-| 監査行の重複（第3輪 #4/#5）: ①「遠端 commit 済みだが応答喪失」の曖昧失敗 ②除外頁の監査が成功した後に別頁が原因でファイルが retryable になり次の3秒輪で再追記 ③`EXCLUDED_DRIFT` 行の epoch 間反復 | **本版では受容**。いずれも繰延中の effect 冪等（§9-1）の現れであり、監査タブは可観測性設備で帳簿ではない。§9-1 完了までの既知の許容範囲として明文化する。headless 有効化前に必ず解消すること |
+| 監査行の重複（第3輪 #4/#5）: ①「遠端 commit 済みだが応答喪失」の曖昧失敗 ②除外頁の監査が成功した後に別頁が原因でファイルが retryable になり次の3秒輪で再追記 ③`分類変化`（drift）監査行の epoch 間反復（第3版では `EXCLUDED_DRIFT` 行と呼んでいたもの。§4.2 の撤回で専用 kind は無くなったが、監査行の重複リスクは変わらない。`test_known_limitation_audit_row_duplicates_on_retry` で現状を固定済み） | **本版では受容**。いずれも繰延中の effect 冪等（§9-1）の現れであり、監査タブは可観測性設備で帳簿ではない。§9-1 完了までの既知の許容範囲として明文化する。headless 有効化前に必ず解消すること |
 | 回退 | `wip/sandevistan-before-ip401` 残置。本版の実装は `2eb213b` の後なので `git revert` 可 |

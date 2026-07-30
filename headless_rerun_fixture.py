@@ -25,6 +25,7 @@ from unittest.mock import patch
 import main
 from doc_types import DocType
 from fake_firestore import FakeFirestore  # 台賬 fake は共有モジュール（Reuse 統合）
+from ocr_engine import EXCLUDE_DEST_AUDIT_TAB
 from posting_ledger import PostingLedger
 from sheets_output import _classify_probe
 
@@ -33,7 +34,9 @@ DEFAULT_UPLOADER = "田中"
 _TAB = f"{DEFAULT_UPLOADER}_領収書"
 
 __all__ = ["FakeFirestore", "FakeReporter", "FakeWriter", "HeadlessRerunFixture",
-           "make_ledger", "run_headless", "page", "pages"]
+           "blank_result",
+           "excluded_page", "make_ledger", "run_headless", "page", "pages",
+           "yield_of", "zero_entry_result"]
 
 
 class FakeReporter:
@@ -82,9 +85,14 @@ class FakeWriter:
     def __init__(self):
         self.sheets: dict = {}      # tab_name -> [row, ...]（着地済み）
         self.append_calls = 0
+        self.build_page_write_calls = 0  # MF 行の組立回数（IP-402、commit とは別軸）
         self.placeholder_calls = []  # append_entries（部分エラー占位行）の記録
         self.start_new_file_calls = []  # UI 版のみ呼ばれる（B4 T4 適配）
         self.flush_calls = 0            # UI/headless 共通の後処理フック（B4 T4 適配）
+        # IP-402 適配: 除外ページの留痕先（監査タブ）。audit_error に例外を
+        # 差すと監査書込失敗（IP-402 Plan §4.4 の語義分離）を模せる。
+        self.audit_rows: list = []
+        self.audit_error = None
 
     def _tab(self, employee_name, doc_type):
         return f"{employee_name}_領収書"
@@ -101,11 +109,30 @@ class FakeWriter:
         """部分ページエラーの占位行書込（headless 経路が UI 経路と同一に呼ぶ）。記録のみ。"""
         self.placeholder_calls.append(entries_data)
 
+    def append_audit_row(self, filename, page_num, verdict, reason,
+                         ocr_text_len, source_url=""):
+        """除外/分岐/分類変化ページの監査タブ追記（IP-402）。記録のみ。
+
+        audit_error が設定されていれば送出する——監査タブが落ちたときの
+        語義（headless は ESCALATE、UI は MF 退避）を分けて検証するため。
+        """
+        if self.audit_error is not None:
+            raise self.audit_error
+        self.audit_rows.append({
+            "filename": filename, "page_num": page_num, "verdict": verdict,
+            "reason": reason, "ocr_text_len": ocr_text_len,
+            "source_url": source_url,
+        })
+
     def next_txn_no(self, employee_name, doc_type):
         tab = self._tab(employee_name, doc_type)
         return len(self.sheets.get(tab, [])) + 1
 
     def build_page_write(self, employee_name, doc_type, results, urls, start_txn):
+        # IP-402: 除外ページで「MF 行を組み立てすらしない」ことを直接断言
+        # できるようにする——commit_page の回数だけでは、組み立てたが commit
+        # しなかった実装（取引No を消費しうる）と区別できない。
+        self.build_page_write_calls += 1
         tab = self._tab(employee_name, doc_type)
         rows = []
         txn = start_txn
@@ -142,6 +169,11 @@ class _FakeResolver:
     def resolve(self, page_num, total_pages, page_bytes):
         return f"http://url/p{page_num}"
 
+    def anchor_url(self, page_num, total_pages):
+        """除外ページ用の非アップロード URL（IP-402）。resolve と区別できる形に
+        して、除外経路が単ページ PDF を上げていないことをテストで断言できる。"""
+        return f"http://url#page={page_num}"
+
 
 def page(page_num, total, vendor, amount, extra=None):
     """1 result（1 票）の pipeline yield 相当 dict を作る。"""
@@ -168,6 +200,58 @@ def error_page(page_num, total, error_class="CONTENT"):
         result["_error_class"] = error_class
     return {"result": result, "page_num": page_num,
             "total_pages": total, "page_bytes": b""}
+
+
+def blank_result(**markers):
+    """entries を持たない result（`ocr_engine._blank_result` の写し）。
+
+    本物の producer は占位頁も除外頁もこの形（date/vendor/invoice_num/memo/
+    entries ＋ markers）で yield する。markers だけを渡し分けるのも同じ——
+    夾具が本物と違う形を作ると、消費者がどのキーを見るかを変えた瞬間に
+    「テストは通るが本番では通らない」が生まれる。
+    """
+    return {"date": "", "vendor": "", "invoice_num": "", "memo": "",
+            "entries": [], **markers}
+
+
+def zero_entry_result(**extra):
+    """占位頁の bare result（entries 空・`_page_error` 無し・除外でもない）。
+
+    「JSON は返ったが票面から仕訳を組めなかった」頁。page() が entries 非空
+    専用なので、この形状はここで一元化する（simcodex Round 2 #4 と同じ方針
+    ——yield 形状の重複実装は同期漏れの温床）。
+    """
+    return blank_result(_unrecognized=True, **extra)
+
+
+def yield_of(result, page_num, total):
+    """bare result dict を pipeline yield 形へ包む汎用ラッパ。"""
+    return {"result": result, "page_num": page_num, "total_pages": total,
+            "page_bytes": b"x"}
+
+
+def excluded_page(page_num, total, reason="envelope",
+                  destination=EXCLUDE_DEST_AUDIT_TAB, ocr_text_len=42):
+    """除外ページ（封筒・社会保険料通知書）の pipeline yield 相当 dict（IP-402）。
+
+    ocr_engine._yield_page_results が実際に yield する形（entries 空・
+    `_page_error` 無し・`_excluded_page=True`・行き先を `_exclude_destination`
+    で宣言）を再現する。これを占位頁と誤認するのが IP-402 の是正対象。
+
+    `_unrecognized` は**付けない**——本物の除外頁（`_blank_result(_excluded_page=
+    True, ...)`）はこのキーを持たない。夾具側で勝手に付けると、除外と認識不能を
+    `_unrecognized` で見分ける消費者を書いた瞬間、この夾具は本物に到達できない
+    形だけを試し続けることになる。
+    """
+    return yield_of(
+        blank_result(
+            memo=f"除外ページ（{reason}）",
+            _excluded_page=True,
+            _exclude_reason=reason,
+            _exclude_destination=destination,
+            _ocr_text_len=ocr_text_len,
+        ),
+        page_num, total)
 
 
 def pages(n):

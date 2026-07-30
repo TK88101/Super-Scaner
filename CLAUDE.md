@@ -99,6 +99,7 @@ Drive 原生预览忽略 `#page=N`，故每页拆成单页 PDF 上传到 `SPLIT_
 - 除外页 → `_excluded_page` + `_exclude_destination` 决定去向：封筒走监査タブ
   `_除外ページ監査`（7 列，**タブ名必须 `_` 开头**否则 GAS 每晚 22:00 删除），
   社保通知書走 MF タブ。**去向由 producer 声明，不要在 main 里按 reason 猜**
+  （此分流规则属 UI 版 `process_file`；headless 消费同一信号但规则不同，见下）
 - entries 有效但封筒信号命中 → `_audit_signal`，照常记账 + 监査タブ留「分岐」
 - `process_pipeline` 与 `main.process_file` 双方都做页覆盖突合，缺页写监査タブ
   「欠落」行（控制台 print 在无人值守的迷你 PC 上等于无声）
@@ -111,6 +112,18 @@ Drive 原生预览忽略 `#page=N`，故每页拆成单页 PDF 上传到 `SPLIT_
 与封筒不同，它是**确定的业务规则**：全 doc_type、全经路常时有效，entries 有效也短路。
 关键词收紧过：「納入告知額」单独不发火（労働保険等公共徴収通知的通用语，误爆会给
 无关文书贴上错误标签并吞掉其会计数据）。
+
+### headless の除外ページ語義は UI 版と違う（IP-402，2026-07-30）
+`HEADLESS_MODE` 未设置＝现行生产走的是上面 IP-401 描述的 UI 版。启用后
+`_process_file_headless` 消费同一个 `_excluded_page`，但**不看 `_exclude_destination`**：
+封筒も社保通知書も監査タブのみ、MF 区へは書込回数ゼロ（硬冪等の器＝effect 記録が
+未実装なので、副作用そのものを起こさない。Plan §4.3／§9）。檔級終態は
+全頁除外→`PARTIAL`（POSTED を騙らず死信にも落とさない）／除外＋記帳→`SUCCESS`／
+除外＋占位→`DEAD_LETTER`（除外は母数から除くだけで、残り頁の判定を変えない）。
+重跑で前後輪の分類が食い違えば監査タブに判定＝`分類変化`・理由＝`drift:<前輪>-><今輪>`。
+**監査書込失敗時は headless だけ `ESCALATE`（ファイル保持・MF へ退避しない）**——
+UI 版は逆に MF 赤行へ退避する（控制面が無く他に可視化先がないため）。
+詳細と繰延事項は `docs/plans/2026-07-30-headless-excluded-page-adaptation.md`。
 
 ### Google API 共享盘适配
 所有 Drive 调用带 `supportsAllDrives=True` + `includeItemsFromAllDrives=True` — **list 缺这两个会静默返回 0 件 (无报错)**。5xx 用 `_call_with_retry` 指数退避。Service Account 无法新建 Drive 文件，Spreadsheet/文件夹须手动预建并共享给 SA。

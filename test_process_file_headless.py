@@ -22,7 +22,8 @@ from test_sheets_output import _make_writer as _make_sheets_output_writer
 # 夾具（T4/T5、B4 復用）から fake 部品を import——二重定義を避け単一ソース化。
 from headless_rerun_fixture import (
     FakeFirestore, FakeWriter, _FakeResolver, error_page, make_ledger,
-    page as _page, run_headless,
+    page as _page, run_headless, yield_of as _yield,
+    zero_entry_result as _zero_entry_result,
 )
 
 
@@ -38,19 +39,6 @@ def _valid_result(vendor, amount, extra=None):
     """entries 非空の bare result dict。headless_rerun_fixture.page() の
     result をそのまま借りる（simcodex Round 2 #4、重複実装を排除）。"""
     return _page(1, 1, vendor, amount, extra)["result"]
-
-
-def _zero_entry_result(**extra):
-    result = {"entries": [], "vendor": "", "date": "", "_unrecognized": True}
-    result.update(extra)
-    return result
-
-
-def _yield(result, page_num, total):
-    """bare result dict を pipeline yield 形へ包む——zero-entry 等、page()
-    （entries 非空専用）では作れない形状向けの汎用ラッパ。"""
-    return {"result": result, "page_num": page_num, "total_pages": total,
-            "page_bytes": b"x"}
 
 
 class HeadlessIdempotencyTest(unittest.TestCase):

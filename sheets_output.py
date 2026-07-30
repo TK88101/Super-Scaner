@@ -33,6 +33,10 @@ AUDIT_HEADERS = ["日時", "ファイル名", "ページ", "判定", "理由", "
 AUDIT_VERDICT_EXCLUDED = "除外"   # 仕訳を作らず MF 区にも書かなかったページ
 AUDIT_VERDICT_BRANCH = "分岐"     # MF には正常記帳したが封筒シグナルも命中した
 AUDIT_VERDICT_MISSING = "欠落"    # 一度も出力されなかったページ（無音欠落の疑い）
+# 過去輪と今輪で分類が食い違ったページ（IP-402 §4.2）。MF に残る旧行（仕訳 or
+# 占位）と今輪の判定が矛盾している事実を人手が突合できるよう、理由列に
+# `drift:<過去輪の分類>-><今輪の分類>` を入れて両方の分類を符号化する。
+AUDIT_VERDICT_DRIFT = "分類変化"
 
 if not AUDIT_TAB_NAME.startswith("_"):
     # import 時に落とす。命名規約を破ると監査タブが毎晩 22:00 に GAS へ削除され、
