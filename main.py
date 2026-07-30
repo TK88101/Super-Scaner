@@ -17,8 +17,13 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from googleapiclient.errors import HttpError
 # 引入我們的模塊
-from ocr_engine import process_pipeline
-from sheets_output import SheetsOutputWriter
+from ocr_engine import (
+    EXCLUDE_DEST_AUDIT_TAB, EXCLUDE_DEST_MF_TAB, process_pipeline,
+)
+from sheets_output import (
+    AUDIT_VERDICT_BRANCH, AUDIT_VERDICT_EXCLUDED, AUDIT_VERDICT_MISSING,
+    SheetsOutputWriter,
+)
 from notifier import send_notification
 from doc_types import DocType, DOC_TYPE_CONFIG
 import config
@@ -194,6 +199,22 @@ class PageUrlResolver:
             print(f"⚠️ 既存単ページの照会失敗: "
                   f"{type(e).__name__}: {str(e)[:120]} → 新規アップロードで継続")
             self._existing = {}
+
+    def anchor_url(self, page_num: int, total_pages: int) -> str:
+        """アップロードせず `#page=` アンカーだけを返す（診断用途）。
+
+        除外ページ（封筒等）の監査タブ行はあくまで可観測性設備であり、その
+        ために Drive へ単ページ PDF を1枚ずつアップロードするのは割に合わない
+        （100頁中20頁が封筒なら 20 回の余計な Drive 書込）。人がページを特定
+        できれば足りるので、resolve() が失敗時に倒す劣化先と同じ形を最初から
+        使う。既に他の理由で解決済みならその URL を再利用する。
+        """
+        if total_pages <= 1 or not self._base_url:
+            return self._base_url
+        cached = self._cache.get(page_num)
+        if cached:
+            return cached
+        return f"{self._base_url}#page={page_num}"
 
     def resolve(self, page_num: int, total_pages: int,
                 page_bytes: bytes | None) -> str:
@@ -992,6 +1013,110 @@ def _process_file_headless(service, writer, file_path, uploader_name, base,
     return _aggregate_file_outcome(page_kinds, ordered_page_nums, file_total_pages)
 
 
+def _build_unrecognized_placeholder(uploader_name, filename, memo):
+    """MF 区に書く「認識不能」占位行の entries_data を組み立てる。
+
+    同じ形状が process_file 内に複数箇所（部分ページエラー・除外ページの退避）
+    あり、逐字コピーだと契約変更時の同期漏れを招く。vendor にファイル名を
+    入れるのは、行だけ見てどの原票の話か分かるようにするため。
+    """
+    return {
+        "entries": [],
+        "_unrecognized": True,
+        "memo": memo,
+        "date": "",
+        "vendor": filename,
+        "uploader": uploader_name,
+    }
+
+
+def _record_excluded_page(sheets_writer, resolver, result, uploader_name,
+                          doc_type, filename, page_num, total_pages):
+    """除外ページの留痕を、result が宣言した行き先へ書く。
+
+    行き先は producer（ocr_engine）が `_exclude_destination` で宣言する。
+    理由文字列から行き先を推測しない——理由（なぜ除外したか）と行き先
+    （どこに書くか）は別の関心事であり、reason の増加に合わせて main 側の
+    分岐を書き足し忘れる事故を避ける。
+
+      audit_tab（封筒等）: MF 区を汚さない。取引No も消費しない
+      mf_tab（社会保険料通知書）: 正常な除外ではなく**運用ルール違反の通知**
+        であり、顧客が必ず目にする場所でなければ意味がない（§3.8）
+
+    除外ページのために Drive へ単ページ PDF を上げるのは割に合わないので、
+    リンクはアップロード無しの #page= アンカーで足りる。
+    """
+    reason = result.get("_exclude_reason", "unknown")
+    destination = result.get("_exclude_destination", EXCLUDE_DEST_AUDIT_TAB)
+    source_url = resolver.anchor_url(page_num, total_pages)
+
+    if destination == EXCLUDE_DEST_MF_TAB:
+        # entries が空なので金額列・科目列は空のまま
+        # = MF インポート時に金額を持ち込まない。
+        print(f"🏥 [{page_num}/{total_pages}] 除外ページ ({reason}) "
+              f"→ MFタブに提示行（仕訳は作成しません）")
+        try:
+            sheets_writer.append_entries(
+                employee_name=uploader_name,
+                doc_type=doc_type,
+                entries_data=_build_unrecognized_placeholder(
+                    uploader_name, filename, result.get("memo", "")),
+                source_url=source_url,
+            )
+        except Exception as e:
+            # この提示行はこのページの**唯一の出力**であり、監査タブ行のような
+            # 「あれば嬉しい」記録ではない。握り潰すと Success 判定でファイルが
+            # 歸檔され、顧客は社会保険料通知書を上げたことも、それが記帳
+            # されなかったことも知る術がなくなる。失敗として上へ返し、
+            # 再試行対象（ファイル保持）に載せる。
+            print(f"❌ 除外ページの提示行の書き込み失敗 ({reason}): {e}")
+            return False
+        return True
+
+    print(f"📨 [{page_num}/{total_pages}] 除外ページ ({reason}) "
+          f"→ 監査タブに記録（MF区には書きません）")
+    try:
+        sheets_writer.append_audit_row(
+            filename=filename,
+            page_num=page_num,
+            verdict=AUDIT_VERDICT_EXCLUDED,
+            reason=reason,
+            ocr_text_len=result.get("_ocr_text_len", 0),
+            source_url=source_url,
+        )
+    except Exception as e:
+        # §3.7: 真の除外は監査タブが唯一の留痕。失敗したら MF の赤い
+        # 認識不能占位行へ退避して必ず可視化する（無音欠落に戻さない）。
+        print(f"⚠️ 監査タブ書き込み失敗 → MF区の認識不能行へ退避: {e}")
+        _write_audit_fallback_row(
+            sheets_writer, uploader_name, doc_type, filename,
+            page_num, reason, source_url)
+    return True
+
+
+def _write_audit_fallback_row(sheets_writer, uploader_name, doc_type, filename,
+                              page_num, reason, source_url):
+    """監査タブ書込に失敗した除外ページを MF 区の認識不能行へ退避する（§3.7）。
+
+    監査タブは可観測性設備であり帳簿データではないが、真の除外ページにとっては
+    **唯一の留痕**である。そこが落ちたら無音欠落に逆戻りするため、MF 区を汚す
+    コストを払ってでも人の目に触れる場所へ出す。退避行自体の書込も失敗したら
+    ログに残すしかない（それ以上の保底経路はない）。
+    """
+    try:
+        sheets_writer.append_entries(
+            employee_name=uploader_name,
+            doc_type=doc_type,
+            entries_data=_build_unrecognized_placeholder(
+                uploader_name, filename,
+                f"⚠ 除外ページ p{page_num} ({reason}) "
+                f"監査タブ書き込み失敗のため退避"),
+            source_url=source_url,
+        )
+    except Exception as e:
+        print(f"❌ 除外ページの退避行も書き込めませんでした（留痕なし）: {e}")
+
+
 def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
                   doc_type=DocType.RECEIPT, drive_file_id=None,
                   split_pdf_folder_id="", base=None, ledger=None):
@@ -1030,11 +1155,19 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
     total_entries = 0
     error_pages = 0
     failed_page_nums = []
+    excluded_pages = 0
+    excluded_page_nums = []
+    failed_page_notes = {}  # {page_num: 具体的な説明} 占位行で汎用文言に埋もれさせない
+
+    seen_page_nums = set()
+    last_total_pages = 0
 
     for page in process_pipeline(file_path, doc_type=doc_type):
         result = page["result"]
         page_num = page["page_num"]
         total_pages = page["total_pages"]
+        seen_page_nums.add(page_num)
+        last_total_pages = total_pages
         count += 1
         # 再試可能なページエラーは Sheets へ書き込まない
         # （全頁失敗時は Failed を返しファイルを保持するため、
@@ -1042,6 +1175,32 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
         if result.get("_page_error"):
             error_pages += 1
             failed_page_nums.append(page_num)
+            continue
+
+        # IP-401 T1/T2: 封筒等の除外ページは MF データ区に一切書かず、独立の
+        # 監査タブへ留痕する。MF 区に書くと取引No・行 fingerprint を消費して
+        # MF インポートデータを汚す（Plan §3.2）。かといって無音で消すと顧客は
+        # 枚数を数えるまで気づけない（本件 IP-401 の事故そのもの）。
+        # error_pages には数えない（除外は失敗ではない）。count には既に
+        # 数えており、全頁封筒でも count>0 → Failed 無限リトライを回避する。
+        if result.get("_excluded_page"):
+            recorded = _record_excluded_page(
+                sheets_writer, resolver, result, uploader_name, doc_type,
+                filename, page_num, total_pages)
+            if not recorded:
+                # 留痕を残せなかった除外は「静かに消えた」のと同じ。除外として
+                # 数えず失敗として扱う。全頁がこれならファイル保持→再試行。
+                # 混在ファイルは既存語義どおり歸檔されるが（再試行すると成功頁の
+                # 仕訳が重複するため）、そのとき書かれる占位行に「どの頁が何
+                # だったか」を残し、汎用文言で情報を落とさないようにする。
+                error_pages += 1
+                failed_page_nums.append(page_num)
+                failed_page_notes[page_num] = (
+                    result.get("memo")
+                    or f"除外ページ({result.get('_exclude_reason', 'unknown')})")
+                continue
+            excluded_pages += 1
+            excluded_page_nums.append(page_num)
             continue
 
         entries = result.get('entries', [])
@@ -1061,11 +1220,52 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
             source_url=source_url,
         )
 
+        # IP-401 T2/R2: entries は有効だが封筒シグナルも命中したページ。
+        # 記帳は止めず（Gemini 優先＝Strategy C 交差検証の設計意図）、Gemini が
+        # 本物の封筒に偽 entry を捏造した場合に備えて人手抽査用の「分岐」を
+        # 監査タブへ残す。書込順序は MF が先・監査が後（帳簿を人質に取らせない）。
+        audit_signal = result.get("_audit_signal")
+        if audit_signal:
+            try:
+                sheets_writer.append_audit_row(
+                    filename=filename,
+                    page_num=page_num,
+                    verdict=AUDIT_VERDICT_BRANCH,
+                    reason=audit_signal,
+                    ocr_text_len=result.get("_ocr_text_len", 0),
+                    source_url=source_url,
+                )
+            except Exception as e:
+                # §3.7: MF は既に正しく書けており帳簿は正しい。監査は諦める。
+                print(f"⚠️ 監査タブへの分岐記録に失敗（記帳は成功）: {e}")
+
         # 軽量サマリーのみ保持（フル結果は GC 対象）
         page_amount = sum(int(e.get('amount', 0)) for e in entries)
         total_amount += page_amount
         vendor_names.append(result.get('vendor', ''))
         total_entries += len(entries)
+
+    # ページカバレッジ突合（IP-401 §8-中7）。ocr_engine 側も同じ検査をして
+    # 警告を出すが、本番機は無人の Windows ミニ PC で誰も控制台を見ておらず
+    # （Chatwork 通知も monitoring も廃止済み、CLAUDE.md 参照）、02:00 の
+    # 再起動で流れる。哨戒が控制台にしか出ないなら哨戒していないのと同じ。
+    # 顧客・運用者が実際に見る監査タブへ持続化する。
+    # 成否判定は変えない（§8-中7 の裁決どおり警告のみ、P2 繰延）。
+    missing_pages = sorted(set(range(1, last_total_pages + 1)) - seen_page_nums)
+    if missing_pages:
+        print(f"⚠️ ページカバレッジ警告: {len(missing_pages)}/{last_total_pages}頁が"
+              f"一度も出力されませんでした {missing_pages}")
+        try:
+            sheets_writer.append_audit_row(
+                filename=filename,
+                page_num=missing_pages[0],
+                verdict=AUDIT_VERDICT_MISSING,
+                reason=f"page_coverage_gap:{missing_pages}",
+                ocr_text_len=0,
+                source_url=base_url,
+            )
+        except Exception as e:
+            print(f"⚠️ カバレッジ警告の監査タブ記録に失敗: {e}")
 
     # 全ページがエラー → 上流障害とみなし Failed（再試行対象として残す）
     # count == error_pages で判定（total_entries ではない）:
@@ -1092,14 +1292,12 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
             sheets_writer.append_entries(
                 employee_name=uploader_name,
                 doc_type=doc_type,
-                entries_data={
-                    "entries": [],
-                    "_unrecognized": True,
-                    "memo": f"⚠ ページ処理エラー {error_pages}/{count}頁 [{failed_pages_str}] 手動再スキャン要",
-                    "date": "",
-                    "vendor": filename,
-                    "uploader": uploader_name,
-                },
+                entries_data=_build_unrecognized_placeholder(
+                    uploader_name, filename,
+                    f"⚠ ページ処理エラー {error_pages}/{count}頁 "
+                    f"[{failed_pages_str}] 手動再スキャン要"
+                    + "".join(f" / p{n}: {note}"
+                              for n, note in sorted(failed_page_notes.items()))),
                 source_url=base_url,
             )
         except Exception as e:
@@ -1108,6 +1306,9 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
     if count > 0:
         vendor_list = ", ".join(v for v in vendor_names if v)
         print(f"\n✅ 処理完了: {count}文書 / {total_entries}仕訳")
+        if excluded_pages:
+            excluded_pages_str = ",".join(f"p{n}" for n in excluded_page_nums)
+            print(f"📨 除外ページ: {excluded_pages}/{count}頁 [{excluded_pages_str}]")
         if partial_error:
             failed_pages_str = ",".join(f"p{n}" for n in failed_page_nums)
             print(f"⚠️ 部分ページエラー: {error_pages}/{count}頁失敗 [{failed_pages_str}]")

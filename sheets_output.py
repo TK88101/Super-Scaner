@@ -21,6 +21,31 @@ MF_HEADERS = [
 ]
 
 
+# ── 除外ページ監査タブ（IP-401 T2）──
+# **タブ名は必ず '_' 始まりにすること。** GAS の backupAllTabs_ は
+# SKIP_TABS と「先頭が '_'」以外の全タブを MF_Backup へ退避したうえで
+# deleteSourceTabs_ で元タブを削除する（gas/daily_backup_ido.gs）。通常名で
+# 作ると監査タブが毎晩 22:00 に消える。
+AUDIT_TAB_NAME = "_除外ページ監査"
+AUDIT_HEADERS = ["日時", "ファイル名", "ページ", "判定", "理由", "OCR文字数", "原票URL"]
+
+# 「判定」列の値。理由（reason）は機械可読な英字キー、判定は人が読む日本語。
+AUDIT_VERDICT_EXCLUDED = "除外"   # 仕訳を作らず MF 区にも書かなかったページ
+AUDIT_VERDICT_BRANCH = "分岐"     # MF には正常記帳したが封筒シグナルも命中した
+AUDIT_VERDICT_MISSING = "欠落"    # 一度も出力されなかったページ（無音欠落の疑い）
+
+if not AUDIT_TAB_NAME.startswith("_"):
+    # import 時に落とす。命名規約を破ると監査タブが毎晩 22:00 に GAS へ削除され、
+    # 「無音でデータが消える」——本モジュールが直そうとしている事故そのものが
+    # 監査証跡に対して再発する。規約とテスト1本に頼ると、リネーム PR が
+    # レビューを素通りして本番で静かに壊れうる。ocr_engine の
+    # _validate_doc_type_registries と同じ「起動時に大声で落ちる」方針を採る。
+    raise RuntimeError(
+        f"監査タブ名は '_' 始まり必須です（GAS backupAllTabs_ が退避後に元タブを"
+        f"削除するため）: {AUDIT_TAB_NAME!r}"
+    )
+
+
 # 異常ハイライトの severity → 背景色。凡例・per-entry・doc 級で共用し、
 # 同じ severity が複数箇所で別の色にブレる事故を防ぐ（single source of truth）。
 _SEVERITY_COLORS = {
@@ -208,6 +233,7 @@ class SheetsOutputWriter:
         self._tab_has_data = {}
         self._tab_next_txn = {}  # タブごとの取引No
         self._tabs_sanitized = set()  # 空尾行の継承色を初回清掃済みのタブ
+        self._audit_row_count = 0     # 監査タブの行数（初回だけ実測し以後自前更新）
 
     def _cleanup_default_sheet(self):
         """デフォルトの空シート（シート1）を削除"""
@@ -692,6 +718,80 @@ class SheetsOutputWriter:
         self._sanitize_trailing_once(ws, tab_name, end_row)
 
         print(f"💾 Sheets に {len(rows)} 行追加: {tab_name}")
+
+    def _get_or_create_audit_tab(self):
+        """除外ページ監査タブを取得（なければ作成）。
+
+        `_get_or_create_tab` は流用できない。同メソッドは `len(MF_HEADERS)` 列
+        固定で MF 凡例4行＋`MF_HEADERS` を書き込むため、7 列の監査 schema と
+        合わない（Codex R1 指摘）。
+
+        既存タブのヘッダが想定と違う場合は**上書きせず例外**にする。誰かが
+        同名タブを別用途で作っていた場合にそのデータを破壊しないため。
+        """
+        if AUDIT_TAB_NAME in self._ws_cache:
+            return self._ws_cache[AUDIT_TAB_NAME]
+
+        try:
+            ws = self.spreadsheet.worksheet(AUDIT_TAB_NAME)
+            header = ws.row_values(1)
+            if header and header != AUDIT_HEADERS:
+                raise ValueError(
+                    f"監査タブ '{AUDIT_TAB_NAME}' のヘッダが想定と異なります。"
+                    f"上書きを避けるため中止しました: {header}"
+                )
+            # 行数は初回だけ実測し、以後は追記に合わせて自前で進める。
+            # 監査タブは全社員・全ファイル共通の単一タブで単調増加するため、
+            # 1行書くたびに get_all_values() で全読みすると読み取り量が
+            # 運用期間とともに際限なく膨らむ。
+            self._audit_row_count = len(ws.get_all_values())
+            if not header:
+                # ヘッダ無しの空タブ = 前回の初期化が add_worksheet 成功・ヘッダ
+                # 書込失敗で中断した残骸。ここを「schema 不一致」で撥ねると
+                # 監査機能が永久に退避経路へ落ち、人手で表を直すまで復旧しない。
+                # 空なら誰のデータも壊さないので書き直して自己修復する。
+                self._write_audit_header(ws)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = self.spreadsheet.add_worksheet(
+                title=AUDIT_TAB_NAME, rows=1000, cols=len(AUDIT_HEADERS)
+            )
+            self._audit_row_count = 0
+            self._write_audit_header(ws)
+
+        self._ws_cache[AUDIT_TAB_NAME] = ws
+        return ws
+
+    def _write_audit_header(self, ws):
+        """監査タブのヘッダ行を書く（レート制限リトライ付き）。
+
+        素の append_row だと 429/5xx 一発でヘッダ無しタブが残り、以後の起動が
+        全部 schema 不一致で撥ねられて監査機能が死ぬ（Codex 指摘）。
+        """
+        self._write_with_retry(ws, [AUDIT_HEADERS])
+        self._audit_row_count += 1
+
+    def append_audit_row(self, filename, page_num, verdict, reason,
+                         ocr_text_len, source_url=""):
+        """除外/分岐ページを監査タブへ 1 行追記する。
+
+        MF データ区には一切書かない（Plan §3.2）。取引No も消費しない。
+        呼び出し側は §3.7 の失敗語義に従って例外を扱うこと:
+          分岐記録   → 警告ログのみ（MF は既に正しく書けており帳簿は正しい）
+          真の除外   → 監査タブが唯一の留痕なので MF の赤い認識不能行へ退避
+        """
+        ws = self._get_or_create_audit_tab()
+        row = [
+            datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S"),
+            filename,
+            page_num,
+            verdict,
+            reason,
+            ocr_text_len,
+            source_url,
+        ]
+        self._ensure_row_capacity(ws, self._audit_row_count + 1)
+        self._write_with_retry(ws, [row])
+        self._audit_row_count += 1
 
     def flush(self):
         """互換性のため残す（タブごと管理なので書き戻し不要）"""

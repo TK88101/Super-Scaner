@@ -165,18 +165,124 @@ class JsonParseFailurePageVisibilityTest(unittest.TestCase):
         vision.assert_called_once_with(b"%PDF-p1", "application/pdf", mock.ANY)
 
 
-class ReceiptEnvelopePageStillSkippedTest(unittest.TestCase):
-    """Session 16 裁決: 封筒フィルタ (_is_envelope_page) は
-    doc_type == DocType.RECEIPT 限定に変更されたが、RECEIPT 自体の既存挙動
-    （封筒/送付状ページは skip=yield されない）は維持されなければならない。
+class PageFormattingExceptionIsolationTest(unittest.TestCase):
+    """IP-401 T0: 整形段階 (_yield_page_results) の例外はそのページに閉じ込める。
 
-    このテストは将来 RECEIPT 限定の条件を誤って剥がしてしまう回帰を防ぐ
-    ガードであり、封筒フィルタの適用範囲を狭めた際に領収書側の挙動まで
-    一緒に変えてしまわないようにする。
+    従来 `_yield_page_results` の消費は逐頁 `try` の**外**にあり、畸形 Gemini
+    JSON 等で整形が例外を投げると最外層の `except` まで飛び、**PDF の残り
+    全ページが無音で消えた**（元の封筒無音棄却より重大な欠落）。
+
+    NOTE: `main` 分支の消費側 (`main.py:347`) は `_page_error` のみで分岐する。
+    Plan の DoD(R4) が要求する `_error_class` は sandevistan 側の機構であり
+    本分支には存在しないため、断言対象は `_page_error` + 例外型を含む memo。
     """
 
-    def test_envelope_page_is_not_yielded_for_receipt(self):
-        # Arrange: p1=封筒（金額関連キーワード無し）/ p2=正常な領収書
+    def _run_with_failing_formatter(self, failing_page_num):
+        """指定ページの整形だけが例外を投げるよう _yield_page_results を差替える。"""
+        real = ocr_engine._yield_page_results
+        calls = {"n": 0}
+
+        def fake(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
+                 envelope_filter=False):
+            calls["n"] += 1
+            if calls["n"] == failing_page_num:
+                # 下の for に yield があるため本関数は既に generator function。
+                # よって raise は「呼び出し時」ではなく「消費時」に届く——
+                # 実際の整形例外（next() の内側で発生）と同じタイミング。
+                raise ValueError("畸形 JSON: items が dict ではない")
+            for entry in real(doc_type, raw_data, ocr_text, ocr_conf,
+                              prefix=prefix, envelope_filter=envelope_filter):
+                yield entry
+
+        route = [
+            (_valid_receipt_raw(), _VALID_OCR_TEXT, 0.95),
+            (_valid_receipt_raw(), _VALID_OCR_TEXT, 0.95),
+        ]
+        with mock.patch.object(ocr_engine, "_yield_page_results", side_effect=fake):
+            pages, _ = _run_receipt_pipeline(route)
+        return pages
+
+    def test_formatting_error_isolated_to_its_own_page(self):
+        # Arrange / Act: p1 の整形だけが例外
+        pages = self._run_with_failing_formatter(failing_page_num=1)
+
+        # Assert: p1 は _page_error 占位行、p2 は巻き添えにならず正常 yield
+        self.assertEqual(len(pages), 2)
+        by_page = {p["page_num"]: p for p in pages}
+        self.assertTrue(by_page[1]["result"].get("_page_error"))
+        self.assertTrue(by_page[1]["result"].get("_unrecognized"))
+        self.assertEqual(by_page[1]["result"]["entries"], [])
+        self.assertIn("ValueError", by_page[1]["result"]["memo"])
+        self.assertFalse(by_page[2]["result"].get("_page_error"))
+        self.assertEqual(len(by_page[2]["result"]["entries"]), 1)
+
+    def test_formatting_error_on_last_page_keeps_earlier_pages(self):
+        # Arrange / Act: p2 の整形だけが例外（先行ページが既に yield 済みの状況）
+        pages = self._run_with_failing_formatter(failing_page_num=2)
+
+        # Assert: p1 の成果は保持され、p2 だけが占位行になる
+        self.assertEqual(len(pages), 2)
+        by_page = {p["page_num"]: p for p in pages}
+        self.assertEqual(len(by_page[1]["result"]["entries"]), 1)
+        self.assertTrue(by_page[2]["result"].get("_page_error"))
+
+    def test_formatting_error_page_carries_page_bytes(self):
+        # Arrange / Act
+        pages = self._run_with_failing_formatter(failing_page_num=1)
+
+        # Assert: 占位行から原票ページへ辿れる（他の失敗経路と同じ契約）
+        by_page = {p["page_num"]: p for p in pages}
+        self.assertEqual(by_page[1].get("page_bytes"), b"%PDF-p1")
+
+
+def _empty_receipt_raw():
+    """Gemini が有効な仕訳を組めなかったときの戻り値（documents 空）。"""
+    return {"documents": []}
+
+
+class ReceiptEnvelopePageStillSkippedTest(unittest.TestCase):
+    """IP-401 T1/T4 で裁決変更: 封筒ページは「無音 skip」から
+    「`_excluded_page` を立てて必ず yield」へ変わった。
+
+    Session 16 の旧裁決は「封筒/送付状ページは yield されない」であり、
+    このクラスはその挙動を固定していた。しかし本番事故（IP-401、社長夫人
+    フィードバック③「54枚アップしたが仕訳は53件」）で、PaddleOCR が
+    「領収証」を「领収证」と誤認識した小型サーマル領収証が
+    `_is_envelope_page` に単独で棄却され、**Sheets にも占位行にも一切
+    残らず無音で消えた**ことが判明した。
+
+    無音 skip は顧客が枚数を数えるまで発見できない。よって
+    「yield はする（`_excluded_page=True`）／MF 区には書かない
+    （監査タブへ回す）」へ変更する。RECEIPT 限定であることは維持。
+    """
+
+    def test_envelope_page_is_yielded_with_excluded_flag(self):
+        # Arrange: p1=封筒（entries を組めず、封筒キーワードのみ）/ p2=正常
+        route = [
+            (_empty_receipt_raw(), _ENVELOPE_OCR_TEXT, 0.9),
+            (_valid_receipt_raw(), _VALID_OCR_TEXT, 0.95),
+        ]
+
+        # Act
+        pages, _ = _run_receipt_pipeline(route)
+
+        # Assert: p1 も yield される（無音欠落の廃止）。_excluded_page が立ち、
+        # _page_error は立たない（失敗ではなく「正常な除外」のため——
+        # 立てると main が Failed 判定 → ファイル保持 → 無限リトライになる）
+        self.assertEqual(len(pages), 2)
+        by_page = {p["page_num"]: p for p in pages}
+        self.assertTrue(by_page[1]["result"].get("_excluded_page"))
+        self.assertEqual(by_page[1]["result"].get("_exclude_reason"), "envelope")
+        self.assertFalse(by_page[1]["result"].get("_page_error"))
+        self.assertFalse(by_page[1]["result"].get("_unrecognized"))
+        self.assertEqual(by_page[1]["result"]["entries"], [])
+
+    def test_valid_entries_survive_envelope_keywords(self):
+        """T1 中核 DoD: Gemini が有効 entries を返せば OCR が何であれ棄却されない。
+
+        IP-401 の実事故（舞鶴パーク領収証）を最短で再現する形。
+        """
+        # Arrange: p1=封筒キーワードだらけの OCR だが Gemini は有効な仕訳を返した
         route = [
             (_valid_receipt_raw(), _ENVELOPE_OCR_TEXT, 0.9),
             (_valid_receipt_raw(), _VALID_OCR_TEXT, 0.95),
@@ -185,9 +291,80 @@ class ReceiptEnvelopePageStillSkippedTest(unittest.TestCase):
         # Act
         pages, _ = _run_receipt_pipeline(route)
 
-        # Assert: p1 は yield されず（RECEIPT では従来通り skip）、p2 のみ残る
-        self.assertEqual(len(pages), 1)
-        self.assertEqual(pages[0]["page_num"], 2)
+        # Assert: 記帳は止まらない。ただし人手抽査のため監査シグナルは立つ
+        self.assertEqual(len(pages), 2)
+        by_page = {p["page_num"]: p for p in pages}
+        self.assertEqual(len(by_page[1]["result"]["entries"]), 1)
+        self.assertFalse(by_page[1]["result"].get("_excluded_page"))
+        self.assertEqual(by_page[1]["result"].get("_audit_signal"),
+                         "envelope_signal_with_entries")
+
+    def test_non_envelope_empty_page_still_unrecognized(self):
+        """entries 空 + 封筒判定不成立 → 従来通り赤い認識不能占位行。"""
+        # Arrange: 領収書構造キーワードを持つ長文だが Gemini が entries を組めず
+        route = [
+            (_empty_receipt_raw(), _VALID_OCR_TEXT, 0.9),
+            (_valid_receipt_raw(), _VALID_OCR_TEXT, 0.95),
+        ]
+
+        # Act
+        pages, _ = _run_receipt_pipeline(route)
+
+        # Assert
+        self.assertEqual(len(pages), 2)
+        by_page = {p["page_num"]: p for p in pages}
+        self.assertTrue(by_page[1]["result"].get("_unrecognized"))
+        self.assertFalse(by_page[1]["result"].get("_excluded_page"))
+
+    def test_all_envelope_pdf_still_counts_as_processed(self):
+        """全頁が封筒でも count>0 になり main の Failed→無限リトライに入らない。"""
+        # Arrange
+        route = [
+            (_empty_receipt_raw(), _ENVELOPE_OCR_TEXT, 0.9),
+            (_empty_receipt_raw(), _ENVELOPE_OCR_TEXT, 0.9),
+        ]
+
+        # Act
+        pages, _ = _run_receipt_pipeline(route)
+
+        # Assert: 2頁とも yield され、いずれも _page_error は立たない
+        # （main は count=2 / error_pages=0 → Success → 歸檔 → 再スキャンなし）
+        self.assertEqual(len(pages), 2)
+        for p in pages:
+            self.assertTrue(p["result"].get("_excluded_page"))
+            self.assertFalse(p["result"].get("_page_error"))
+
+    def test_envelope_filter_not_applied_to_single_page_path(self):
+        """§3.5: 適用範囲は PDF 逐頁ループのみ。尾段（単頁/画像）には広げない。"""
+        # Arrange: 尾段は _yield_page_results を envelope_filter なしで呼ぶ
+        with mock.patch.object(ocr_engine, "_is_envelope_page") as envelope:
+            with redirect_stdout(io.StringIO()):
+                results = list(ocr_engine._yield_page_results(
+                    DocType.RECEIPT, _empty_receipt_raw(), _ENVELOPE_OCR_TEXT, 0.9))
+
+        # Assert: 判定自体が呼ばれず、従来通り認識不能占位行になる
+        envelope.assert_not_called()
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].get("_unrecognized"))
+
+
+class NonReceiptEnvelopeFilterGuardTest(unittest.TestCase):
+    """Session 16 裁決の維持: 非 RECEIPT では封筒判定を一切呼ばない。
+
+    構造キーワード（「領収」「請求書」「合計」等）は領収書向けヒューリスティック
+    であり、給与明細等の短文ページに誤爆すると本来の票が除外される。
+    """
+
+    def test_envelope_check_not_called_for_salary_slip(self):
+        # Arrange: 給与明細 doc_type で封筒キーワードだらけの OCR
+        with mock.patch.object(ocr_engine, "_is_envelope_page") as envelope:
+            with redirect_stdout(io.StringIO()):
+                list(ocr_engine._yield_page_results(
+                    DocType.SALARY_SLIP, {"employees": []},
+                    _ENVELOPE_OCR_TEXT, 0.9, envelope_filter=True))
+
+        # Assert
+        envelope.assert_not_called()
 
 
 if __name__ == "__main__":

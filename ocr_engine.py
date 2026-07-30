@@ -648,14 +648,56 @@ _PAMPHLET_KEYWORDS = ["制度", "仕組み", "チャート", "についてのご
                       "処分の流れ", "についての留意", "についてのお知らせ"]
 
 
+# PaddleOCR が日本語漢字を簡体字に取り違えたときの照合用写像（IP-401 T3）。
+# **一方向・比較専用**。表示や Sheets へ書き出すテキストには絶対に適用しない
+# （canonical direction が無い双方向置換は元テキストを壊す）。
+# 実事故: 「☆領収証☆」→「☆领収证☆」で構造キーワード「領収」に失配した。
+#
+# 収録基準は「本番で実際に観測された誤読」のみ。憶測で簡体字全域を畳むと
+# 別語に化けて誤分類を増やすため広げない。纳/录 は本ファイル内の既存の
+# 場当たり対処（_extract_date_from_ocr の "纳期限"、_extract_invoice_num_from_ocr
+# の 登[録录]番号）が、同じ誤読が既に観測済みであることを示している。
+_SIMPLIFIED_TO_JP = {
+    "领": "領",
+    "证": "証",
+    "收": "収",
+    "请": "請",
+    "买": "買",
+    "计": "計",
+    "纳": "納",
+    "录": "録",
+}
+
+_SIMPLIFIED_TRANS = str.maketrans(_SIMPLIFIED_TO_JP)
+
+
+def _normalize_for_keyword_match(text):
+    """キーワード照合専用にテキストを正規化する（比較用、表示用ではない）。
+
+    NFKC で全角英数字・記号を畳んだうえで、PaddleOCR がよく取り違える簡体字を
+    日本語字形へ一方向に寄せる。写像表に無い文字は触らない（過剰変換すると
+    別語に化けて誤分類を生む）。
+    """
+    return unicodedata.normalize("NFKC", text or "").translate(_SIMPLIFIED_TRANS)
+
+
 def _is_envelope_page(ocr_text, raw_data):
     """不要ページ（封筒・送付状・裏面メモ・挨拶状・説明書）を検出する。
+
+    best-effort の分類器であり、これ単体を票の採否に使ってはいけない
+    （IP-401: 本関数の単独否決が本番で1票を無音欠落させた）。現在の役割は
+    「entries を組めなかったページ」を監査タブ行きにするか赤い認識不能行に
+    するかの理由分類のみ（Plan §3.1）。
+
+    照合は全キーワード群を同一の normalized_text に対して行う。片側だけ
+    正規化すると同じ誤認識が判定の一方にしか効かず一貫性を欠く（§3.4）。
+
     NOTE: 空白ページや documents=[] は認識不能として扱い、ここでは除外しない。
     """
     if not ocr_text:
         return False
 
-    text_lower = ocr_text.replace(" ", "")
+    text_lower = _normalize_for_keyword_match(ocr_text).replace(" ", "")
     has_financial_kw = any(kw in text_lower for kw in _FINANCIAL_KEYWORDS)
 
     # 封筒: 封筒キーワードあり + 金額関連なし
@@ -682,13 +724,115 @@ def _is_envelope_page(ocr_text, raw_data):
         return True
 
     # 裏面メモ/カード控え裏面/手書きメモ: 短いテキスト（60文字未満）+ 領収書構造なし
-    # 正式な領収書は必ず「領収」「合計」等の構造キーワードを持つため、
-    # それがなければ金額の有無に関わらずメモとして除外
+    # かつては「正式な領収書は必ず構造キーワードを持つ」と断定していたが、
+    # IP-401 の事故（小型サーマル領収証が「领収证」と誤読され構造キーワードに
+    # 失配、55文字でメモ扱い）がこれを反証した。best-effort のヒューリスティック
+    # であり、閾値 60 にも強い根拠は無い（Plan §3.6）。
     _receipt_structure = ["領収", "請求書", "合計", "小計", "お買上"]
     has_receipt_structure = any(kw in text_lower for kw in _receipt_structure)
     if len(clean_text) < 60 and not has_receipt_structure:
         return True
 
+    return False
+
+
+# ── 社会保険料通知書の検出（IP-401 T6 / Plan §3.8）──
+# 「保険料納入告知額・領収済額通知書」は券面に当月の納入告知額と前月の
+# 領収済額の2口が印字されており、Gemini は両方を仕訳化してしまう（顧客の表に
+# 実在した誤り: 319,000円 × 2行）。
+#
+# 社員からの共通ルール宣言（2026-07-30、最優先）:
+#   「社会保険料に関する会計処理はアップロードせずに口座振替資料として処理する」
+# 口座振替側で既に記帳される以上、SS 側が当月分を1行作れば二重計上になる。
+# よって**仕訳は一切作らない**。
+#
+# 封筒判定との違い（意図的）:
+#   封筒     = ヒューリスティック。誤爆が怖いので適用範囲を絞る（§3.5）
+#   社会保険 = 確定した業務ルール。全 doc_type・全経路で常時有効にする。
+#              顧客が「今後スキャンしない」と述べてもコードはそれに依存しない
+#              （§7-5 ユーザー裁定: 「你不能去賭它掃不掃」）
+#
+# 誤爆の代償は「静かに消える」より重い。仕訳が0件になるうえ MF タブに
+# 「社会保険料通知書です」という**断定的に誤ったラベル**が顧客向けに書かれる。
+# よって単独で発火させるのは社会保険に固有の複合語だけに限る。
+# 特に「納入告知額」は単独では発火させない——「納入告知書/納入告知額」は
+# 日本の公的機関の徴収通知に広く使われる一般語であり、労働保険料（労働局）等
+# 顧客ルールの対象外の文書まで巻き込む。必ず機関名・保険種別と共起させる。
+_SOCIAL_INSURANCE_STRONG = ["保険料納入告知額", "領収済額通知書"]
+# 単独では別文書（年金定期便・各種お知らせ・労働保険）に誤爆するため
+# 組み合わせで判定する。ペア内の全語が揃って初めて成立。
+_SOCIAL_INSURANCE_WEAK_PAIRS = [
+    ("日本年金機構", "保険料"),
+    ("納入告知額", "厚生年金"),
+    ("納入告知額", "健康保険"),
+    ("納入告知額", "日本年金機構"),
+]
+
+# Gemini 側の取引先名による交差確認。PaddleOCR がキーワードを読み崩しても
+# （改行分断・写像表外の異体字）Gemini が機関名を拾えていれば救える。
+#
+# ただし取引先名**単独では成立させない**。年金機構は通知書以外の文書
+# （年金定期便・各種お知らせ）も送ってくるため、単独条件にすると
+# 「日本年金機構からのお知らせ」——キーワード判定が意図的に弾いている文書——が
+# Gemini の vendor だけで吞まれてしまう。必ず OCR 側の裏付けと組み合わせる。
+_SOCIAL_INSURANCE_VENDORS = ["日本年金機構", "年金事務所"]
+# 取引先名の裏付けとして OCR 側に最低限必要な語（単独では弱すぎる語群）
+_SOCIAL_INSURANCE_CORROBORATION = ["保険料", "納入告知", "領収済額"]
+
+SOCIAL_INSURANCE_REASON = "social_insurance_notice"
+SOCIAL_INSURANCE_MEMO = (
+    "⚠ 社会保険料通知書です。口座振替資料として処理してください"
+    "（仕訳は作成していません）"
+)
+
+# 除外ページの留痕先。理由（なぜ除外したか）と行き先（どこに書くか）は別の
+# 関心事なので、理由文字列から行き先を推測させない。R2 の先例（分岐記録に
+# _exclude_reason を流用せず _audit_signal を新設した）と同じ方針。
+EXCLUDE_DEST_AUDIT_TAB = "audit_tab"   # 封筒等。MF 区を汚さず監査タブへ
+EXCLUDE_DEST_MF_TAB = "mf_tab"         # 運用ルール違反の通知。顧客が必ず見る場所へ
+
+
+def _is_social_insurance_notice(ocr_text, raw_data=None):
+    """社会保険料の納入告知額・領収済額通知書を検出する。
+
+    日本年金機構の定型書式なので券面キーワードが主判定。照合は §3.4 の
+    正規化を共用し PaddleOCR の簡体字誤読に耐える。
+
+    加えて Gemini の取引先名でも交差確認する。OCR だけに頼ると、キーワードが
+    改行で分断されたり写像表外の異体字で崩れたときに見逃し、社会保険料の
+    仕訳が作られて口座振替側と二重計上になる（§3.8 が防ぎたい事態そのもの）。
+    Strategy C の交差検証の精神をここでも使う。
+    """
+    # 空白は「全部」落とす。PaddleOCR は券面のレイアウトどおりに改行を入れるので
+    # 「保険料納入\n告知額」のようにキーワードが行またぎで分断されうる。半角空白
+    # だけ落とす実装だと、まさにその分断で検出を取りこぼし、禁止されている
+    # 社会保険料の仕訳が生成されて口座振替側と二重計上になる。
+    text = re.sub(r'\s+', '', _normalize_for_keyword_match(ocr_text))
+    if any(kw in text for kw in _SOCIAL_INSURANCE_STRONG):
+        return True
+    if any(all(kw in text for kw in pair)
+           for pair in _SOCIAL_INSURANCE_WEAK_PAIRS):
+        return True
+
+    # 取引先名は「裏付け」であって単独の陽性シグナルではない（上のコメント参照）
+    return (_has_social_insurance_vendor(raw_data)
+            and any(kw in text for kw in _SOCIAL_INSURANCE_CORROBORATION))
+
+
+def _has_social_insurance_vendor(raw_data):
+    """Gemini が返した取引先名が年金機構系かを見る（交差確認用）。"""
+    if not isinstance(raw_data, dict):
+        return False
+    vendors = [raw_data.get("vendor", "")]
+    for doc in raw_data.get("documents") or []:
+        if isinstance(doc, dict):
+            vendors.append(doc.get("vendor", ""))
+    for vendor in vendors:
+        if not vendor:
+            continue
+        normalized = re.sub(r'\s+', '', _normalize_for_keyword_match(vendor))
+        if any(kw in normalized for kw in _SOCIAL_INSURANCE_VENDORS):
+            return True
     return False
 
 
@@ -1122,8 +1266,23 @@ PROMPTS = {
 # ============================================================
 
 def _determine_credit_account(pay_method, doc_category="receipt"):
-    """支払方法とドキュメントカテゴリから貸方科目を決定"""
-    # 顧客確認済み: 領収書・請求書とも貸方は「未払金」に統一
+    """支払方法とドキュメントカテゴリから貸方科目を決定。
+
+    **無条件で「未払金」を返す。これは意図的。** 引数 pay_method /
+    doc_category は呼出側の形を変えないために受け取るだけで、参照しない。
+
+    顧客確認済み: 領収書・請求書とも貸方は「未払金」に統一。SS は「何の費用が
+    発生したか」だけを担い、「どの財布から出たか」は担わない——後者は
+    MoneyForward 側で口座連携と突合して消し込む運用（社会保険料を口座振替
+    資料として処理するのと同じ思想）。
+
+    **再議しないこと（2026-07-30 ユーザー裁定:「不用改動了，員工就是這樣
+    要求的」）。** payment_method が現金でも貸方が未払金になるのは仕様であり
+    判定失敗ではない。`_build_entries_from_receipt_legacy`（旧フォーマット兜底）と
+    `_build_entries_from_purchase_invoice` は本関数を通らず独自に現金／普通預金へ
+    分岐しており統一規則と食い違うが、社員の運用がそれで成立しているため
+    現状維持と裁定された。三者を揃える提案は却下済み。
+    """
     return "未払金"
 
 
@@ -1320,7 +1479,11 @@ def _build_entries_from_receipt_legacy(raw_data):
     entries = []
     debit_account = raw_data.get("debit_account", "消耗品費")
 
-    # 貸方科目決定
+    # 貸方科目決定（_determine_credit_account の「一律未払金」とは意図的に別ロジック。
+    # 統一規則の導入前からある旧フォーマット兜底経路で、社員の運用がこれで
+    # 成立しているため現状維持と裁定済み——2026-07-30 ユーザー裁定
+    # 「不用改動了，員工就是這樣要求的」。_determine_credit_account の
+    # docstring 参照。揃える提案は却下済みなので再議しないこと）
     pay_method = str(raw_data.get("payment_method", "現金"))
     credit_account = "現金"
     if any(x in pay_method for x in ["クレジット", "Credit", "Card", "VISA", "Master"]):
@@ -1365,7 +1528,10 @@ def _build_entries_from_purchase_invoice(raw_data):
     entries = []
     items = raw_data.get("items", [])
 
-    # 貸方科目決定
+    # 貸方科目決定（_determine_credit_account の「一律未払金」とは意図的に別ロジック。
+    # 請求書側は支払手段で分岐する運用のまま——2026-07-30 ユーザー裁定
+    # 「不用改動了，員工就是這樣要求的」。_determine_credit_account の
+    # docstring 参照。揃える提案は却下済みなので再議しないこと）
     pay_method = str(raw_data.get("payment_method", "振込"))
     credit_account = "買掛金"
     if "振込" in pay_method or "口座" in pay_method:
@@ -1697,7 +1863,26 @@ def _route_ocr_strategy(
     return raw_data, ocr_text, ocr_conf
 
 
-def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix=""):
+def _blank_result(date="", vendor="", **markers):
+    """entries を持たない result dict（認識不能・除外ページ）を組み立てる。
+
+    `_page_error_payload` はページ封筒（page_num 等を含む外側）を作るのに対し、
+    こちらは result dict そのもの。両者とも「占位行の形状を 1 箇所に集約して
+    漂移を防ぐ」という同じ意図で、markers に `_unrecognized=True` や
+    `_excluded_page=True` / `_exclude_reason=...` を渡し分ける。
+    """
+    return {
+        "date": date,
+        "vendor": vendor,
+        "invoice_num": "",
+        "memo": "",
+        "entries": [],
+        **markers,
+    }
+
+
+def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
+                        envelope_filter=False):
     """1ページ分の解析結果を doc_type 別に整形して result dict を yield する。
 
     process_pipeline の「PDF 逐頁ループ」と「単ページ PDF/画像（尾段）」は
@@ -1708,31 +1893,82 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix=""):
     一本化し、呼び出し側は page_num/total_pages/page_bytes 等のページメタ
     情報を付与してラップするだけにする。
 
-    封筒/非領収書ページ判定 (_is_envelope_page) はループ側のみの関心事のため
-    ここには含めない（尾段には元々その判定が存在しない——挙動を変えない）。
+    IP-401 T1: 封筒/非領収書ページ判定 (_is_envelope_page) は本関数へ移設された。
+    ただし §3.5 の裁決により有効なのは PDF 逐頁ループから
+    `envelope_filter=True` で呼ばれたときだけで、尾段（単頁 PDF・画像）は
+    既定の False のまま——尾段には元々この判定が無く、挙動を変えない。
+
+    Args:
+        envelope_filter: True なら RECEIPT の封筒/不要ページ判定を有効化する。
+            PDF 逐頁ループ専用（§3.5）。
 
     Yields:
         dict: result dict そのもの（page_num 等は含まない。呼び出し側が付与）
     """
     _apply_ocr_overrides(raw_data, ocr_text, prefix)
 
+    # ── IP-401 T6: 社会保険料通知書は仕訳を一切作らない（§3.8）──
+    # 封筒判定と違い entries の有無を見ない。Gemini はこの券面から堂々と
+    # 2口の仕訳を作ってしまう（それが実際の誤りだった）ので、「entries が
+    # 空のときだけ効く」設計では止まらない。業務ルールとして先に短絡する。
+    # doc_type も envelope_filter も問わない: どのフォルダへ投げられても、
+    # 単頁画像でも成立させる（顧客がスキャンしない前提に賭けない）。
+    if _is_social_insurance_notice(ocr_text, raw_data):
+        print(f"{prefix}🏥 社会保険料通知書を検出 → 仕訳を作成せず提示行のみ")
+        yield _blank_result(
+            memo=SOCIAL_INSURANCE_MEMO,
+            _excluded_page=True,
+            _exclude_reason=SOCIAL_INSURANCE_REASON,
+            _exclude_destination=EXCLUDE_DEST_MF_TAB,
+            _ocr_text_len=len(ocr_text or ""),
+        )
+        return
+
     if doc_type == DocType.RECEIPT:
         page_results = _normalize_receipt_results(
             raw_data, prefix=prefix, ocr_confidence=ocr_conf)
+
+        # ── IP-401 T1: 封筒判定を「前置拒否権」から「事後説明器」へ ──
+        # 旧実装は Gemini 呼び出しの直後・整形の前にこの判定を置き、命中したら
+        # continue で無音 skip していた。PaddleOCR の誤認識テキストだけを見て
+        # Gemini の成果を単独で否決できる構造であり、Strategy C（交差検証）の
+        # 設計意図がこの一点で潰れていた。実際に舞鶴パークの小型サーマル
+        # 領収証（「領収証」→「领収证」と誤認識）が無音で消えている。
+        #
+        # 改後は entries を組めたかどうかを先に見る。組めていれば棄却経路は
+        # 存在しない（目標1が構造的に達成される）。組めなかったときだけ
+        # 封筒判定を「なぜ空だったのか」の分類器として使う。
+        is_envelope = bool(
+            envelope_filter and _is_envelope_page(ocr_text, raw_data))
+
         if not page_results:
+            if is_envelope:
+                # 除外はするが**無音にはしない**。呼び出し側が監査タブへ回す。
+                # _page_error は立てない: これは失敗ではなく正常な除外であり、
+                # 立てると main が Failed 判定 → ファイル保持 → 無限リトライ。
+                print(f"{prefix}📨 封筒/非領収書ページとして除外（監査タブに記録）")
+                yield _blank_result(_excluded_page=True,
+                                    _exclude_reason="envelope",
+                                    _exclude_destination=EXCLUDE_DEST_AUDIT_TAB,
+                                    _ocr_text_len=len(ocr_text or ""))
+                return
             print(f"{prefix}⚠️ 有効な仕訳エントリが見つかりません → 認識不能として記録")
             p_date, p_vendor = _extract_partial_data(raw_data)
-            yield {
-                "date": p_date,
-                "vendor": p_vendor,
-                "invoice_num": "",
-                "memo": "",
-                "entries": [],
-                "_unrecognized": True,
-            }
+            yield _blank_result(date=p_date, vendor=p_vendor,
+                                _unrecognized=True)
             return
-        for entry in page_results:
-            yield entry
+
+        # entries は有効だが封筒シグナルも命中 → 記帳は止めず（Gemini 優先＝
+        # 交差検証の設計意図）、人手抽査用に監査タブへ「分岐」を残す。
+        # Gemini が本物の封筒に偽 entry を捏造する可能性への担保（§6）。
+        # 記録はページ単位で 1 行にしたいので先頭 result にだけ付ける。
+        if is_envelope:
+            yield {**page_results[0],
+                   "_audit_signal": "envelope_signal_with_entries",
+                   "_ocr_text_len": len(ocr_text or "")}
+            yield from page_results[1:]
+        else:
+            yield from page_results
         return
 
     # ── 非領収書（請求書系・給与明細）: builder 適用 ──
@@ -1744,6 +1980,39 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix=""):
         return
 
     yield _build_doc_result(doc_type, raw_data, builder(raw_data))
+
+
+def _page_error_payload(memo, page_num, total_pages, page_bytes, error_class):
+    """ページ失敗時の占位 yield ペイロードを組み立てる（逐頁ループ 3 経路共通）。
+
+    「ページ処理エラー」「AI応答のJSON解析失敗」「整形処理エラー」の 3 経路が
+    同一形状の dict を逐字コピーで持っていた。占位行の契約（`_page_error` /
+    `_unrecognized` / `_error_class` / `page_bytes`）は消費側の成否判定と
+    原票リンク生成に直結するため、1 箇所でも取りこぼすと無音欠落に戻る。
+    単一の出所にまとめて漂移を防ぐ。
+
+    error_class は **必須引数**（既定値を置かない）。headless 経路の
+    `_classify_page_result_shape` は欠落を保守的に "UNKNOWN" と見なし檔級
+    FAILED（再試行不可）に倒すため、渡し忘れが静かに終態を変えてしまう。
+    値の作り分けは §2.1 の白名単制に従う:
+      例外を伴う経路           → `_classify_page_error(exc)`（RETRYABLE/UNKNOWN）
+      例外なき JSON 解析失敗   → "CONTENT"（票面不可読の専用分岐）
+    """
+    return {
+        "result": {
+            "date": "",
+            "vendor": "",
+            "invoice_num": "",
+            "memo": memo,
+            "entries": [],
+            "_unrecognized": True,
+            "_page_error": True,
+            "_error_class": error_class,
+        },
+        "page_num": page_num,
+        "total_pages": total_pages,
+        "page_bytes": page_bytes,
+    }
 
 
 def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, start_page=1):
@@ -1796,6 +2065,24 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                 print(f"📄 大型PDF対応: {total}ページを分割解析します")
                 yielded = 0
                 failed_pages = 0
+                # IP-401 §8-中7: 一度でも何かを yield したページ番号。
+                # 「無音でページが消える」バグ全般に対する最終哨戒であり、
+                # 個別の欠落経路（封筒・整形例外）を塞いだ後も、将来また別の
+                # 経路で欠落が生まれたときに気づけるようにする。
+                # 裁決により警告のみ（成否判定は変えない、P2 繰延）。
+                seen_pages = set()
+
+                def _mark(payload):
+                    """出力を記録してから payload を返す（yield と対で使う）。
+
+                    記録と yield を1つの式にまとめる。別々の文にすると、将来
+                    yield 地点を増やしたときに記録だけ書き忘れ——哨戒自身が
+                    「成功したページを欠落と誤報する」という、まさに防ぎたい
+                    種類の欠陥を生む。ページ番号は payload から取るので
+                    ずれようがない。
+                    """
+                    seen_pages.add(payload["page_num"])
+                    return payload
 
                 for page_info in itertools.chain([first_page], page_gen):
                     idx = page_info["page_num"]
@@ -1817,23 +2104,12 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                     except Exception as page_err:
                         failed_pages += 1
                         print(f"{prefix}❌ ページ処理エラーのためスキップ: {type(page_err).__name__}: {str(page_err)[:120]}")
-                        yield {
-                            "result": {
-                                "date": "",
-                                "vendor": "",
-                                "invoice_num": "",
-                                "memo": f"ページ処理エラー: {type(page_err).__name__}",
-                                "entries": [],
-                                "_unrecognized": True,
-                                "_page_error": True,
-                                # B4 Plan §2.1 三分類: 例外は isinstance 判定
-                                # （子類含む）で RETRYABLE/UNKNOWN のいずれか
-                                "_error_class": _classify_page_error(page_err),
-                            },
-                            "page_num": idx,
-                            "total_pages": total,
-                            "page_bytes": page_data,
-                        }
+                        yield _mark(_page_error_payload(
+                            f"ページ処理エラー: {type(page_err).__name__}",
+                            idx, total, page_data,
+                            # B4 Plan §2.1 三分類: 例外は isinstance 判定
+                            # （子類含む）で RETRYABLE/UNKNOWN のいずれか
+                            error_class=_classify_page_error(page_err)))
                         gc.collect()
                         continue
 
@@ -1843,50 +2119,71 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                         # このページのデータが無音欠落する（例外経路と同扱い）
                         failed_pages += 1
                         print(f"{prefix}⚠️ AIの応答がJSONではありませんでした")
-                        yield {
-                            "result": {
-                                "date": "",
-                                "vendor": "",
-                                "invoice_num": "",
-                                "memo": "AI応答のJSON解析失敗",
-                                "entries": [],
-                                "_unrecognized": True,
-                                "_page_error": True,
-                                # B4 Plan §2.1: 例外を伴わない JSON 解析失敗は
-                                # 常に CONTENT（票面不可読、白名単制・専用分岐）
-                                "_error_class": "CONTENT",
-                            },
-                            "page_num": idx,
-                            "total_pages": total,
-                            "page_bytes": page_data,
-                        }
+                        yield _mark(_page_error_payload(
+                            "AI応答のJSON解析失敗", idx, total, page_data,
+                            # B4 Plan §2.1: 例外を伴わない JSON 解析失敗は
+                            # 常に CONTENT（票面不可読、白名単制・専用分岐）
+                            error_class="CONTENT"))
                         gc.collect()
                         continue
 
-                    # ── 封筒・非領収書ページ検出（コードレベル強制フィルタ）──
-                    # Session 16 裁決: この判定の構造キーワード（「領収」「請求書」
-                    # 「合計」等）は領収書向けに調整されたヒューリスティックであり、
-                    # 給与明細等の非領収書ページ（短文の明細ページ等）に誤爆すると
-                    # skip（yield されない）→ count==0 → Failed → 無限リトライ、
-                    # あるいは無音のページ欠落を引き起こす。よって RECEIPT に限定
-                    # する。非領収書の実際の封筒/送付状ページは _build_doc_result
-                    # の _unrecognized 占位行で可視化・アーカイブされるため兜は残る。
-                    if doc_type == DocType.RECEIPT and _is_envelope_page(ocr_text, page_raw_data):
-                        print(f"{prefix}📨 封筒/非領収書ページを検出、スキップします")
-                        continue
-
+                    # ── 封筒・非領収書ページ検出 ──
+                    # IP-401 T1: ここにあった「判定して continue（無音 skip）」は
+                    # 廃止。判定は _yield_page_results の内側へ移設し、
+                    # 「entries を組めなかったページの理由分類器」に降格した
+                    # （envelope_filter=True）。無音 skip は顧客が枚数を数える
+                    # までしか発見手段がなく、実際に本番で1票欠落している。
+                    # Session 16 の RECEIPT 限定裁決は移設先でも維持される
+                    # （判定は RECEIPT 分岐の内側にしか無い）。
+                    #
                     # OCR オーバーライド → doc_type別ルーティング → result dict 整形
                     # は _yield_page_results に一本化済み（尾段と共通ロジック）
-                    for entry in _yield_page_results(
-                            doc_type, page_raw_data, ocr_text, ocr_conf, prefix=prefix):
-                        yield {
+                    #
+                    # IP-401 T0: 整形段階の例外境界。
+                    # ここは以前 `for entry in _yield_page_results(...)` を裸で
+                    # 回しており、逐頁 try の**外**だった。畸形 Gemini JSON 等で
+                    # 整形が例外を投げると最外層の except まで飛び、そのページ
+                    # だけでなく **PDF の残り全ページが無音で消えた**。
+                    # next() を try で包み、例外は当該ページの占位行に閉じ込めて
+                    # 次ページへ進む。yield 自体は try の外に置き、消費側から
+                    # throw/close された例外を誤って握り潰さないようにする。
+                    page_iter = _yield_page_results(
+                        doc_type, page_raw_data, ocr_text, ocr_conf, prefix=prefix,
+                        envelope_filter=True)
+                    while True:
+                        try:
+                            entry = next(page_iter)
+                        except StopIteration:
+                            break
+                        except Exception as fmt_err:
+                            failed_pages += 1
+                            print(f"{prefix}❌ 整形処理エラー: "
+                                  f"{type(fmt_err).__name__}: {str(fmt_err)[:120]}")
+                            yield _mark(_page_error_payload(
+                                f"整形処理エラー: {type(fmt_err).__name__}",
+                                idx, total, page_data,
+                                # 畸形 JSON 由来の Python 例外。CONTENT は
+                                # 「例外なき解析失敗」専用の白名単なので広げず、
+                                # 例外経路と同じ三分類に委ねる（§2.1）
+                                error_class=_classify_page_error(fmt_err)))
+                            break
+                        yield _mark({
                             "result": entry,
                             "page_num": idx,
                             "total_pages": total,
                             "page_bytes": page_data,
-                        }
+                        })
                         yielded += 1
                     gc.collect()
+
+                # ページカバレッジ突合（IP-401 §8-中7）
+                # 個別の欠落経路を塞いだ後の最終哨戒。将来また別経路で無音
+                # 欠落が生まれたときに、顧客が枚数を数えるより先に気づく。
+                missing = sorted(set(range(start_page, total + 1)) - seen_pages)
+                if missing:
+                    print(f"⚠️ ページカバレッジ警告: {len(missing)}/{total}頁が"
+                          f"一度も出力されませんでした {missing} "
+                          f"（無音欠落の疑い。処理は継続します）")
 
                 if yielded > 0:
                     print(
