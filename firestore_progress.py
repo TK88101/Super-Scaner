@@ -78,6 +78,7 @@ class FirestorePageOutcomesReporter:
         self._base = base
         self._pending: dict[int, tuple[str, dict]] = {}
         self._warned = False
+        self._warned_kinds: set[str] = set()
 
     def record_page(self, page_num, kind, detail=None):
         """頁決算 1 件を §5.6 行へ映射して書く（失敗は pending へ退避）。"""
@@ -85,8 +86,10 @@ class FirestorePageOutcomesReporter:
         if mapped is None:
             # 未知 kind＝outcome を決められない→不写＋警告。静默で POSTED 等に
             # 化けさせない（R6）。ESCALATE も意図的にここに落ちる（不写裁決）。
-            if kind != "ESCALATE":
-                print(f"⚠️ page_outcomes: 未知 kind '{kind}' p{page_num} → 不記録")
+            if kind != "ESCALATE" and kind not in self._warned_kinds:
+                # 同一 kind の警告は檔内 1 回（50 頁檔で 50 連呼させない）
+                print(f"⚠️ page_outcomes: 未知 kind '{kind}' → 不記録")
+                self._warned_kinds.add(kind)
             return
         outcome, default_reason = mapped
         if detail is None:

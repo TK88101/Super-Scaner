@@ -498,14 +498,14 @@ def _report_headless_outcome(reporter, base, lease_epoch, outcome, file_id, cycl
     return "FAILED", None
 
 
-def _process_one_file(service, writer, reporter, file, input_folder_id, doc_type,
+def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_type,
                       processed_folder_id, split_pdf_folder_id, quarantine_alerted,
                       headless_memo, intake_state_memo, cycle, *,
                       progress_reporter=None):
     """1 ファイルの取り込み～記帳～終態処理（main() の for file in files: 本体を
     可測化のため抽出、ロジック改変なし——IP-303/304/306/308 全接線の実体）。
 
-    UI 版（reporter=None）と headless 版の分岐は本関数の内部で行う。main() 側は
+    UI 版（job_reporter=None）と headless 版の分岐は本関数の内部で行う。main() 側は
     ファイル一覧の反復と本関数の呼出しのみ担う。
 
     intake_state_memo：状態白名単で継続的にスキップされる file の pre-gate
@@ -521,7 +521,7 @@ def _process_one_file(service, writer, reporter, file, input_folder_id, doc_type
     # 自体を省く——無界の毎輪 get_job 連打を防ぐ（simcodex Round 2 #2）。
     # base は Drive properties から純関数で読める（Firestore 不要）ため、
     # gate 呼出し前でもキー参照できる。
-    if reporter is not None:
+    if job_reporter is not None:
         pre_base = intake_guard.resolve_posting_id(file)
         if pre_base is not None and _headless_memo_skip(
                 intake_state_memo, (pre_base, file_id), cycle):
@@ -532,9 +532,9 @@ def _process_one_file(service, writer, reporter, file, input_folder_id, doc_type
     # 0. ヘッドレスモード入口守衛（IP-303）+ 状態白名単（IP-308/T4）: 防重檢測より
     # 前に base posting_id ＋ job 状態を検証する。
     should_process, base, lease_epoch, state_rejected = _headless_intake_gate(
-        service, file, input_folder_id, reporter, alerted=quarantine_alerted)
+        service, file, input_folder_id, job_reporter, alerted=quarantine_alerted)
     if not should_process:
-        if reporter is not None and state_rejected and base is not None:
+        if job_reporter is not None and state_rejected and base is not None:
             _record_headless_memo(
                 intake_state_memo, (base, file_id), "STATE_NOT_ALLOWED",
                 input_folder_id, cycle + _ESCALATE_MEMO_TTL_CYCLES)
@@ -544,14 +544,14 @@ def _process_one_file(service, writer, reporter, file, input_folder_id, doc_type
     # 0.5 memo（費用防護、IP-308/T4、headless のみ）: 同 epoch 内で既に終態記録
     # 済みの file は本輪スキップ（零下載零OCR）。
     memo_key = (base, lease_epoch, file_id)
-    if reporter is not None and _headless_memo_skip(headless_memo, memo_key, cycle):
+    if job_reporter is not None and _headless_memo_skip(headless_memo, memo_key, cycle):
         print(f"headless memo 命中 → 本輪スキップ file_id={file_id}")
         print("=" * 30)
         return
 
     # 1. 防重檢測（UI 版のみ——headless は頁級台賬(IP-304)が硬去重を担い、
     # SS はファイル単位の move も行わない、B4 Plan §2.6 move 出口全審計）
-    if reporter is None:
+    if job_reporter is None:
         if is_duplicate_file(service, md5, processed_folder_id):
             print(f"⚠️ 重複アップロードを検出: {file_name}")
             print("   -> 処理をスキップしてアーカイブします")
@@ -578,47 +578,50 @@ def _process_one_file(service, writer, reporter, file, input_folder_id, doc_type
     local_path = download_file(service, file_id, file_name)
 
     # 頁級台賬（IP-304、headless のみ）: 1 ファイル＝1 job、job_key=base。
-    # reporter と同一 Firestore client を再利用、witness probe は writer 提供。
+    # job_reporter と同一 Firestore client を再利用、witness probe は writer 提供。
     ledger = None
     page_outcomes = None
-    if reporter is not None and base is not None:
+    if job_reporter is not None and base is not None:
         from posting_ledger import PostingLedger
         ledger = PostingLedger(
-            reporter.client, base, sheet_probe=writer.probe_page)
-        # 頁処理結果台帳 reporter（契約 §5.6、B7-2 T3）。1 ファイル＝1 個、
-        # client は檔級回報（reporter＝job 状態）と同一を再利用。
+            job_reporter.client, base, sheet_probe=writer.probe_page)
+        # 頁処理結果台帳（契約 §5.6、B7-2 T3）。1 ファイル＝1 個、
+        # client は檔級回報（job_reporter＝job 状態）と同一を再利用。
         from firestore_progress import FirestorePageOutcomesReporter
-        page_outcomes = FirestorePageOutcomesReporter(reporter.client, base)
+        page_outcomes = FirestorePageOutcomesReporter(job_reporter.client, base)
 
     # PDF 間分割線 + 取引No リセットは UI 版のみ（headless は取引No を
     # Sheets A 列から都度再構築＝崩潰重跑冪等、分割線リセットは不要・有害）。
     if ledger is None:
         writer.start_new_file(uploader_name, doc_type, file_name)
 
-    outcome = process_file(
-        service, writer, local_path,
-        uploader_name, chat_id,
-        doc_type=doc_type, drive_file_id=file_id,
-        split_pdf_folder_id=split_pdf_folder_id,
-        base=base, ledger=ledger,
-        # Sheets 進捗タブは UI 版のみ接続（headless の頁級可視化権威は
-        # 控制面 page_outcomes——B7-2 Plan §2 非目標）。
-        progress=progress_reporter if ledger is None else None,
-        page_outcomes=page_outcomes,
-    )
-
-    if page_outcomes is not None:
-        # 檔終局の補写一輪（report_posted の**前**——頁時に失敗した行を
-        # 回収してから檔級終態を回報する。なお失敗は放行＝reconciler 側で
-        # 欠落として扱われる。B7-2 Plan §9 #3/#9 裁決）。
-        page_outcomes.flush_pending()
+    try:
+        outcome = process_file(
+            service, writer, local_path,
+            uploader_name, chat_id,
+            doc_type=doc_type, drive_file_id=file_id,
+            split_pdf_folder_id=split_pdf_folder_id,
+            base=base, ledger=ledger,
+            # Sheets 進捗タブは UI 版のみ接続（headless の頁級可視化権威は
+            # 控制面 page_outcomes——B7-2 Plan §2 非目標）。
+            progress=progress_reporter if ledger is None else None,
+            page_outcomes=page_outcomes,
+        )
+    finally:
+        if page_outcomes is not None:
+            # 檔終局の補写一輪（report_posted の**前**——頁時に失敗した行を
+            # 回収してから檔級終態を回報する。なお失敗は放行＝reconciler 側で
+            # 欠落として扱われる。B7-2 Plan §9 #3/#9 裁決）。finally なのは
+            # 途中例外でも真に決算済みの頁の行を落とさないため（flush 自体は
+            # 決して raise しない）。
+            page_outcomes.flush_pending()
 
     if ledger is not None:
         # headless 五態（B4 Plan §2.3）。move は全出口で削除済み（§2.6 全審計、
         # SUCCESS も含め move 零呼出——回報 report_posted/report_dead_letter に
         # 代替）。memo は outcome_label が非 None のときのみ記録する。
         outcome_label, expire_cycle = _report_headless_outcome(
-            reporter, base, lease_epoch, outcome, file_id, cycle)
+            job_reporter, base, lease_epoch, outcome, file_id, cycle)
         if outcome_label is not None:
             _record_headless_memo(headless_memo, memo_key, outcome_label,
                                   input_folder_id, expire_cycle)
@@ -1716,7 +1719,7 @@ def main():
     # Firestore reporter を起動時に一度だけ構築する。UI 版
     # （HEADLESS_MODE 未設定）では reporter は None のまま、既存挙動に
     # 一切影響しない。
-    reporter = _init_headless_reporter()
+    job_reporter = _init_headless_reporter()
 
     # 拒絶件記憶層（IP-303、進程内快取）: alert 送達済みだが move が未完了の
     # file_id を憶えておき、次輪で check_intake/get_job/write_alert を
@@ -1739,8 +1742,8 @@ def main():
 
     # B7 T4: プロファイルごとの進捗レポーター（Sheets `_処理進捗` タブ）。
     # 生成失敗は build_writers と同じ粒度で縮退——進捗タブが無くても記帳は続行。
-    # 変数名は headless の Firestore 入口守衛 reporter と衝突させない
-    # （progress_reporter ＝人向け進捗可視化／reporter ＝ Firestore 回報）。
+    # 変数名は headless の Firestore 入口守衛 job_reporter と衝突させない
+    # （progress_reporter ＝人向け進捗可視化／job_reporter ＝ Firestore 回報）。
     progress_reporters = build_progress_reporters(writers)
 
     active_folder_map = filter_active_folders(folder_map, writers)
@@ -1775,7 +1778,7 @@ def main():
 
                 # 剪枝按夾（IP-308/T4、B4 Plan §2.4 DoD⑦）: list_files 成功後にのみ
                 # 呼ぶ（「夾列舉失敗不剪」は呼出順序で自然に満たす）。
-                if reporter is not None:
+                if job_reporter is not None:
                     _prune_headless_memo(headless_memo, input_folder_id, files)
                     _prune_headless_memo(intake_state_memo, input_folder_id, files,
                                          file_id_index=1)
@@ -1795,7 +1798,7 @@ def main():
 
                 for file in files:
                     _process_one_file(
-                        service, writer, reporter, file, input_folder_id,
+                        service, writer, job_reporter, file, input_folder_id,
                         doc_type, processed_folder_id,
                         profile["split_pdf_folder_id"], quarantine_alerted,
                         headless_memo, intake_state_memo, cycle,

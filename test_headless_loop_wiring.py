@@ -44,12 +44,12 @@ def _file(file_id="f1", base="cust:hash"):
             "properties": {"sandevistan_posting_id": base}}
 
 
-def _call_process_one_file(writer, reporter, *, file=None, headless_memo=None,
+def _call_process_one_file(writer, job_reporter, *, file=None, headless_memo=None,
                            intake_state_memo=None, cycle=1):
     """main._process_one_file の呼出し足場（ProcessOneFileTest と
     IntakeStatePreGateMemoTest で共用、simcodex Round 2 #11 と同型の DRY）。"""
     main._process_one_file(
-        service=None, writer=writer, reporter=reporter,
+        service=None, writer=writer, job_reporter=job_reporter,
         file=file if file is not None else _file(), input_folder_id="in",
         doc_type="receipt", processed_folder_id="processed",
         split_pdf_folder_id="split", quarantine_alerted={},
