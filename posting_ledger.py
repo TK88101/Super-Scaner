@@ -296,7 +296,7 @@ class PostingLedger:
                     )
                 # 既存 PENDING＝同 owner の重写（witness ABSENT 後）。created_at は保持。
                 created_at = existing.get("created_at", now)
-            txn.set(doc_ref, _pending_payload(page_id, summary, created_at, now))
+            txn.set(doc_ref, _pending_payload(summary, created_at, now))
 
         self._transaction_runner(body)
         self._invalidate_cache(page_id)
@@ -329,6 +329,9 @@ class PostingLedger:
                 "status": STATUS_CONFIRMED,
                 "sheet_row_range": [row_range[0], row_range[1]],
                 "updated_at": now,
+                # S2: written_at 双写（契約 §5.3 打卡制の数据源）。updated_at と
+                # 同一 now 変数・同一 txn.set 内（防漂移三律①②）。
+                "written_at": now,
             }
             txn.set(doc_ref, new_data)
 
@@ -337,15 +340,20 @@ class PostingLedger:
 
 
 def _pending_payload(
-    page_id: str,
     summary: PagePostingSummary,
     created_at: datetime,
     updated_at: datetime,
 ) -> dict[str, Any]:
-    """PENDING doc の全文檔ペイロード（定稿 Plan §9 schema、全文 set 対齊 reporter）。"""
+    """PENDING doc の全文檔ペイロード（契約 v0.16 §5.5 対齊、S1/S2）。
+
+    S1: 台賬キーは `page`（旧 `page_num`）。`page_id` は文書 ID に一本化済み
+    （Firestore の doc id そのものが page_id）のため字段としては持たない
+    （dataclass `PagePostingSummary.page_num` 属性名は不変——変わるのは
+    Firestore 文書のキー面だけ）。
+    S2: `written_at`＝`updated_at` と同一値（防漂移三律③、PENDING 記録時点）。
+    """
     return {
-        "page_id": page_id,
-        "page_num": summary.page_num,
+        "page": summary.page_num,
         "status": STATUS_PENDING,
         "ticket_count": summary.ticket_count,
         "row_count": summary.row_count,
@@ -362,5 +370,6 @@ def _pending_payload(
         "sheet_row_range": None,
         "created_at": created_at,
         "updated_at": updated_at,
+        "written_at": updated_at,
         "schema_version": SCHEMA_VERSION,
     }

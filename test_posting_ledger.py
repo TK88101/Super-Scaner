@@ -37,9 +37,10 @@ def _make_ledger(fs: _FakeFirestore, probe) -> PostingLedger:
 
 
 def _pending_doc(**overrides) -> dict:
+    # 契約 v0.16 §5.5 対斉（S1/S2）: page_id は持たない・page_num→page・
+    # written_at は updated_at と同一値で双写。
     base = {
-        "page_id": PAGE_ID,
-        "page_num": 3,
+        "page": 3,
         "status": pl.STATUS_PENDING,
         "ticket_count": 1,
         "row_count": 2,
@@ -50,6 +51,7 @@ def _pending_doc(**overrides) -> dict:
         "sheet_row_range": None,
         "created_at": datetime(2026, 7, 21, tzinfo=UTC),
         "updated_at": datetime(2026, 7, 21, tzinfo=UTC),
+        "written_at": datetime(2026, 7, 21, tzinfo=UTC),
         "schema_version": 1,
     }
     base.update(overrides)
@@ -177,7 +179,9 @@ class PostPageTest(unittest.TestCase):
         self.assertEqual(doc["ticket_count"], 1)
         self.assertEqual(doc["row_count"], 2)
         self.assertEqual(doc["tickets"], [{"date": "2026-07-01", "amount": 1100, "vendor": "A社"}])
-        self.assertEqual(doc["page_num"], 3)
+        self.assertEqual(doc["page"], 3)
+        self.assertNotIn("page_num", doc)
+        self.assertNotIn("page_id", doc)
         self.assertEqual(doc["schema_version"], 1)
         self.assertIs(doc["created_at"].tzinfo, UTC)
         self.assertIs(doc["updated_at"].tzinfo, UTC)
@@ -299,7 +303,7 @@ class ConfirmedTicketCountTest(unittest.TestCase):
         fs.store[POSTING_PATH] = _pending_doc(status=pl.STATUS_CONFIRMED, ticket_count=2)
         other_path = ("jobs", JOB_KEY, "postings", "cust:hash:p9")
         fs.store[other_path] = _pending_doc(
-            page_id="cust:hash:p9", status=pl.STATUS_CONFIRMED, ticket_count=9)
+            page=9, status=pl.STATUS_CONFIRMED, ticket_count=9)
         ledger = _make_ledger(fs, self._probe_const(ProbeResult.ABSENT))
         ledger.check_page(PAGE_ID)
         self.assertEqual(ledger.confirmed_ticket_count("cust:hash:p9"), 9)
@@ -313,6 +317,128 @@ class ConfirmedTicketCountTest(unittest.TestCase):
         self.assertIs(ledger.check_page(PAGE_ID), PageDecision.WRITE)  # (PAGE_ID, None) を快取
         ledger.post_page(PAGE_ID, _summary(ticket_count=5), lambda: (1, 1))
         self.assertEqual(ledger.confirmed_ticket_count(PAGE_ID), 5)  # 快取無効化→最新値
+
+
+class WrittenAtDoubleWriteTest(unittest.TestCase):
+    """S2: written_at 双写・防漂移三律（①同一 now ②同一 txn.set 内 ③恒等）。
+
+    PENDING 直後・CONFIRMED 直後の両態で written_at == updated_at が恒成立する
+    ことを断言する。witness PRESENT 補記経路（require_pending=True、
+    _recover_pending 経由）でも同一 _confirm を通るため同様に成立する。
+    """
+
+    def _probe_const(self, result):
+        return lambda tab, rng, fp: result
+
+    def test_pending_written_at_equals_updated_at(self) -> None:
+        fs = _FakeFirestore()
+        ledger = _make_ledger(fs, self._probe_const(ProbeResult.ABSENT))
+        captured = {}
+
+        def commit():
+            captured["pending_doc"] = dict(fs.store[POSTING_PATH])
+            return (5, 5)
+
+        ledger.post_page(PAGE_ID, _summary(), commit)
+
+        pending_doc = captured["pending_doc"]
+        self.assertEqual(pending_doc["written_at"], pending_doc["updated_at"])
+        self.assertIs(pending_doc["written_at"].tzinfo, UTC)
+
+    def test_confirmed_written_at_equals_updated_at(self) -> None:
+        fs = _FakeFirestore()
+        ledger = _make_ledger(fs, self._probe_const(ProbeResult.ABSENT))
+        ledger.post_page(PAGE_ID, _summary(), lambda: (5, 5))
+
+        doc = fs.store[POSTING_PATH]
+        self.assertEqual(doc["written_at"], doc["updated_at"])
+        # confirm 時の written_at は claim 時のものから前進している
+        # （②同一 txn.set 内で updated_at と一緒に更新される）
+        self.assertNotEqual(doc["written_at"], doc["created_at"])
+
+    def test_witness_present_recovery_confirm_also_sets_written_at(self) -> None:
+        # _recover_pending の PRESENT 分岐（require_pending=True）経由の
+        # _confirm 呼出しでも written_at == updated_at が成立する。
+        fs = _FakeFirestore()
+        fs.store[POSTING_PATH] = _pending_doc()
+        ledger = _make_ledger(fs, self._probe_const(ProbeResult.PRESENT))
+
+        self.assertIs(ledger.check_page(PAGE_ID), PageDecision.SKIP)
+
+        doc = fs.store[POSTING_PATH]
+        self.assertEqual(doc["status"], pl.STATUS_CONFIRMED)
+        self.assertEqual(doc["written_at"], doc["updated_at"])
+        self.assertIs(doc["written_at"].tzinfo, UTC)
+
+
+# 契約 v0.16 §5.5 字段表（S3、Codex #6 採納で状態別 schema テストへ格上げ）。
+# リテラル列挙——posting_ledger 側の定数を再利用すると「実装が変われば
+# テストも自動で追従してしまう」ため、契約の字面をここに固定して漂移を検知する。
+_CONTRACT_FIELDS_V16 = frozenset(
+    {"page", "ticket_count", "status", "sheet_row_range", "written_at", "tickets"}
+)
+
+
+class ContractSchemaV16Test(unittest.TestCase):
+    """S3: 契約 §5.5 状態別 schema テスト（PENDING/CONFIRMED、Codex #6 採納）。
+
+    T1/T2 適用前のコード（"page_num"/"page_id" キー・written_at 無し）に
+    当てると本クラスは RED になる（歯の証明、T3 DoD）。
+    """
+
+    def _probe_const(self, result):
+        return lambda tab, rng, fp: result
+
+    def _assert_common_contract_fields(self, doc, summary) -> None:
+        # 契約字段集 ⊆ doc.keys()
+        self.assertTrue(_CONTRACT_FIELDS_V16.issubset(doc.keys()))
+        # page == summary.page_num（int）
+        self.assertEqual(doc["page"], summary.page_num)
+        self.assertIsInstance(doc["page"], int)
+        # ticket_count == len(tickets)
+        self.assertEqual(doc["ticket_count"], len(doc["tickets"]))
+        # written_at == updated_at（UTC aware datetime）
+        self.assertEqual(doc["written_at"], doc["updated_at"])
+        self.assertIsInstance(doc["written_at"], datetime)
+        self.assertIs(doc["written_at"].tzinfo, UTC)
+        # 旧形再発の否定対照（S1）
+        self.assertNotIn("page_num", doc)
+        self.assertNotIn("page_id", doc)
+
+    def test_pending_doc_matches_contract_schema(self) -> None:
+        fs = _FakeFirestore()
+        ledger = _make_ledger(fs, self._probe_const(ProbeResult.ABSENT))
+        summary = _summary()
+        captured = {}
+
+        def commit():
+            captured["pending_doc"] = dict(fs.store[POSTING_PATH])
+            return (10, 12)
+
+        ledger.post_page(PAGE_ID, summary, commit)
+
+        doc = captured["pending_doc"]
+        self._assert_common_contract_fields(doc, summary)
+        # PENDING: sheet_row_range は None
+        self.assertIsNone(doc["sheet_row_range"])
+
+    def test_confirmed_doc_matches_contract_schema(self) -> None:
+        fs = _FakeFirestore()
+        ledger = _make_ledger(fs, self._probe_const(ProbeResult.ABSENT))
+        summary = _summary()
+
+        ledger.post_page(PAGE_ID, summary, lambda: (10, 12))
+
+        doc = fs.store[POSTING_PATH]
+        self._assert_common_contract_fields(doc, summary)
+        # CONFIRMED: sheet_row_range == [start, end]・正整数・start <= end
+        row_range = doc["sheet_row_range"]
+        start, end = row_range
+        self.assertIsInstance(start, int)
+        self.assertIsInstance(end, int)
+        self.assertGreater(start, 0)
+        self.assertGreaterEqual(end, start)
+        self.assertEqual([start, end], [10, 12])
 
 
 if __name__ == "__main__":
