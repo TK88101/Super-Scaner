@@ -18,12 +18,15 @@ import os
 import sys
 import unittest
 from contextlib import redirect_stdout
+from datetime import timezone
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 
 import main
 import ocr_engine
+import page_progress
+from sheets_output import APPEND_RESULT_PLACEHOLDER, APPEND_RESULT_POSTED
 from doc_types import DocType
 
 
@@ -78,13 +81,23 @@ def _excluded_result(reason="envelope", ocr_text_len=55):
             "_ocr_text_len": ocr_text_len}
 
 
-def _run_process_file(pages, writer=None):
-    """process_pipeline を差替えて process_file を1回走らせる。"""
+def _run_process_file(pages, writer=None, progress=None,
+                      resolver_side_effect=None):
+    """process_pipeline を差替えて process_file を1回走らせる。
+
+    progress は B7 T3 で追加された任意引数。未指定(None)のときは既存呼出と
+    完全に同じ挙動になる（main.process_file 内で NULL_REPORTER に落ちる）。
+    resolver_side_effect を渡すと resolver.resolve が例外を投げる（未預期
+    例外経路のテスト用。例外はそのまま呼び出し元へ伝播する）。
+    """
     writer = writer if writer is not None else _RecordingWriter()
     with mock.patch.object(main, "process_pipeline", return_value=iter(pages)), \
          mock.patch.object(main, "send_notification"), \
          mock.patch.object(main, "PageUrlResolver") as resolver_cls:
-        resolver_cls.return_value.resolve.return_value = "https://example/doc"
+        if resolver_side_effect is not None:
+            resolver_cls.return_value.resolve.side_effect = resolver_side_effect
+        else:
+            resolver_cls.return_value.resolve.return_value = "https://example/doc"
         with redirect_stdout(io.StringIO()):
             ok = main.process_file(
                 service=mock.MagicMock(),
@@ -93,6 +106,7 @@ def _run_process_file(pages, writer=None):
                 uploader_name="テスト社員",
                 chat_id="",
                 doc_type=DocType.RECEIPT,
+                progress=progress,
             )
     return ok, writer
 
@@ -393,6 +407,211 @@ class SocialInsuranceNoticeRoutingTest(unittest.TestCase):
         # Assert
         self.assertEqual(writer.calls, [])
         self.assertEqual(len(writer.audit_calls), 1)
+
+
+# ─────────────────────── B7 T3: 頁級進捗フックの発射表 ───────────────────────
+
+class _ProgressSpy:
+    """process_file(..., progress=...) の発射を記録するテスト用 reporter。"""
+
+    def __init__(self):
+        self.file_started_calls = []
+        self.page_done_calls = []
+        self.file_finished_calls = []
+
+    def file_started(self, filename, uploader_name, doc_type):
+        self.file_started_calls.append((filename, uploader_name, doc_type))
+
+    def page_done(self, page_num, total_pages, outcome, reason, occurred_at):
+        self.page_done_calls.append(
+            (page_num, total_pages, outcome, reason, occurred_at))
+
+    def file_finished(self, status, error_class=None):
+        self.file_finished_calls.append((status, error_class))
+
+
+class _ReturnControlledWriter(_RecordingWriter):
+    """append_entries の戻り値を制御できる _RecordingWriter 派生（B7 T3専用）。
+
+    既存の _RecordingWriter は戻り値を検証しない既存テスト群のために一切
+    変更しない。"posted"/"placeholder" の発射を検証する新規テストだけが
+    こちらを使う。
+    """
+
+    def __init__(self, entries_return=APPEND_RESULT_POSTED, audit_error=None):
+        super().__init__(audit_error=audit_error)
+        self._entries_return = entries_return
+
+    def append_entries(self, employee_name, doc_type, entries_data, source_url):
+        super().append_entries(employee_name, doc_type, entries_data, source_url)
+        return self._entries_return
+
+
+class _AlwaysFailingEntriesWriter(_RecordingWriter):
+    """append_entries が常に失敗する writer（除外頁の MF 落地失敗を模す）。"""
+
+    def append_entries(self, employee_name, doc_type, entries_data, source_url):
+        raise RuntimeError("Sheets 500")
+
+
+def _notice_page_dict():
+    """社会保険料通知書ページ（_excluded_page かつ MF タブへ提示行、§3.8）。"""
+    return {"entries": [], "memo": ocr_engine.SOCIAL_INSURANCE_MEMO,
+            "_excluded_page": True,
+            "_exclude_reason": ocr_engine.SOCIAL_INSURANCE_REASON,
+            "_exclude_destination": ocr_engine.EXCLUDE_DEST_MF_TAB,
+            "_ocr_text_len": 90}
+
+
+class PageDoneEmissionTest(unittest.TestCase):
+    """B7 T3: process_file のページ終局5種の発射表（Plan §3.2(b)）。"""
+
+    def test_page_error_emits_failed(self):
+        progress = _ProgressSpy()
+        pages = [_page({"entries": [], "_unrecognized": True,
+                        "_page_error": True}, 1, 1)]
+        _run_process_file(pages, progress=progress)
+        self.assertEqual(len(progress.page_done_calls), 1)
+        _, _, outcome, reason, occurred_at = progress.page_done_calls[0]
+        self.assertEqual(outcome, page_progress.OUTCOME_FAILED)
+        self.assertEqual(reason, "page_error")
+        self.assertEqual(occurred_at.tzinfo, timezone.utc)
+
+    def test_excluded_page_success_emits_excluded_with_reason(self):
+        progress = _ProgressSpy()
+        pages = [_page(_excluded_result(reason="envelope"), 1, 1)]
+        _run_process_file(pages, progress=progress)
+        self.assertEqual(len(progress.page_done_calls), 1)
+        _, _, outcome, reason, _ = progress.page_done_calls[0]
+        self.assertEqual(outcome, page_progress.OUTCOME_EXCLUDED)
+        self.assertEqual(reason, "envelope")
+
+    def test_excluded_page_mf_landing_is_still_excluded_not_placeholder(self):
+        """低11 裁決: 落地形式が MF 占位行（社保通知書）でも恒に EXCLUDED。"""
+        progress = _ProgressSpy()
+        pages = [_page(_notice_page_dict(), 1, 1)]
+        _run_process_file(pages, progress=progress)
+        self.assertEqual(len(progress.page_done_calls), 1)
+        _, _, outcome, reason, _ = progress.page_done_calls[0]
+        self.assertEqual(outcome, page_progress.OUTCOME_EXCLUDED)
+        self.assertEqual(reason, ocr_engine.SOCIAL_INSURANCE_REASON)
+
+    def test_excluded_record_failure_emits_failed(self):
+        """MF 落地失敗（recorded=False）は FAILED, reason=exclude_record_failed。"""
+        progress = _ProgressSpy()
+        writer = _AlwaysFailingEntriesWriter()
+        pages = [_page(_notice_page_dict(), 1, 1)]
+        _run_process_file(pages, writer=writer, progress=progress)
+        self.assertEqual(len(progress.page_done_calls), 1)
+        _, _, outcome, reason, _ = progress.page_done_calls[0]
+        self.assertEqual(outcome, page_progress.OUTCOME_FAILED)
+        self.assertEqual(reason, "exclude_record_failed")
+
+    def test_posted_page_emits_posted(self):
+        progress = _ProgressSpy()
+        writer = _ReturnControlledWriter(entries_return=APPEND_RESULT_POSTED)
+        pages = [_page(_valid_result(), 1, 1)]
+        _run_process_file(pages, writer=writer, progress=progress)
+        self.assertEqual(len(progress.page_done_calls), 1)
+        _, _, outcome, reason, _ = progress.page_done_calls[0]
+        self.assertEqual(outcome, page_progress.OUTCOME_POSTED)
+        self.assertEqual(reason, "")
+
+    def test_placeholder_page_emits_placeholder(self):
+        """中8 裁決: entries 有値でも append_entries が占位行に転落した頁は
+        PLACEHOLDER（POSTED ではない）——「entries>0＝POSTED」の誤報排除。"""
+        progress = _ProgressSpy()
+        writer = _ReturnControlledWriter(
+            entries_return=APPEND_RESULT_PLACEHOLDER)
+        pages = [_page(_valid_result(), 1, 1)]
+        _run_process_file(pages, writer=writer, progress=progress)
+        self.assertEqual(len(progress.page_done_calls), 1)
+        _, _, outcome, reason, _ = progress.page_done_calls[0]
+        self.assertEqual(outcome, page_progress.OUTCOME_PLACEHOLDER)
+        self.assertEqual(reason, "unrecognized")
+
+
+class FileFinishedEmissionTest(unittest.TestCase):
+    """B7 T3: process_file の檔終局4状態（Plan §3.2(c)）。"""
+
+    def test_all_pages_error_emits_failed_retained(self):
+        progress = _ProgressSpy()
+        pages = [_page({"entries": [], "_unrecognized": True,
+                        "_page_error": True}, 1, 1)]
+        _run_process_file(pages, progress=progress)
+        self.assertEqual(len(progress.file_finished_calls), 1)
+        status, error_class = progress.file_finished_calls[0]
+        self.assertEqual(status, page_progress.STATUS_FAILED_RETAINED)
+        self.assertIsNone(error_class)
+
+    def test_success_emits_completed(self):
+        progress = _ProgressSpy()
+        pages = [_page(_valid_result(), 1, 2), _page(_valid_result(), 2, 2)]
+        _run_process_file(pages, progress=progress)
+        status, _ = progress.file_finished_calls[0]
+        self.assertEqual(status, page_progress.STATUS_COMPLETED)
+
+    def test_missing_pages_emits_completed_with_coverage_gap(self):
+        """中6 裁決: 頁欠落があれば「完了」ではなく COMPLETED_WITH_COVERAGE_GAP。"""
+        progress = _ProgressSpy()
+        pages = [_page(_valid_result(), 1, 3), _page(_valid_result(), 3, 3)]
+        _run_process_file(pages, progress=progress)
+        status, _ = progress.file_finished_calls[0]
+        self.assertEqual(status, page_progress.STATUS_COMPLETED_COVERAGE_GAP)
+
+    def test_partial_error_emits_partial_error_status(self):
+        progress = _ProgressSpy()
+        pages = [
+            _page({"entries": [], "_unrecognized": True,
+                  "_page_error": True}, 1, 2),
+            _page(_valid_result(), 2, 2),
+        ]
+        _run_process_file(pages, progress=progress)
+        status, _ = progress.file_finished_calls[0]
+        self.assertEqual(status, page_progress.STATUS_PARTIAL_ERROR)
+
+    def test_partial_error_takes_priority_over_coverage_gap(self):
+        """partial_error は coverage gap より優先（タスク指示の優先順位）。"""
+        progress = _ProgressSpy()
+        pages = [
+            _page({"entries": [], "_unrecognized": True,
+                  "_page_error": True}, 1, 3),
+            _page(_valid_result(), 3, 3),  # p2 は一度も来ない(欠落) かつ p1 はエラー
+        ]
+        _run_process_file(pages, progress=progress)
+        status, _ = progress.file_finished_calls[0]
+        self.assertEqual(status, page_progress.STATUS_PARTIAL_ERROR)
+
+    def test_count_zero_emits_parse_failed(self):
+        progress = _ProgressSpy()
+        _run_process_file([], progress=progress)
+        status, _ = progress.file_finished_calls[0]
+        self.assertEqual(status, page_progress.STATUS_PARSE_FAILED)
+
+
+class UnexpectedExceptionAbortedTest(unittest.TestCase):
+    """B7 T3(高1): 未預期例外は ABORTED を best-effort 発射後、例外を原様 re-raise。"""
+
+    def test_unexpected_exception_emits_aborted_and_reraises(self):
+        progress = _ProgressSpy()
+        pages = [_page(_valid_result(), 1, 1)]
+        with self.assertRaises(RuntimeError):
+            _run_process_file(pages, progress=progress,
+                              resolver_side_effect=RuntimeError("boom"))
+        self.assertEqual(len(progress.file_finished_calls), 1)
+        status, error_class = progress.file_finished_calls[0]
+        self.assertEqual(status, page_progress.STATUS_ABORTED)
+        self.assertEqual(error_class, "RuntimeError")
+
+
+class ProgressOptionalNoRegressionTest(unittest.TestCase):
+    """B7 T3: progress 未指定でも process_file は従来どおり動く（無回帰）。"""
+
+    def test_process_file_works_without_progress_argument(self):
+        pages = [_page(_valid_result(), 1, 1)]
+        ok, writer = _run_process_file(pages)  # progress 未指定
+        self.assertTrue(ok)
+        self.assertEqual(len(writer.calls), 1)
 
 
 if __name__ == "__main__":
