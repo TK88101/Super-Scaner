@@ -1894,9 +1894,12 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
     情報を付与してラップするだけにする。
 
     IP-401 T1: 封筒/非領収書ページ判定 (_is_envelope_page) は本関数へ移設された。
-    ただし §3.5 の裁決により有効なのは PDF 逐頁ループから
-    `envelope_filter=True` で呼ばれたときだけで、尾段（単頁 PDF・画像）は
-    既定の False のまま——尾段には元々この判定が無く、挙動を変えない。
+    §3.5 の当初裁決では有効なのは PDF 逐頁ループから `envelope_filter=True`
+    で呼ばれたときだけで、尾段（単頁 PDF・画像）は既定の False のまま
+    （尾段には元々この判定が無く、挙動を変えない）だった。契約 v0.15
+    §5.1-b 裁定-5（B7 T5）でこれを改め、headless（`config.headless_mode()`）
+    では尾段も呼び出し側（process_pipeline）が `envelope_filter=True` を渡す
+    ——UI 版（非 headless）は従来どおり False のまま、挙動零改動。
 
     Args:
         envelope_filter: True なら RECEIPT の封筒/不要ページ判定を有効化する。
@@ -2217,8 +2220,13 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
 
         # OCR オーバーライド → doc_type別ルーティング → result dict 整形
         # は _yield_page_results に一本化済み（PDF 逐頁ループと共通ロジック）。
-        # 封筒判定は元々この経路には無かったため呼ばない（挙動を変えない）。
-        for entry in _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf):
+        # 封筒判定は元々この経路には無かった（挙動を変えない）が、契約 v0.15
+        # §5.1-b 裁定-5（B7 T5）で headless に限り尾段でも有効化する
+        # （config は本関数冒頭の import config で既に束縛済み）。UI 版
+        # （非 headless）は headless_mode()==False のため従来どおり無効。
+        for entry in _yield_page_results(
+                doc_type, raw_data, ocr_text, ocr_conf,
+                envelope_filter=config.headless_mode()):
             yield {
                 "result": entry,
                 "page_num": 1,
