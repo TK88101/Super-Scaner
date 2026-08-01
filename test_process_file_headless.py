@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 import main
 from doc_types import DocType
-from posting_ledger import PostingLedger, derive_page_id
+from posting_ledger import PageDecision, PostingLedger, derive_page_id
 from sheets_output import TAG_COL_INDEX
 from test_sheets_output import _make_writer as _make_sheets_output_writer
 # 夾具（T4/T5、B4 復用）から fake 部品を import——二重定義を避け単一ソース化。
@@ -191,12 +191,16 @@ class IntakeGateBaseWiringTest(unittest.TestCase):
                 pass
 
         with patch.object(main.config, "headless_mode", return_value=True):
-            should, base, epoch, state_rejected = main._headless_intake_gate(
-                service=None, file=file, input_folder_id="in", reporter=_Rep())
+            should, base, epoch, state_rejected, cust_id, cust_label = (
+                main._headless_intake_gate(
+                    service=None, file=file, input_folder_id="in",
+                    reporter=_Rep()))
         self.assertTrue(should)
         self.assertEqual(base, "cust:hash")
         self.assertFalse(state_rejected)
         self.assertEqual(epoch, 1)
+        self.assertIsNone(cust_id)   # _Rep の job には customer_id が無い
+        self.assertIsNone(cust_label)
 
 
 # ============================================================
@@ -719,6 +723,50 @@ class ContentPlaceholderRowShapeTest(unittest.TestCase):
         self.assertEqual(raw_result["vendor"], "")
 
 
+class RealWriterCustomerTabWitnessTest(unittest.TestCase):
+    """§5.1-d T4 DoD⑧: ledger doc の sheet_tab＝新 tab 名、witness probe が
+    新 tab 名で照合される（real SheetsOutputWriter＋real PostingLedger、
+    tab_namer 注入。FakeWriter は tab 算出がハードコードで tab_namer を
+    模せないため、ここだけ実物の sheets_output.SheetsOutputWriter を使う）。
+    """
+
+    def test_ledger_sheet_tab_matches_injected_tab_name_and_witness_recovers(self):
+        import golden_replay
+
+        owner = "20220401　株式会社緒方材木店"
+        # golden_replay.make_offline_writer は _get_or_create_tab を実働の
+        # FakeWorksheet 実装へ差し替え済み（_make_sheets_output_writer は
+        # 他テストで _get_or_create_tab 自体を mock する前提のため、
+        # next_txn_no/probe_page を実際に叩くこの検証には合わない）。
+        writer = golden_replay.make_offline_writer()
+        writer._tab_namer = lambda o, dt: o
+        fs = FakeFirestore()
+        base = "cust:hash"
+        ledger = PostingLedger(fs, base, sheet_probe=writer.probe_page,
+                               transaction_runner=fs.runner())
+
+        pages = [_page(1, 1, "店A", 1000)]
+        with patch.object(main, "process_pipeline", return_value=iter(pages)), \
+             patch.object(main, "PageUrlResolver", _FakeResolver):
+            outcome = main.process_file(
+                service=None, sheets_writer=writer, file_path="d.pdf",
+                uploader_name="田中", chat_id=None, doc_type=DocType.RECEIPT,
+                drive_file_id=None, base=base, ledger=ledger, tab_owner=owner)
+
+        self.assertIs(outcome.outcome, main.ProcessOutcome.SUCCESS)
+        pid = derive_page_id(base, 1)
+        doc = fs.store[("jobs", base, "postings", pid)]
+        self.assertEqual(doc["sheet_tab"], owner)
+        self.assertEqual(doc["status"], "CONFIRMED")
+
+        # witness 再照合: 別 ledger インスタンス（プロセス再起動を模す）で
+        # 同一頁を再チェックすると、owner タブへ probe_page が照合され
+        # PRESENT→SKIP になる（従業員 tab ではなく顧客 tab で照合している証拠）。
+        ledger2 = PostingLedger(fs, base, sheet_probe=writer.probe_page,
+                                transaction_runner=fs.runner())
+        self.assertIs(ledger2.check_page(pid), PageDecision.SKIP)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -866,3 +914,14 @@ class PageOutcomesEmissionTest(unittest.TestCase):
                            page_outcomes=None)
         self.assertIs(out.outcome, main.ProcessOutcome.SUCCESS)
         self.assertEqual(self._outcomes(fs), {})
+
+
+class TabOwnerRequiredTest(unittest.TestCase):
+    """codex R1-P1 裁決: tab_owner=None は fail-fast（フォールバック復活ではなく
+    「None」という名の tab への静默記帳を入口で大声拒否する）。"""
+
+    def test_headless_entry_raises_on_none_tab_owner(self):
+        with self.assertRaises(ValueError):
+            main._process_file_headless(
+                None, object(), "dummy.pdf", "田中", "cust:hash",
+                object(), DocType.RECEIPT, None, "", tab_owner=None)

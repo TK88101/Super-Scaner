@@ -18,7 +18,8 @@ import gspread
 from doc_types import DocType
 from sheets_output import (
     APPEND_RESULT_PLACEHOLDER, APPEND_RESULT_POSTED,
-    AUDIT_HEADERS, AUDIT_TAB_NAME, _build_description, SheetsOutputWriter,
+    AUDIT_HEADERS, AUDIT_TAB_NAME, _build_description, _tab_name,
+    SheetsOutputWriter,
 )
 
 
@@ -62,12 +63,19 @@ class _FakeWorksheet:
         self._values.extend(rows)
 
 
-def _make_writer():
-    """gspread 認証を回避した SheetsOutputWriter を組み立てる。"""
+def _make_writer(tab_namer=None):
+    """gspread 認証を回避した SheetsOutputWriter を組み立てる。
+
+    `_tab_namer` の既定はクラス属性が供給する（§5.1-d T4・simcodex R1）ため、
+    注入時（headless の `lambda owner, doc_type: owner` 等を模す場合）のみ
+    インスタンスへ上書きする。
+    """
     writer = SheetsOutputWriter.__new__(SheetsOutputWriter)
     # _get_next_txn_no（line 59）が try 外で参照する属性。欠けると AttributeError
     writer._tab_next_txn = {}
     writer._tabs_sanitized = set()  # _sanitize_trailing_once が参照する
+    if tab_namer is not None:
+        writer._tab_namer = tab_namer
     return writer
 
 
@@ -629,6 +637,78 @@ class BuildPageWriteOffsetTest(unittest.TestCase):
         # 票内は同一取引No、票ごとに +1
         self.assertEqual([r[0] for r in pw.rows], [7, 7, 8])
         self.assertEqual(pw.txn_range, (7, 8))
+
+
+class TabNamerInjectionTest(unittest.TestCase):
+    """§5.1-d T4④: tab_namer 注入（既定＝_tab_name、headless は main が
+    `lambda owner, doc_type: owner` を渡す）。sheets_output は
+    `config.headless_mode()` を一切参照しない——注入だけで UI/golden replay の
+    無影響性を構造的に保証する（F12）。
+    """
+
+    def test_default_tab_namer_matches_legacy_employee_tab(self):
+        writer = _make_writer()
+        r1 = _receipt_result("店A", [_entry(5000)], total=5000)
+        pw = writer.build_page_write(
+            "従業員", DocType.RECEIPT, [r1], ["u1"], start_txn_no=1)
+        self.assertEqual(pw.tab_name, "従業員_領収書")
+
+    def test_injected_tab_namer_ignores_doc_type_suffix(self):
+        # headless の実注入形（main.py: lambda owner, doc_type: owner）
+        writer = _make_writer(tab_namer=lambda owner, doc_type: owner)
+        r1 = _receipt_result("店A", [_entry(5000)], total=5000)
+        pw = writer.build_page_write(
+            "20220401　株式会社緒方材木店", DocType.RECEIPT, [r1], ["u1"],
+            start_txn_no=1)
+        self.assertEqual(pw.tab_name, "20220401　株式会社緒方材木店")
+
+    def test_injected_tab_namer_converges_across_doc_types(self):
+        # DoD⑦: 複数 doc_type が同一顧客 tab へ集約する
+        writer = _make_writer(tab_namer=lambda owner, doc_type: owner)
+        owner = "20220401　株式会社緒方材木店"
+        r1 = _receipt_result("店A", [_entry(5000)], total=5000)
+        pw_receipt = writer.build_page_write(
+            owner, DocType.RECEIPT, [r1], ["u1"], start_txn_no=1)
+        pw_invoice = writer.build_page_write(
+            owner, DocType.PURCHASE_INVOICE, [r1], ["u1"], start_txn_no=1)
+        self.assertEqual(pw_receipt.tab_name, pw_invoice.tab_name)
+        self.assertEqual(pw_receipt.tab_name, owner)
+
+    def test_next_txn_no_uses_injected_tab_namer(self):
+        writer = _make_writer(tab_namer=lambda owner, doc_type: owner)
+        ws = _FakeWorksheet()
+        with patch.object(SheetsOutputWriter, "_get_or_create_tab") as m_tab:
+            m_tab.return_value = ws
+            writer.next_txn_no("20220401　株式会社緒方材木店", DocType.RECEIPT)
+        m_tab.assert_called_once_with("20220401　株式会社緒方材木店")
+
+    def test_start_new_file_uses_injected_tab_namer(self):
+        writer = _make_writer(tab_namer=lambda owner, doc_type: owner)
+        ws = _FakeWorksheet()
+        with patch.object(SheetsOutputWriter, "_get_or_create_tab") as m_tab:
+            m_tab.return_value = ws
+            writer.start_new_file(
+                "20220401　株式会社緒方材木店", DocType.RECEIPT, "f.pdf")
+        m_tab.assert_called_once_with("20220401　株式会社緒方材木店")
+
+    def test_append_entries_uses_injected_tab_namer(self):
+        writer = _make_writer(tab_namer=lambda owner, doc_type: owner)
+        ws = _FakeWorksheet()
+        data = _receipt_result("店A", [_entry(5000)], total=5000)
+        with ExitStack() as stack:
+            m_tab = stack.enter_context(
+                patch.object(SheetsOutputWriter, "_get_or_create_tab"))
+            m_tab.return_value = ws
+            stack.enter_context(patch.object(
+                SheetsOutputWriter, "_format_with_retry", lambda *a, **k: None))
+            stack.enter_context(patch.object(
+                SheetsOutputWriter, "_apply_anomaly_highlight",
+                lambda *a, **k: None))
+            with redirect_stdout(io.StringIO()):
+                writer.append_entries(
+                    "20220401　株式会社緒方材木店", DocType.RECEIPT, data,
+                    source_url="http://x")
+        m_tab.assert_called_once_with("20220401　株式会社緒方材木店")
 
 
 class CommitPageTest(unittest.TestCase):

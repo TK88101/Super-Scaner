@@ -342,15 +342,20 @@ _INTAKE_ALLOWED_JOB_STATE = firestore_report.STATE_POSTING_IN_PROGRESS
 
 def _headless_intake_gate(service, file, input_folder_id, reporter, alerted=None):
     """監視フォルダ入口守衛（IP-303）+ 状態白名単（IP-308/T4、§2.4）を1ファイルに
-    適用し (続行可, base, lease_epoch, state_rejected) を返す。
+    適用し (続行可, base, lease_epoch, state_rejected, customer_id,
+    customer_label) を返す。
 
-    非 HEADLESS_MODE では常に (True, None, None, False)（副作用なし）。
-    HEADLESS_MODE では intake_guard.handle_intake_gate の裁決を橋渡しし、
-    PROCESS 時のみ base posting_id ＋lease_epoch を通す（IP-304 が頁級台賬の
-    job_key に、IP-308 が report_posted/report_dead_letter の epoch 引数に使う）。
-    intake_guard 自体の五分岐判定は零改動——状態白名単はこの消費側でのみ
-    適用する（should_process=True でも job_state が POSTING_IN_PROGRESS で
-    なければ本輪は処理をスキップする）。
+    非 HEADLESS_MODE では常に (True, None, None, False, None, None)
+    （副作用なし）。HEADLESS_MODE では intake_guard.handle_intake_gate の
+    裁決を橋渡しし、PROCESS 時のみ base posting_id ＋lease_epoch を通す
+    （IP-304 が頁級台賬の job_key に、IP-308 が report_posted/
+    report_dead_letter の epoch 引数に使う）。intake_guard 自体の五分岐判定は
+    零改動——状態白名単はこの消費側でのみ適用する（should_process=True でも
+    job_state が POSTING_IN_PROGRESS でなければ本輪は処理をスキップする）。
+
+    customer_id/customer_label：B7 Plan §5.1-d T4-1。intake_guard の
+    IntakeGateResult をそのまま橋渡しする（呼出元 _process_one_file が
+    headless の Sheets tab キー＝tab_owner の解決に使う）。
 
     state_rejected：True は「五分岐判定は PROCESS だが job_state が
     POSTING_IN_PROGRESS でない」局面のみ（simcodex Round 2 #2）。呼出元
@@ -361,7 +366,7 @@ def _headless_intake_gate(service, file, input_folder_id, reporter, alerted=None
     memo しない。
     """
     if not config.headless_mode():
-        return True, None, None, False
+        return True, None, None, False, None, None
     result = intake_guard.handle_intake_gate(
         file,
         get_job=reporter.get_job,
@@ -371,12 +376,15 @@ def _headless_intake_gate(service, file, input_folder_id, reporter, alerted=None
         alerted=alerted,
     )
     if not result.should_process:
-        return False, result.base, result.lease_epoch, False
+        return (False, result.base, result.lease_epoch, False,
+                result.customer_id, result.customer_label)
     if result.job_state != _INTAKE_ALLOWED_JOB_STATE:
         print(f"入口守衛: 状態非対象 file_id={file.get('id')} "
               f"job_state={result.job_state!r} → 本輪スキップ（不下載不OCR不打刻）")
-        return False, result.base, result.lease_epoch, True
-    return True, result.base, result.lease_epoch, False
+        return (False, result.base, result.lease_epoch, True,
+                result.customer_id, result.customer_label)
+    return (True, result.base, result.lease_epoch, False,
+            result.customer_id, result.customer_label)
 
 
 # B4 Plan §2.4: ESCALATED memo の TTL（≈20輪。SCAN_INTERVAL=3s 前提で約60s、
@@ -498,10 +506,58 @@ def _report_headless_outcome(reporter, base, lease_epoch, outcome, file_id, cycl
     return "FAILED", None
 
 
+# B7 Plan §5.1-d T4-2: Sheets tab 上限（末尾に他要素を足す余地込みで 100 桁）。
+_TAB_LABEL_MAX_LEN = 100
+# customer_label の区切り記号（契約 §2 想定字面「顧客番号_顧客名」の実体は
+# 全角空格区切り、Plan T4 DoD② `20220401　株式会社緒方材木店` 参照）。
+_CUSTOMER_LABEL_SEPARATOR = "　"
+
+
+def _validate_customer_label(customer_id, customer_label):
+    """customer_label が §5.1-d T4-2 の 4 条件を満たすか（純関数）。
+
+    ①非空 str ②customer_id で始まる ③区切りは全角空格＋非空の名前部
+    ④長さ ≤100。文字列の推測・整形は行わない（不通過は呼出側が
+    customer_id 単独へ縮退する）。
+    """
+    if not isinstance(customer_label, str) or not customer_label:
+        return False
+    if len(customer_label) > _TAB_LABEL_MAX_LEN:
+        return False
+    if not customer_label.startswith(customer_id):
+        return False
+    rest = customer_label[len(customer_id):]
+    if not rest.startswith(_CUSTOMER_LABEL_SEPARATOR):
+        return False
+    name_part = rest[len(_CUSTOMER_LABEL_SEPARATOR):]
+    return bool(name_part)
+
+
+def _resolve_tab_owner(customer_id, customer_label):
+    """headless の tab_owner（Sheets tab キー）を決定する（§5.1-d T4-2）。
+
+    customer_id が非空 str でない（None・数値・空文字等の奇形）→ None
+    （呼出側が冪等 alert＋処理スキップする、T4-3。codex R1-P2: 非 str を
+    startswith や tab 名へ通すと TypeError で輪詢サイクル全体が落ちる——
+    奇形は例外でなく既設の alert 経路へ封じ込める）。
+    customer_label 検証通過 → label 採用（顧客番号_顧客名 の完全形）。
+    不通過／欠落 → customer_id 単独へ縮退＋警告 print（§5.1-d の明示的例外
+    状態——顧客分離の担保は job 文書由来の customer_id 自体が持つため、
+    label 不正のみで fail-closed 停止はしない）。
+    """
+    if not isinstance(customer_id, str) or not customer_id:
+        return None
+    if _validate_customer_label(customer_id, customer_label):
+        return customer_label
+    print(f"入口守衛: customer_label 不正/未設定 → customer_id 単独 tab へ縮退 "
+          f"customer_id={customer_id!r} customer_label={customer_label!r}")
+    return customer_id
+
+
 def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_type,
                       processed_folder_id, split_pdf_folder_id, quarantine_alerted,
                       headless_memo, intake_state_memo, cycle, *,
-                      progress_reporter=None):
+                      progress_reporter=None, customer_meta_alerted=None):
     """1 ファイルの取り込み～記帳～終態処理（main() の for file in files: 本体を
     可測化のため抽出、ロジック改変なし——IP-303/304/306/308 全接線の実体）。
 
@@ -531,7 +587,8 @@ def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_
 
     # 0. ヘッドレスモード入口守衛（IP-303）+ 状態白名単（IP-308/T4）: 防重檢測より
     # 前に base posting_id ＋ job 状態を検証する。
-    should_process, base, lease_epoch, state_rejected = _headless_intake_gate(
+    (should_process, base, lease_epoch, state_rejected, customer_id,
+     customer_label) = _headless_intake_gate(
         service, file, input_folder_id, job_reporter, alerted=quarantine_alerted)
     if not should_process:
         if job_reporter is not None and state_rejected and base is not None:
@@ -574,6 +631,46 @@ def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_
         print(f"⚠️ 未対応のフォーマットです: {file_name}")
         return
 
+    # 3.5 headless tab_owner 解決（§5.1-d T4-2/T4-3、headless のみ）:
+    # customer_id 欠落は奇形 job（契約 §2 違反）——ダウンロード前に冪等
+    # alert＋処理スキップ・ファイル保持。次輪で job 文書を再読し、控制面が
+    # 修復すれば自然回復する（終端性）。customer_label の検証・整形は
+    # ここで完結させる（SS 側で推測はしない）。
+    tab_owner = None
+    if job_reporter is not None:
+        tab_owner = _resolve_tab_owner(customer_id, customer_label)
+        if tab_owner is None:
+            # customer_meta_alerted（進程内快取、simcodex R1）: 3 秒輪詢で同一
+            # file に毎輪 write_alert を打たない（alert は文書 ID＝file_id で
+            # 冪等だが、控制面が job を直すまで無界の Firestore 写が続く）。
+            # 送達失敗時は memo 不記録＝下輪必ず再送（quarantine_alerted と
+            # 同じ「alert 未達なら再送させる」規律）。job の再読・解決判定は
+            # 毎輪行う（終端性＝控制面修復の次輪に自然回復）。
+            already_alerted = (customer_meta_alerted is not None
+                               and file_id in customer_meta_alerted)
+            if not already_alerted:
+                try:
+                    job_reporter.write_alert(file_id, {
+                        "kind": "customer_metadata_missing",
+                        "file_id": file_id,
+                        "posting_id": base,
+                    })
+                except Exception as exc:  # noqa: BLE001 - alert 失敗も保持・下輪再試行
+                    print(f"入口守衛: customer_metadata_missing alert 書込失敗 "
+                          f"file_id={file_id} error_type={type(exc).__name__}")
+                else:
+                    if customer_meta_alerted is not None:
+                        customer_meta_alerted[file_id] = True
+            print(f"入口守衛: customer_id 欠落（奇形 job）→ 処理スキップ・"
+                  f"ファイル保持 file_id={file_id} posting_id={base}")
+            print("=" * 30)
+            return
+        if customer_meta_alerted is not None:
+            # 解決成功＝欠落状態の解消。memo を解いておき、将来の再発時に
+            # 改めて alert が飛ぶようにする（_finish_quarantine_move の
+            # 「move 成功で alerted から削除」と同型）。
+            customer_meta_alerted.pop(file_id, None)
+
     # 4. 下載與處理
     local_path = download_file(service, file_id, file_name)
 
@@ -606,6 +703,8 @@ def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_
             # 控制面 page_outcomes——B7-2 Plan §2 非目標）。
             progress=progress_reporter if ledger is None else None,
             page_outcomes=page_outcomes,
+            # §5.1-d T4: headless の Sheets tab キー（None＝UI 版、行為零改動）。
+            tab_owner=tab_owner,
         )
     finally:
         if page_outcomes is not None:
@@ -747,12 +846,16 @@ def _extract_tickets(results):
     ]
 
 
-def _flush_page(writer, ledger, page_id, doc_type, uploader_name, page_num,
+def _flush_page(writer, ledger, page_id, doc_type, tab_owner, page_num,
                 results, urls):
     """1 頁分の查重→記帳。戻り値 'written'|'skipped'|'escalate'。
 
     page_id は呼出元（_classify_and_flush_page）が既に derive_page_id 済みの値を
     そのまま受け取る（同一頁で二重算出しない）。
+
+    tab_owner：writer の tab キー引数（§5.1-d T4、Codex #9 採納の貫通引数名）。
+    行内容の投稿者列（result["uploader"]）とは別系統——本関数は tab 識別のみ
+    担い、行内容には一切触れない（F5、呼出元 _process_file_headless 参照）。
 
     check_page で SKIP（既 CONFIRMED/witness PRESENT）→ 何も書かない（硬去重）。
     ESCALATE（witness 不確実）→ 呼出側でファイル保持・回報せず。WRITE → build_page_write
@@ -771,9 +874,9 @@ def _flush_page(writer, ledger, page_id, doc_type, uploader_name, page_num,
         print(f"🚨 頁 {page_num} 判定不能（witness 不確実）→ ESCALATE（人工核）")
         return "escalate"
 
-    start_txn = writer.next_txn_no(uploader_name, doc_type)
+    start_txn = writer.next_txn_no(tab_owner, doc_type)
     page_write = writer.build_page_write(
-        uploader_name, doc_type, results, urls, start_txn)
+        tab_owner, doc_type, results, urls, start_txn)
     predicted = writer.peek_append_range(page_write)
     fingerprint = compute_page_fingerprint(page_write.rows)
     tickets = _extract_tickets(results)
@@ -988,7 +1091,7 @@ def _handle_excluded_page(writer, ledger, resolver, page_id, destination,
 
 
 def _classify_and_flush_page(writer, ledger, resolver, base, doc_type,
-                             uploader_name, filename, page_num, total_pages,
+                             tab_owner, filename, page_num, total_pages,
                              results, page_bytes_list):
     """1 頁分の形状分類→（必要なら）査重・記帳。戻り値は main 内部の軽量タグ:
         ("ESCALATE", reason) — 呼出側は即座に ProcessOutcome.ESCALATED
@@ -1035,7 +1138,7 @@ def _classify_and_flush_page(writer, ledger, resolver, base, doc_type,
         print(f"📄 [{page_num}/{total_pages}] 取引先: {result.get('vendor')} | "
               f"仕訳: {len(entries)}行")
 
-    outcome = _flush_page(writer, ledger, page_id, doc_type, uploader_name,
+    outcome = _flush_page(writer, ledger, page_id, doc_type, tab_owner,
                           page_num, results, urls)
     if outcome == "escalate":
         return ("ESCALATE", "ledger_witness_ambiguous")
@@ -1139,15 +1242,32 @@ def _record_page_classification(classified, page_kinds, ordered_page_nums,
 
 def _process_file_headless(service, writer, file_path, uploader_name, base,
                            ledger, doc_type, drive_file_id, split_pdf_folder_id,
-                           *, page_outcomes=None):
+                           *, tab_owner, page_outcomes=None):
     """HEADLESS_MODE の頁級緩衝集約経路（IP-304/IP-306）。HeadlessOutcome を返す。
+
+    tab_owner は真必須（codex R1-P1 裁決＝fallback 復活ではなく fail-fast）：
+    None のまま書込へ進むと「None」という名の tab へ静かに記帳される。
+    生産呼出（_process_one_file）は解決済みの顧客キーを必ず渡し、テストは
+    headless_rerun_fixture.run_headless が既定を供給する——ここに None が
+    届くのは呼出し側のバグなので大声で落とす。
 
     process_pipeline の yield を page_num で連続緩衝し、頁境界で flush（形状分類→
     査重→原子書込）。緩衝は一頁分のみ（CLAUDE.md メモリ硬約束、頁 flush 後に解放）。
     占位頁（CONTENT/認識不能）は continue で読み飛ばさず、正常頁と同じ頁緩衝→
     頁原子書込の経路を通る（B4 Plan §2.2、旧・檔級聚合占位行塊は廃止済み）。
     page_num の再登場は ESCALATE（#6 連続性 contract、静默拆頁禁）。
+
+    uploader_name：実投稿者（result["uploader"]、行内容の作成者/最終更新者列）。
+    tab_owner：Sheets tab キー（§5.1-d T4、Codex #9 採納）。headless では
+    顧客番号_顧客名（または縮退時は顧客番号単独）——uploader_name とは別系統
+    （F5「行内容の投稿者列は別系統」）。tab_owner が顧客系でも result["uploader"]
+    は実投稿者のまま変わらない。
     """
+    if tab_owner is None:
+        raise ValueError(
+            "_process_file_headless: tab_owner が None（§5.1-d T4）——"
+            "呼出し側で顧客キーを解決してから渡すこと（None のまま進むと"
+            "「None」という名の tab へ静かに記帳される）")
     filename = os.path.basename(file_path)
     base_url = _drive_view_url(drive_file_id) if drive_file_id else ""
     resolver = PageUrlResolver(
@@ -1167,7 +1287,7 @@ def _process_file_headless(service, writer, file_path, uploader_name, base,
         if not results_:
             return None
         return _classify_and_flush_page(
-            writer, ledger, resolver, base, doc_type, uploader_name, filename,
+            writer, ledger, resolver, base, doc_type, tab_owner, filename,
             page_num_, total_pages_, results_, page_bytes_)
 
     for page in process_pipeline(file_path, doc_type=doc_type):
@@ -1318,7 +1438,7 @@ def _write_audit_fallback_row(sheets_writer, uploader_name, doc_type, filename,
 def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
                   doc_type=DocType.RECEIPT, drive_file_id=None,
                   split_pdf_folder_id="", base=None, ledger=None,
-                  progress=None, page_outcomes=None):
+                  progress=None, page_outcomes=None, tab_owner=None):
     """process_file の薄い外殻（B7 T3）。
 
     進捗フックの発火（file_started／未預期例外時の ABORTED best-effort 記録）
@@ -1326,6 +1446,12 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
     (None) なら NULL_REPORTER に落ちるため、既存の呼び出し側・テストは
     完全に従来どおり動く（無回帰）。base/ledger（headless 経路）も
     そのまま impl へ貫通する（merge B7-2：main 外殻×headless 分流の合成）。
+
+    tab_owner：headless の Sheets tab キー（§5.1-d T4、Codex #9 採納）。
+    UI 経路（ledger=None）は None のまま渡され一切参照されない（零改動）。
+    headless 経路では必須——None のまま渡ると _process_file_headless が
+    fail-fast で ValueError を送出する（simcodex R1・codex R1-P1 裁決。
+    テストの既定供給は headless_rerun_fixture.run_headless）。
     """
     progress = progress or NULL_REPORTER
     filename = os.path.basename(file_path)
@@ -1335,7 +1461,7 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
             service, sheets_writer, file_path, uploader_name, chat_id,
             doc_type=doc_type, drive_file_id=drive_file_id,
             split_pdf_folder_id=split_pdf_folder_id, base=base, ledger=ledger,
-            progress=progress, page_outcomes=page_outcomes)
+            progress=progress, page_outcomes=page_outcomes, tab_owner=tab_owner)
     except Exception as e:
         # best-effort: 進捗記録は reporter 自身が内部で自吞するが、二重の
         # 安全網として元例外を必ずそのまま伝播させる（main loop の既存の
@@ -1347,7 +1473,7 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
 def _process_file_impl(service, sheets_writer, file_path, uploader_name,
                        chat_id, doc_type=DocType.RECEIPT, drive_file_id=None,
                        split_pdf_folder_id="", base=None, ledger=None,
-                       page_outcomes=None, *, progress):
+                       page_outcomes=None, tab_owner=None, *, progress):
     """ファイルを処理し、Google Sheets に逐次書き込み、通知を送信する。
 
     ledger 非 None（HEADLESS_MODE）は頁級緩衝集約＋硬去重の経路へ分流し ProcessOutcome
@@ -1358,11 +1484,17 @@ def _process_file_impl(service, sheets_writer, file_path, uploader_name,
 
     split_pdf_folder_id もプロファイルごとに異なる。共通の分割保存先へ
     アップロードすると、社長専用シートの原票 URL が全社から閲覧可能になる。
+
+    tab_owner：§5.1-d T4。headless 呼出しでは必須——_process_one_file が intake
+    の customer_id/customer_label から解決した値を渡す（テストの既定は
+    headless_rerun_fixture.run_headless が夹具層で供給、simcodex R1）。
+    UI 版（ledger None）は不使用。
     """
     if ledger is not None:
         return _process_file_headless(
             service, sheets_writer, file_path, uploader_name, base, ledger,
             doc_type, drive_file_id, split_pdf_folder_id,
+            tab_owner=tab_owner,
             page_outcomes=page_outcomes)
 
     type_label = DOC_TYPE_CONFIG.get(doc_type, {}).get("label", doc_type)
@@ -1624,15 +1756,30 @@ def _is_transient_sheet_error(err):
     return isinstance(err, (ConnectionError, TimeoutError, OSError))
 
 
+def _customer_tab_namer(owner, doc_type):
+    """headless の tab_namer 注入（§5.1-d T4-5）: doc_type 後缀を捨て owner を
+    そのまま tab 名にする（1 社 1 tab、doc_type 跨ぎで集約）。owner は
+    _process_one_file が job の customer_id/customer_label から解決した
+    tab_owner（顧客番号_顧客名 または顧客番号単独、DoD⑦）。
+    """
+    return owner
+
+
 def open_writer_with_retry(profile, credentials_file, delays=None):
     """SheetsOutputWriter を作る。一時エラーのみ指数バックオフで再試行する。
 
     SheetsOutputWriter の構築は冪等 (open_by_key も空シート削除も再実行安全) な
     ため、丸ごと再試行してよい。恒久エラーは再試行せず送出し、呼び出し側で
     そのプロファイルだけを縮退させる。
+
+    tab_namer：headless（config.headless_mode()）時のみ _customer_tab_namer を
+    注入し、tab を顧客キー単位へ切替える（§5.1-d T4）。UI 版は None のまま
+    ＝ SheetsOutputWriter 既定の従業員 tab（_tab_name）——挙動零改動。
     """
     if delays is None:
         delays = _SHEET_OPEN_RETRY_DELAYS
+
+    tab_namer = _customer_tab_namer if config.headless_mode() else None
 
     last_err = None
     for attempt, delay in enumerate([0] + list(delays)):
@@ -1643,6 +1790,7 @@ def open_writer_with_retry(profile, credentials_file, delays=None):
             return SheetsOutputWriter(
                 spreadsheet_id=profile["spreadsheet_id"],
                 credentials_file=credentials_file,
+                tab_namer=tab_namer,
             )
         except Exception as e:
             if not _is_transient_sheet_error(e):
@@ -1742,6 +1890,11 @@ def main():
     # （gate 呼出し前は epoch 未知のため）。outcome memo とは別 dict
     # （キー形が違うため剪定 file_id_index も別途指定）。
     intake_state_memo: dict = {}
+    # customer_metadata_missing の alert 送達 memo（file_id → True、simcodex R1）:
+    # 顧客メタ欠落 job の alert を毎輪 Firestore へ再書込しない。解決成功で
+    # 該当キーを解除（再発時に再 alert）。プロセス再起動で自然に消える
+    # （alert 自体は文書 ID 冪等なので再送は無害＝重複可視化にはならない）。
+    customer_meta_alerted: dict = {}
     cycle = 0
 
     # B7 T4: プロファイルごとの進捗レポーター（Sheets `_処理進捗` タブ）。
@@ -1806,7 +1959,8 @@ def main():
                         doc_type, processed_folder_id,
                         profile["split_pdf_folder_id"], quarantine_alerted,
                         headless_memo, intake_state_memo, cycle,
-                        progress_reporter=progress_reporter)
+                        progress_reporter=progress_reporter,
+                        customer_meta_alerted=customer_meta_alerted)
 
             if not found_any:
                 print(".", end="", flush=True)

@@ -265,15 +265,21 @@ def make_ledger(fs, writer, base=DEFAULT_BASE, runner=None):
 
 
 def run_headless(writer, ledger, page_yields, base=DEFAULT_BASE,
-                 uploader=DEFAULT_UPLOADER, page_outcomes=None):
-    """process_file を headless 経路で駆動（process_pipeline/PageUrlResolver は fake）。"""
+                 uploader=DEFAULT_UPLOADER, page_outcomes=None, tab_owner=None):
+    """process_file を headless 経路で駆動（process_pipeline/PageUrlResolver は fake）。
+
+    tab_owner 未指定は uploader で代用する（§5.1-d T4・simcodex R1）。生産の
+    headless 呼出しは _process_one_file が顧客キーを必ず渡すため、既定値の
+    決定権は生産経路（_process_file_impl）ではなく本夹具層が一元で持つ。
+    """
     with patch.object(main, "process_pipeline", return_value=iter(page_yields)), \
          patch.object(main, "PageUrlResolver", _FakeResolver):
         return main.process_file(
             service=None, sheets_writer=writer, file_path="dummy.pdf",
             uploader_name=uploader, chat_id=None, doc_type=DocType.RECEIPT,
             drive_file_id=None, base=base, ledger=ledger,
-            page_outcomes=page_outcomes)
+            page_outcomes=page_outcomes,
+            tab_owner=tab_owner if tab_owner is not None else uploader)
 
 
 class HeadlessRerunFixture:

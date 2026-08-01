@@ -226,6 +226,93 @@ class IntakeCheckLeaseEpochJobStateTest(unittest.TestCase):
         self.assertIsNone(result.job_state)
 
 
+class IntakeCheckCustomerFieldsTest(unittest.TestCase):
+    """B7 Plan §5.1-d T4-1: IntakeCheck 尾部の customer_id/customer_label 透出。
+
+    lease_epoch/job_state と同型（IntakeCheckLeaseEpochJobStateTest と鏡像）:
+    守衛五分岐判定そのものは零改動——job が取得できた分岐（PROCESS/
+    posting_id_mismatch）でのみ job.get("customer_id")/job.get("customer_label")
+    をそのまま転記し、job が取得できない分岐では None のまま。
+    """
+
+    def test_process_carries_customer_id_and_label_from_job(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-1"}}
+        store = FakeJobStore({"base-1": {
+            "posting_id": "base-1", "customer_id": "20220401",
+            "customer_label": "20220401　株式会社緒方材木店"}})
+
+        result = check_intake(file, store.get_job)
+
+        self.assertEqual(IntakeDecision.PROCESS, result.decision)
+        self.assertEqual("20220401", result.customer_id)
+        self.assertEqual("20220401　株式会社緒方材木店", result.customer_label)
+
+    def test_non_string_customer_fields_are_coerced_to_none_at_boundary(self):
+        # simcodex R2 層位採納: 数値等の奇形 customer 字段は入口境界で None へ
+        # 縮退（resolve_posting_id の isinstance 検査と同型）。下游は
+        # IntakeCheck.customer_*: str | None の型約束を信じてよい。
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-1"}}
+        store = FakeJobStore({"base-1": {
+            "posting_id": "base-1", "customer_id": 20220401,
+            "customer_label": ["20220401", "株式会社緒方材木店"]}})
+
+        result = check_intake(file, store.get_job)
+
+        self.assertEqual(IntakeDecision.PROCESS, result.decision)
+        self.assertIsNone(result.customer_id)
+        self.assertIsNone(result.customer_label)
+
+    def test_posting_id_mismatch_still_carries_observed_customer_fields(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-3"}}
+        store = FakeJobStore({"base-3": {
+            "posting_id": "different-base", "customer_id": "20220401",
+            "customer_label": "20220401　株式会社緒方材木店"}})
+
+        result = check_intake(file, store.get_job)
+
+        self.assertEqual(IntakeDecision.REJECTED, result.decision)
+        self.assertEqual("posting_id_mismatch", result.reason)
+        self.assertEqual("20220401", result.customer_id)
+        self.assertEqual("20220401　株式会社緒方材木店", result.customer_label)
+
+    def test_missing_keys_in_job_default_to_none(self):
+        # 契約 §2 は customer_id を必填とするが、旧schema/奇形 job の防御
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-1"}}
+        store = FakeJobStore({"base-1": {"posting_id": "base-1"}})
+
+        result = check_intake(file, store.get_job)
+
+        self.assertIsNone(result.customer_id)
+        self.assertIsNone(result.customer_label)
+
+    def test_job_not_found_leaves_fields_none(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-2"}}
+        store = FakeJobStore({})
+
+        result = check_intake(file, store.get_job)
+
+        self.assertIsNone(result.customer_id)
+        self.assertIsNone(result.customer_label)
+
+    def test_no_posting_id_leaves_fields_none(self):
+        file = {"id": "f1"}
+        store = FakeJobStore({})
+
+        result = check_intake(file, store.get_job)
+
+        self.assertIsNone(result.customer_id)
+        self.assertIsNone(result.customer_label)
+
+    def test_deferred_leaves_fields_none(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-4"}}
+        store = FakeJobStore(raise_exc=ConnectionError("boom"))
+
+        result = check_intake(file, store.get_job)
+
+        self.assertIsNone(result.customer_id)
+        self.assertIsNone(result.customer_label)
+
+
 class IntakeGateResultLeaseEpochJobStateTest(unittest.TestCase):
     """handle_intake_gate も check_intake の lease_epoch/job_state を
     IntakeGateResult へ橋渡しする（#14 base 橋渡しと同型）。"""
@@ -284,6 +371,62 @@ class IntakeGateResultLeaseEpochJobStateTest(unittest.TestCase):
 
         self.assertIsNone(result.lease_epoch)
         self.assertIsNone(result.job_state)
+
+
+class IntakeGateResultCustomerFieldsTest(unittest.TestCase):
+    """B7 Plan §5.1-d T4-1: handle_intake_gate も check_intake の
+    customer_id/customer_label を IntakeGateResult へ橋渡しする
+    （IntakeGateResultLeaseEpochJobStateTest と鏡像）。"""
+
+    def test_process_gate_result_carries_customer_id_and_label(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-1"}}
+        store = FakeJobStore({"base-1": {
+            "posting_id": "base-1", "customer_id": "20220401",
+            "customer_label": "20220401　株式会社緒方材木店"}})
+
+        result = handle_intake_gate(
+            file, get_job=store.get_job,
+            write_alert=lambda *a: None, move_to_quarantine=lambda: None)
+
+        self.assertTrue(result.should_process)
+        self.assertEqual("20220401", result.customer_id)
+        self.assertEqual("20220401　株式会社緒方材木店", result.customer_label)
+
+    def test_rejected_gate_result_carries_observed_customer_fields(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-3"}}
+        store = FakeJobStore({"base-3": {
+            "posting_id": "different-base", "customer_id": "20220401",
+            "customer_label": "20220401　株式会社緒方材木店"}})
+
+        result = handle_intake_gate(
+            file, get_job=store.get_job,
+            write_alert=lambda *a: None, move_to_quarantine=lambda: None)
+
+        self.assertFalse(result.should_process)
+        self.assertEqual("20220401", result.customer_id)
+        self.assertEqual("20220401　株式会社緒方材木店", result.customer_label)
+
+    def test_deferred_gate_result_fields_none(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-4"}}
+        store = FakeJobStore(raise_exc=ConnectionError("boom"))
+
+        result = handle_intake_gate(
+            file, get_job=store.get_job,
+            write_alert=lambda *a: None, move_to_quarantine=lambda: None)
+
+        self.assertIsNone(result.customer_id)
+        self.assertIsNone(result.customer_label)
+
+    def test_memo_hit_gate_result_fields_none(self):
+        file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-1"}}
+        alerted = {"f1": "no_posting_id"}
+
+        result = handle_intake_gate(
+            file, get_job=lambda b: None, write_alert=lambda *a: None,
+            move_to_quarantine=lambda: None, alerted=alerted)
+
+        self.assertIsNone(result.customer_id)
+        self.assertIsNone(result.customer_label)
 
 
 class HandleIntakeTest(unittest.TestCase):
@@ -679,7 +822,7 @@ class HeadlessIntakeGateTest(unittest.TestCase):
         file = {"id": "f1"}
 
         with patch.dict(os.environ, {"HEADLESS_MODE": "0"}):
-            should, base, epoch, _ = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
+            should, base, epoch, _, _, _ = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
 
         self.assertTrue(should)
         self.assertIsNone(base)
@@ -698,7 +841,7 @@ class HeadlessIntakeGateTest(unittest.TestCase):
 
         with patch.dict(os.environ, {"HEADLESS_MODE": "1", "QUARANTINE_FOLDER_ID": "Q_FOLDER"}), \
                 redirect_stdout(io.StringIO()):
-            should, base, epoch, _ = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
+            should, base, epoch, _, _, _ = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
 
         self.assertFalse(should)
         kwargs = service.files.return_value.update.call_args.kwargs
@@ -717,7 +860,7 @@ class HeadlessIntakeGateTest(unittest.TestCase):
         file = {"id": "f1", "properties": {POSTING_ID_PROPERTY_KEY: "base-1"}}
 
         with patch.dict(os.environ, {"HEADLESS_MODE": "1", "QUARANTINE_FOLDER_ID": "Q_FOLDER"}):
-            should, base, epoch, _ = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
+            should, base, epoch, _, _, _ = main._headless_intake_gate(service, file, "INPUT_FOLDER", reporter)
 
         self.assertTrue(should)
         self.assertEqual(base, "base-1")
@@ -759,12 +902,12 @@ class HeadlessIntakeGateTest(unittest.TestCase):
 
         with patch.dict(os.environ, {"HEADLESS_MODE": "1", "QUARANTINE_FOLDER_ID": "Q_FOLDER"}), \
                 redirect_stdout(io.StringIO()):
-            first, _, _, _ = main._headless_intake_gate(
+            first, _, _, _, _, _ = main._headless_intake_gate(
                 service, file, "INPUT_FOLDER", reporter, alerted=alerted)
             self.assertFalse(first)
             self.assertIn("f1", alerted, "初回 move 失敗直後は memo に残るはず")
 
-            second, _, _, _ = main._headless_intake_gate(
+            second, _, _, _, _, _ = main._headless_intake_gate(
                 service, file, "INPUT_FOLDER", reporter, alerted=alerted)
 
         self.assertFalse(second)

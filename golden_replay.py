@@ -102,6 +102,8 @@ def make_offline_writer(employee_name=EMPLOYEE_NAME):
     # commit_page／next_txn_no）では一切参照されない。probe_page 等を将来
     # 駆動するなら fake を差す必要がある。
     writer.spreadsheet = None
+    # §5.1-d T4: `_tab_namer` の既定は SheetsOutputWriter のクラス属性が供給する
+    # （__new__ 迂回でも属性探索で到達。基線 0d304f0 は参照自体が無い＝設定不要）。
     writer._ws_cache = {}
     writer._tab_has_data = {}
     writer._tab_next_txn = {}

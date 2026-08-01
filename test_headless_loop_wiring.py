@@ -14,11 +14,12 @@ for file in files: 本体そのもの（可測化のための抽出、ロジッ�
 from __future__ import annotations
 
 import importlib
+import io
 import os
 import sys
 import types
 import unittest
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, redirect_stdout
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -34,9 +35,18 @@ import main
 from headless_rerun_fixture import FakeReporter, FakeWriter
 
 
-def _job(posting_id, lease_epoch=1, current_state="POSTING_IN_PROGRESS"):
+def _job(posting_id, lease_epoch=1, current_state="POSTING_IN_PROGRESS",
+        customer_id="20220401",
+        customer_label="20220401　株式会社緒方材木店"):
+    """既定で customer_id/customer_label を有効な組合せにしておく
+    （§5.1-d T4）——本ファイルの大半のテストは tab_owner 解決とは無関係の
+    関心事（memo/回報/白名単）なので、customer_metadata_missing の
+    処理スキップ短絡に巻き込まれないようにする。customer_id/label 自体を
+    検証したいテストは引数で上書きする（CustomerTabOwnerResolutionTest 参照）。
+    """
     return {"posting_id": posting_id, "lease_epoch": lease_epoch,
-            "current_state": current_state}
+            "current_state": current_state, "customer_id": customer_id,
+            "customer_label": customer_label}
 
 
 def _file(file_id="f1", base="cust:hash"):
@@ -45,7 +55,8 @@ def _file(file_id="f1", base="cust:hash"):
 
 
 def _call_process_one_file(writer, job_reporter, *, file=None, headless_memo=None,
-                           intake_state_memo=None, cycle=1):
+                           intake_state_memo=None, cycle=1,
+                           customer_meta_alerted=None):
     """main._process_one_file の呼出し足場（ProcessOneFileTest と
     IntakeStatePreGateMemoTest で共用、simcodex Round 2 #11 と同型の DRY）。"""
     main._process_one_file(
@@ -56,7 +67,8 @@ def _call_process_one_file(writer, job_reporter, *, file=None, headless_memo=Non
         headless_memo=headless_memo if headless_memo is not None else {},
         intake_state_memo=(
             intake_state_memo if intake_state_memo is not None else {}),
-        cycle=cycle)
+        cycle=cycle,
+        customer_meta_alerted=customer_meta_alerted)
 
 
 # ============================================================
@@ -77,51 +89,61 @@ class IntakeStateWhitelistTest(unittest.TestCase):
                 reporter=reporter)
 
     def test_posting_in_progress_allows_process(self):
-        should, base, epoch, state_rejected = self._gate("POSTING_IN_PROGRESS")
+        should, base, epoch, state_rejected, cust_id, cust_label = self._gate(
+            "POSTING_IN_PROGRESS")
         self.assertTrue(should)
         self.assertEqual(base, "cust:hash")
         self.assertEqual(epoch, 1)
         self.assertFalse(state_rejected)
+        self.assertEqual(cust_id, "20220401")
+        self.assertEqual(cust_label, "20220401　株式会社緒方材木店")
 
     def test_posted_is_skipped(self):
-        should, base, epoch, state_rejected = self._gate("POSTED")
+        should, base, epoch, state_rejected, _, _ = self._gate("POSTED")
         self.assertFalse(should)
         self.assertTrue(state_rejected)  # simcodex Round 2 #2: pre-gate memo 対象
 
     def test_post_unknown_is_skipped(self):
-        should, base, epoch, state_rejected = self._gate("POST_UNKNOWN")
+        should, base, epoch, state_rejected, _, _ = self._gate("POST_UNKNOWN")
         self.assertFalse(should)
         self.assertTrue(state_rejected)
 
     def test_dead_letter_is_skipped(self):
-        should, base, epoch, state_rejected = self._gate("DEAD_LETTER")
+        should, base, epoch, state_rejected, _, _ = self._gate("DEAD_LETTER")
         self.assertFalse(should)
         self.assertTrue(state_rejected)
 
     def test_missing_job_state_is_skipped(self):
-        should, base, epoch, state_rejected = self._gate(None)
+        should, base, epoch, state_rejected, _, _ = self._gate(None)
         self.assertFalse(should)
         self.assertTrue(state_rejected)
 
     def test_non_headless_bypasses_whitelist(self):
         with patch.object(main.config, "headless_mode", return_value=False):
-            should, base, epoch, state_rejected = main._headless_intake_gate(
-                service=None, file=_file(), input_folder_id="in", reporter=None)
+            should, base, epoch, state_rejected, cust_id, cust_label = (
+                main._headless_intake_gate(
+                    service=None, file=_file(), input_folder_id="in",
+                    reporter=None))
         self.assertTrue(should)
         self.assertIsNone(base)
         self.assertIsNone(epoch)
         self.assertFalse(state_rejected)
+        self.assertIsNone(cust_id)
+        self.assertIsNone(cust_label)
 
     def test_rejected_by_underlying_gate_short_circuits_before_state_check(self):
         # no_posting_id で REJECTED（job 未取得）→ state チェックへ到達しない
         reporter = FakeReporter({})
         with patch.object(main.config, "headless_mode", return_value=True):
-            should, base, epoch, state_rejected = main._headless_intake_gate(
-                service=None, file={"id": "f1"}, input_folder_id="in",
-                reporter=reporter)
+            should, base, epoch, state_rejected, cust_id, cust_label = (
+                main._headless_intake_gate(
+                    service=None, file={"id": "f1"}, input_folder_id="in",
+                    reporter=reporter))
         self.assertFalse(should)
         self.assertIsNone(epoch)
         self.assertFalse(state_rejected)  # 五分岐 REJECTED、state 白名単には未到達
+        self.assertIsNone(cust_id)
+        self.assertIsNone(cust_label)
 
 
 class IntakeStatePreGateMemoTest(unittest.TestCase):
@@ -523,9 +545,12 @@ class ProcessOneFileTest(unittest.TestCase):
         self.assertEqual(reporter.report_posted_calls, [])
 
     def test_missing_epoch_success_zero_reporter_calls_and_never_moves(self):
-        # job に lease_epoch キーが無い旧 schema 想定 → epoch=None（違約態）
+        # job に lease_epoch キーが無い旧 schema 想定 → epoch=None（違約態）。
+        # customer_id は本テストの関心事ではないため単独形で満たしておく
+        # （§5.1-d T4 の customer_metadata_missing 短絡に巻き込まれない）。
         reporter = FakeReporter({"cust:hash": {"posting_id": "cust:hash",
-                                                "current_state": "POSTING_IN_PROGRESS"}})
+                                                "current_state": "POSTING_IN_PROGRESS",
+                                                "customer_id": "20220401"}})
         writer = self._writer()
         outcome = main.HeadlessOutcome(main.ProcessOutcome.SUCCESS)
         headless_memo = {}
@@ -610,6 +635,223 @@ class ProcessOneFileTest(unittest.TestCase):
              patch("os.remove") as rm:
             self._call(writer, None)
         rm.assert_called_once_with("local.pdf")
+
+
+# ============================================================
+# §5.1-d T4-2/T4-3: headless tab_owner 解決（DoD①③④⑤）
+# ============================================================
+
+class ValidateCustomerLabelTest(unittest.TestCase):
+    """_validate_customer_label の 4 条件（純関数、§5.1-d T4-2）。"""
+
+    def test_valid_label_passes(self):
+        self.assertTrue(main._validate_customer_label(
+            "20220401", "20220401　株式会社緒方材木店"))
+
+    def test_none_label_fails(self):
+        self.assertFalse(main._validate_customer_label("20220401", None))
+
+    def test_empty_string_label_fails(self):
+        self.assertFalse(main._validate_customer_label("20220401", ""))
+
+    def test_non_str_label_fails(self):
+        self.assertFalse(main._validate_customer_label("20220401", 12345))
+
+    def test_wrong_prefix_fails(self):
+        self.assertFalse(main._validate_customer_label(
+            "20220401", "99999999　別会社"))
+
+    def test_missing_separator_fails(self):
+        # customer_id で始まるが区切り（全角空格）が無い
+        self.assertFalse(main._validate_customer_label(
+            "20220401", "20220401株式会社緒方材木店"))
+
+    def test_half_width_space_separator_fails(self):
+        # 区切りは全角空格限定——半角空格は不通過
+        self.assertFalse(main._validate_customer_label(
+            "20220401", "20220401 株式会社緒方材木店"))
+
+    def test_empty_name_part_after_separator_fails(self):
+        self.assertFalse(main._validate_customer_label("20220401", "20220401　"))
+
+    def test_too_long_label_fails(self):
+        label = "20220401　" + "株" * 100
+        self.assertGreater(len(label), 100)
+        self.assertFalse(main._validate_customer_label("20220401", label))
+
+    def test_exactly_100_chars_passes(self):
+        prefix = "20220401　"
+        label = prefix + "株" * (100 - len(prefix))
+        self.assertEqual(len(label), 100)
+        self.assertTrue(main._validate_customer_label("20220401", label))
+
+
+class ResolveTabOwnerTest(unittest.TestCase):
+    """_resolve_tab_owner（純関数、§5.1-d T4-2）。"""
+
+    def test_customer_id_none_returns_none(self):
+        self.assertIsNone(main._resolve_tab_owner(None, "anything"))
+
+    def test_valid_label_is_adopted(self):
+        self.assertEqual(
+            main._resolve_tab_owner("20220401", "20220401　株式会社緒方材木店"),
+            "20220401　株式会社緒方材木店")
+
+    def test_invalid_label_falls_back_to_customer_id(self):
+        self.assertEqual(
+            main._resolve_tab_owner("20220401", "不正なラベル"), "20220401")
+
+    def test_missing_label_falls_back_to_customer_id(self):
+        self.assertEqual(main._resolve_tab_owner("20220401", None), "20220401")
+
+
+class CustomerTabOwnerResolutionTest(unittest.TestCase):
+    """_process_one_file が process_file へ渡す tab_owner kwarg を検証する。
+
+    process_file 自体は _patch_file_processing で mock 化されている——実際の
+    Sheets tab 集約（同一 tab_owner 値が同一タブへ落ちる保証）は
+    test_sheets_output.TabNamerInjectionTest が担う。ここは main 側の
+    customer_id/customer_label → tab_owner 解決ロジックのみを検収する。
+    """
+
+    def _file_with_uploader(self, email, file_id="f1", base="cust:hash"):
+        return {"id": file_id, "name": "invoice.pdf",
+                "properties": {"sandevistan_posting_id": base},
+                "lastModifyingUser": {"emailAddress": email,
+                                      "displayName": email}}
+
+    def test_resolved_tab_owner_matches_full_customer_label(self):
+        # ②tab 名が customer_label（全角空格区切り）と完全一致
+        reporter = FakeReporter({"cust:hash": _job(
+            "cust:hash", customer_id="20220401",
+            customer_label="20220401　株式会社緒方材木店")})
+        writer = FakeWriter()
+        outcome = main.HeadlessOutcome(main.ProcessOutcome.SUCCESS)
+        with _patch_file_processing(process_return=outcome) as p:
+            _call_process_one_file(writer, reporter)
+        self.assertEqual(p.process_file.call_args.kwargs.get("tab_owner"),
+                         "20220401　株式会社緒方材木店")
+
+    def test_different_uploaders_same_customer_resolve_to_same_tab_owner(self):
+        # ①同一顧客・別投稿者の 2 ファイル → 同一 tab_owner へ集約
+        reporter = FakeReporter({"cust:hash": _job(
+            "cust:hash", customer_id="20220401",
+            customer_label="20220401　株式会社緒方材木店")})
+        writer = FakeWriter()
+        outcome = main.HeadlessOutcome(main.ProcessOutcome.SUCCESS)
+        file_a = self._file_with_uploader("a@example.com", file_id="fA")
+        file_b = self._file_with_uploader("b@example.com", file_id="fB")
+
+        with _patch_file_processing(process_return=outcome) as p:
+            _call_process_one_file(writer, reporter, file=file_a)
+            tab_owner_a = p.process_file.call_args.kwargs.get("tab_owner")
+            _call_process_one_file(writer, reporter, file=file_b)
+            tab_owner_b = p.process_file.call_args.kwargs.get("tab_owner")
+
+        self.assertEqual(tab_owner_a, tab_owner_b)
+        self.assertEqual(tab_owner_a, "20220401　株式会社緒方材木店")
+
+    def test_invalid_label_falls_back_to_customer_id_with_warning(self):
+        # ③label 不正（customer_id で始まらない）→ customer_id 単独＋警告
+        reporter = FakeReporter({"cust:hash": _job(
+            "cust:hash", customer_id="20220401",
+            customer_label="別の顧客のラベル")})
+        writer = FakeWriter()
+        outcome = main.HeadlessOutcome(main.ProcessOutcome.SUCCESS)
+        with _patch_file_processing(process_return=outcome) as p:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                _call_process_one_file(writer, reporter)
+        self.assertEqual(p.process_file.call_args.kwargs.get("tab_owner"), "20220401")
+        self.assertIn("customer_label 不正", buf.getvalue())
+
+    def test_missing_label_falls_back_to_customer_id_with_warning(self):
+        # ③label 欠落（None）→ customer_id 単独＋警告（不通過／欠落は同じ扱い）
+        reporter = FakeReporter({"cust:hash": _job(
+            "cust:hash", customer_id="20220401", customer_label=None)})
+        writer = FakeWriter()
+        outcome = main.HeadlessOutcome(main.ProcessOutcome.SUCCESS)
+        with _patch_file_processing(process_return=outcome) as p:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                _call_process_one_file(writer, reporter)
+        self.assertEqual(p.process_file.call_args.kwargs.get("tab_owner"), "20220401")
+        self.assertIn("customer_label 不正", buf.getvalue())
+
+    def test_missing_customer_id_writes_zero_and_alerts_and_keeps_file(self):
+        # ④customer_id も欠落 → ダウンロード前に処理スキップ・冪等 alert・
+        # ファイル保持（move も process_file も一切呼ばれない）
+        reporter = FakeReporter({"cust:hash": _job(
+            "cust:hash", customer_id=None, customer_label=None)})
+        writer = FakeWriter()
+        with _patch_file_processing() as p:
+            _call_process_one_file(writer, reporter)
+        p.download_file.assert_not_called()
+        p.process_file.assert_not_called()
+        p.move_file.assert_not_called()
+        self.assertEqual(len(reporter.write_alert_calls), 1)
+        alert_id, payload = reporter.write_alert_calls[0]
+        self.assertEqual(alert_id, "f1")
+        self.assertEqual(payload["kind"], "customer_metadata_missing")
+        self.assertEqual(payload["file_id"], "f1")
+        self.assertEqual(payload["posting_id"], "cust:hash")
+
+    def test_ui_path_tab_owner_is_none(self):
+        # ⑤UI 版: tab_owner は常に None（UI 経路＝ledger None は tab_owner を
+        # 一切使わない。既存従業員 tab 挙動は無改動、simcodex R1 で
+        # フォールバック自体を生産経路から撤去済）
+        writer = FakeWriter()
+        with _patch_file_processing(process_return=True, headless=False) as p:
+            _call_process_one_file(writer, None)
+        self.assertIsNone(p.process_file.call_args.kwargs.get("tab_owner"))
+
+    def test_non_string_customer_id_treated_as_missing_not_crash(self):
+        # codex R1-P2: 数値 customer_id（奇形 job）は TypeError で輪詢サイクルを
+        # 落とさず、欠落と同じ alert-and-skip 経路へ封じ込める。
+        reporter = FakeReporter({"cust:hash": _job(
+            "cust:hash", customer_id=12345,
+            customer_label="20220401　株式会社緒方材木店")})
+        writer = FakeWriter()
+        with _patch_file_processing() as p:
+            _call_process_one_file(writer, reporter)
+        p.process_file.assert_not_called()
+        self.assertEqual(len(reporter.write_alert_calls), 1)
+        self.assertEqual(reporter.write_alert_calls[0][1]["kind"],
+                         "customer_metadata_missing")
+
+    def test_missing_customer_id_alert_throttled_by_memo_and_rearmed(self):
+        # simcodex R1（効率）: 3 秒輪詢で同一 file に毎輪 write_alert を打たない。
+        # ①memo 付きで 2 輪回す → alert は 1 回だけ ②job が修復されたら
+        # memo が解除され、再発時に改めて alert が飛ぶ（再武装）。
+        job_missing = _job("cust:hash", customer_id=None, customer_label=None)
+        job_fixed = _job("cust:hash", customer_id="20220401",
+                         customer_label="20220401　株式会社緒方材木店")
+        reporter = FakeReporter({"cust:hash": job_missing})
+        writer = FakeWriter()
+        memo = {}
+        outcome = main.HeadlessOutcome(main.ProcessOutcome.SUCCESS)
+
+        with _patch_file_processing(process_return=outcome):
+            _call_process_one_file(writer, reporter, cycle=1,
+                                   customer_meta_alerted=memo)
+            _call_process_one_file(writer, reporter, cycle=2,
+                                   customer_meta_alerted=memo)
+        self.assertEqual(len(reporter.write_alert_calls), 1)  # 節流
+        self.assertIn("f1", memo)
+
+        # 控制面が job を修復 → 処理再開＋memo 解除（再武装）
+        reporter._jobs["cust:hash"] = job_fixed
+        with _patch_file_processing(process_return=outcome):
+            _call_process_one_file(writer, reporter, cycle=3,
+                                   customer_meta_alerted=memo)
+        self.assertNotIn("f1", memo)
+
+        # 再発 → 改めて alert（計 2 回目）
+        reporter._jobs["cust:hash"] = job_missing
+        with _patch_file_processing(process_return=outcome):
+            _call_process_one_file(writer, reporter, cycle=4,
+                                   customer_meta_alerted=memo)
+        self.assertEqual(len(reporter.write_alert_calls), 2)
 
 
 if __name__ == "__main__":

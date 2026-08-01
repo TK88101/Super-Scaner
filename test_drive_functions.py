@@ -263,7 +263,9 @@ class OpenWriterWithRetryTest(unittest.TestCase):
         # Arrange: 最初の2回は 503、3回目で成功
         attempts = []
 
-        def factory(spreadsheet_id, credentials_file):
+        def factory(spreadsheet_id, credentials_file, **kwargs):
+            # **kwargs: §5.1-d T4 で main.open_writer_with_retry が
+            # tab_namer= を追加で渡すようになった（本テストの関心事ではない）
             attempts.append(spreadsheet_id)
             if len(attempts) < 3:
                 raise _transient_error(503)
@@ -284,7 +286,9 @@ class OpenWriterWithRetryTest(unittest.TestCase):
         # Arrange: 共有剥奪 = 恒久エラー
         attempts = []
 
-        def factory(spreadsheet_id, credentials_file):
+        def factory(spreadsheet_id, credentials_file, **kwargs):
+            # **kwargs: §5.1-d T4 で main.open_writer_with_retry が
+            # tab_namer= を追加で渡すようになった（本テストの関心事ではない）
             attempts.append(spreadsheet_id)
             raise _transient_error(404)
 
@@ -312,7 +316,9 @@ class OpenWriterWithRetryTest(unittest.TestCase):
     def test_no_delays_means_single_attempt(self):
         attempts = []
 
-        def factory(spreadsheet_id, credentials_file):
+        def factory(spreadsheet_id, credentials_file, **kwargs):
+            # **kwargs: §5.1-d T4 で main.open_writer_with_retry が
+            # tab_namer= を追加で渡すようになった（本テストの関心事ではない）
             attempts.append(1)
             raise _transient_error(503)
 
@@ -354,7 +360,9 @@ class BuildWritersTest(unittest.TestCase):
 
     def test_one_unopenable_sheet_does_not_kill_the_others(self):
         # Arrange: ido のシートだけ開けない（共有剥奪 / 削除を模す）
-        def factory(spreadsheet_id, credentials_file):
+        def factory(spreadsheet_id, credentials_file, **kwargs):
+            # **kwargs: §5.1-d T4 で main.open_writer_with_retry が
+            # tab_namer= を追加で渡すようになった（本テストの関心事ではない）
             if spreadsheet_id == "ss_ido":
                 raise Exception("SpreadsheetNotFound")
             return MagicMock()

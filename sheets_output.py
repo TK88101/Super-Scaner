@@ -194,7 +194,15 @@ def compute_page_fingerprint(rows):
 
 
 def _tab_name(employee_name, doc_type):
-    """`{従業員名}_{文書後缀}` タブ名（4 箇所で共用、後缀既定＝領収書）。"""
+    """`{従業員名}_{文書後缀}` タブ名（既定 tab_namer、後缀既定＝領収書）。
+
+    §5.1-d T4: SheetsOutputWriter.__init__ の `tab_namer` 既定値
+    （4 箇所の呼出しは `self._tab_namer(...)` 経由になる）。headless では
+    main 側が `tab_namer=lambda owner, doc_type: owner` を注入し、この関数の
+    第一引数位置には顧客 tab キー（tab_owner）が渡る——呼出し側の意味づけの
+    問題であり、本関数のシグネチャ自体は不変（UI 経路・golden replay は
+    既定のまま無影響、F12）。
+    """
     from doc_types import DOC_TYPE_TAB_SUFFIX
     return f"{employee_name}_{DOC_TYPE_TAB_SUFFIX.get(doc_type, '領収書')}"
 
@@ -233,10 +241,26 @@ def _build_description(doc_type, vendor_name, item_description):
 class SheetsOutputWriter:
     """Google Sheets への仕訳データ出力"""
 
-    def __init__(self, spreadsheet_id, credentials_file):
+    # §5.1-d T4: タブ名決定関数の既定値（simcodex R1 でクラス属性化）。
+    # クラス属性に置くことで、テストが __new__ で __init__ を迂回して裸の
+    # インスタンスを作っても Python の属性探索で既定に到達する——属性を
+    # 増やすたびに全 __new__ 構築点を巡回して手動補設する線形コストを断つ。
+    _tab_namer = staticmethod(_tab_name)
+
+    def __init__(self, spreadsheet_id, credentials_file, *, tab_namer=None):
+        """tab_namer: (owner, doc_type) -> str のタブ名決定関数（§5.1-d T4、注入式）。
+
+        既定＝モジュール関数 `_tab_name`（従業員 tab、UI 経路と golden replay の
+        挙動は不変、F12）。headless では main 側が
+        `tab_namer=lambda owner, doc_type: owner` を渡し、tab を顧客キー単位へ
+        切替える——本クラスは `config.headless_mode()` を一切参照しない
+        （ambient な分岐を持ち込まず、注入だけで無影響性を構造的に保証する）。
+        """
         gc = gspread.service_account(filename=credentials_file)
         self.spreadsheet = gc.open_by_key(spreadsheet_id)
         self._cleanup_default_sheet()
+        if tab_namer is not None:
+            self._tab_namer = tab_namer
         # キャッシュ: tab 参照と取引No をメモリに保持し API 呼び出しを削減
         self._ws_cache = {}
         self._tab_has_data = {}
@@ -318,7 +342,7 @@ class SheetsOutputWriter:
 
     def start_new_file(self, employee_name, doc_type, filename=""):
         """新しいPDFファイルの処理開始を通知。分割線+取引No リセット。"""
-        tab_name = _tab_name(employee_name, doc_type)
+        tab_name = self._tab_namer(employee_name, doc_type)
         ws = self._get_or_create_tab(tab_name)
 
         # 既存データがあれば太黒線で分割
@@ -504,7 +528,7 @@ class SheetsOutputWriter:
         占位行 1 行として取込む（頁級では独立書込路径を使わない）。取引No は票ごとに +1。
         ws には一切触れない（tab 名の算出のみ）——書込は commit_page が行う。
         """
-        tab_name = _tab_name(employee_name, doc_type)
+        tab_name = self._tab_namer(employee_name, doc_type)
 
         txn = start_txn_no
         all_rows = []
@@ -572,7 +596,7 @@ class SheetsOutputWriter:
 
     def next_txn_no(self, employee_name, doc_type):
         """当該タブの次取引No を返す（headless の build_page_write へ渡す start_txn_no）。"""
-        tab_name = _tab_name(employee_name, doc_type)
+        tab_name = self._tab_namer(employee_name, doc_type)
         ws = self._get_or_create_tab(tab_name)
         return self._get_next_txn_no(tab_name, ws)
 
@@ -625,7 +649,7 @@ class SheetsOutputWriter:
         # 本メソッド（Phase B）は coerce_tax_amount のみ要する。
         from receipt_aggregation import coerce_tax_amount
 
-        tab_name = _tab_name(employee_name, doc_type)
+        tab_name = self._tab_namer(employee_name, doc_type)
         ws = self._get_or_create_tab(tab_name)
 
         transaction_no = self._get_next_txn_no(tab_name, ws)

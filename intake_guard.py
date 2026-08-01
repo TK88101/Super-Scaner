@@ -44,6 +44,16 @@ def resolve_posting_id(file: Mapping[str, Any]) -> str | None:
     return stripped
 
 
+def _str_or_none(value: Any) -> str | None:
+    """str ならそのまま、それ以外（None・数値・奇形）は None（防御的縮退）。
+
+    resolve_posting_id の isinstance 検査と同じ趣旨——外部由来（Firestore job
+    文書）の字段を型保証付きで下游へ渡す。空文字はここでは落とさない
+    （「空をどう扱うか」は消費側の業務判断＝_resolve_tab_owner が担う）。
+    """
+    return value if isinstance(value, str) else None
+
+
 class IntakeDecision(Enum):
     """check_intake の裁決結果（IP-303）。"""
 
@@ -64,6 +74,11 @@ class IntakeCheck:
     posting_id_mismatch）のみ job.get("lease_epoch")/job.get("current_state")
     をそのまま転記、それ以外（job 未取得）は None のまま。main（T4）の
     intake 状態白名単判定・report_posted の lease_epoch 引数に使う。
+    customer_id/customer_label：B7 Plan §5.1-d T4-1。lease_epoch/job_state と
+    同型（job が取得できた分岐でのみ job.get("customer_id")/
+    job.get("customer_label") をそのまま転記）。main（T4）が headless の
+    Sheets tab キー（tab_owner）解決に使う——契約 §2 は customer_id を必填と
+    するが customer_label は任意字段（TBD-8、控制面書込は趙拍板待ち）。
     """
 
     decision: IntakeDecision
@@ -71,6 +86,8 @@ class IntakeCheck:
     reason: str | None
     lease_epoch: int | None = None
     job_state: str | None = None
+    customer_id: str | None = None
+    customer_label: str | None = None
 
 
 def check_intake(
@@ -103,16 +120,24 @@ def check_intake(
     if job is None:
         return IntakeCheck(IntakeDecision.REJECTED, base, "job_not_found")
 
-    # job は取得済み——以降の分岐は lease_epoch/job_state を裁決線索として転記する
+    # job は取得済み——以降の分岐は lease_epoch/job_state/customer_id/
+    # customer_label を裁決線索として転記する。customer 系は resolve_posting_id
+    # と同じ防御的仕様（simcodex R2 層位採納）：非 str（数値・奇形）は入口境界で
+    # None へ縮退させ、IntakeCheck.customer_*: str | None の型約束を下游全消費者
+    # に対して成立させる（main 側 _resolve_tab_owner の検査は縦深防御として残る）。
     lease_epoch = job.get("lease_epoch")
     job_state = job.get("current_state")
+    customer_id = _str_or_none(job.get("customer_id"))
+    customer_label = _str_or_none(job.get("customer_label"))
 
     if job.get("posting_id") != base:
         return IntakeCheck(IntakeDecision.REJECTED, base, "posting_id_mismatch",
-                           lease_epoch=lease_epoch, job_state=job_state)
+                           lease_epoch=lease_epoch, job_state=job_state,
+                           customer_id=customer_id, customer_label=customer_label)
 
     return IntakeCheck(IntakeDecision.PROCESS, base, None,
-                       lease_epoch=lease_epoch, job_state=job_state)
+                       lease_epoch=lease_epoch, job_state=job_state,
+                       customer_id=customer_id, customer_label=customer_label)
 
 
 @dataclass(frozen=True)
@@ -125,6 +150,8 @@ class IntakeGateResult:
     decision/reason：check_intake の裁決（memo 命中は REJECTED 扱い、base=None）。
     lease_epoch/job_state：check_intake からの橋渡し（B4 Plan §2.5、#14 base 橋渡しと
     同型）。メモ命中経路は check_intake を呼ばないため常に None。
+    customer_id/customer_label：check_intake からの橋渡し（B7 Plan §5.1-d T4-1、
+    lease_epoch/job_state と同型）。メモ命中経路は常に None。
     """
 
     should_process: bool
@@ -133,6 +160,8 @@ class IntakeGateResult:
     reason: str | None
     lease_epoch: int | None = None
     job_state: str | None = None
+    customer_id: str | None = None
+    customer_label: str | None = None
 
 
 def _finish_quarantine_move(
@@ -245,10 +274,13 @@ def handle_intake_gate(
 
     def gate_result(should_process: bool, decision: IntakeDecision,
                     reason: str | None) -> IntakeGateResult:
-        """check（本関数クロージャ捕捉）から base/lease_epoch/job_state を転記する
-        （simcodex Round 2 #3、4 返回点の尾引数重複を解消）。"""
+        """check（本関数クロージャ捕捉）から base/lease_epoch/job_state/
+        customer_id/customer_label を転記する（simcodex Round 2 #3、
+        4 返回点の尾引数重複を解消）。"""
         return IntakeGateResult(should_process, check.base, decision, reason,
-                                lease_epoch=check.lease_epoch, job_state=check.job_state)
+                                lease_epoch=check.lease_epoch, job_state=check.job_state,
+                                customer_id=check.customer_id,
+                                customer_label=check.customer_label)
 
     if check.decision is IntakeDecision.PROCESS:
         return gate_result(True, IntakeDecision.PROCESS, None)
