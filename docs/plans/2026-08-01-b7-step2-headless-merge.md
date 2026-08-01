@@ -130,3 +130,17 @@
 - #14 ESCALATE 不写：接受（未決を FAILED と誤表現しない。POST_UNKNOWN 人工核と整合）
 
 **→ 本計画定稿（2026-08-01）。以後の変更は実施中の Plan 修正手続（fatboyslim Phase 2）による。**
+
+## 10. 実施後評審記録（simcodex・2026-08-01）
+
+- **Round 1 で early-exit**（規約どおり：panel 0 P0/P1・codex 0 P0/P1・verify 全緑）。
+- simplify 4 視角 panel（Reuse/Simplification/Efficiency/Altitude 並行）：**P0/P1 ゼロ**、P2 計 18 件。
+- codex review（`--base origin/feature/sandevistan-headless`＝本批全量）：「No actionable correctness issues」。修復後の `--uncommitted` 追認：「No actionable regressions」。
+- **即修した 3 件**：①Altitude#4＝`job_reporter` 改名（Plan §9 #4 既裁事項の履行——コメント代替は bandaid だった）②Altitude#1＝`flush_pending` を try/finally 化（途中例外でも決算済み頁の行を落とさない）③Altitude#5＝未知 kind 警告の檔内去重。
+- **P2 遺留清単（次批以降・拘束なし）**：
+  1. `social_insurance_notice` リテラルが `ocr_engine.SOCIAL_INSURANCE_REASON` と二重定義（依存を増やさず共有するには定数の dep-free モジュール移設が要る）
+  2. `_handle_excluded_page` の `reason` が監査タブ表示文字列と機械 detail キーの二役（表示形式を変えると白名単翻訳が unclassified へ縮退）
+  3. kind/detail 語彙が main.py 産出側・映射表・網羅テストの 3 箇所に文字列で分散（定数昇格＋テスト導出で漂移検出可能に）
+  4. UI 経路 `page_done` の reason が未消費の混在語彙（消費者が現れる前に閉語彙化 or 撤去）
+  5. `_emit` 閉包の毎頁再生成／`basename` 二重計算／fake の `_make(fs)` 死引数／テスト内 import 反復等の微小整理
+  6. `test_drive_functions.BuildProgressReportersTest` docstring の「None を割り当て」記述と実装（キー省略）の乖離
