@@ -15,7 +15,7 @@ headless 側（`_process_file_headless`）はそれを「占位ページ」と�
   - 除外ページは MF 区へ**一切書かない**（仕訳行も占位行も提示行も、書込回数ゼロ）
   - 留痕は監査タブのみ。page doc は作らない（`ticket_count` 二分を揺らさない）
   - ただし `check_page` は**必ず見る**（載せないことと参照しないことは別）
-  - 全頁除外 → PARTIAL（POSTED とは偽らない・DEAD_LETTER にも落とさない）
+  - 全頁除外 → SUCCESS（正常完了、契約 v0.15 §5.1-b 裁定2／P0-10・趙 2026-08-01 拍板）
   - 除外＋記帳頁 → SUCCESS（封筒混在は最頻ケース。永久非終端にしない）
   - 分類 drift（過去輪と今輪で判定が違う頁）は監査タブに両方の分類を残す
 
@@ -171,7 +171,7 @@ class ExcludedPageWriteBlockingTest(unittest.TestCase):
         fs, writer, ledger = _env()
         out = run_headless(writer, ledger, [excluded_page(1, 1)])
 
-        self.assertIs(out.outcome, main.ProcessOutcome.PARTIAL)
+        self.assertIs(out.outcome, main.ProcessOutcome.SUCCESS)  # 全頁除外＝正常完了（P0-10）
         self.assertEqual(writer.append_calls, 0)        # commit_page 経由の書込ゼロ
         self.assertEqual(writer.build_page_write_calls, 0)  # 組立すらしない
         self.assertEqual(writer.placeholder_calls, [])  # append_entries もゼロ
@@ -191,7 +191,7 @@ class ExcludedPageWriteBlockingTest(unittest.TestCase):
             1, 1, reason="social_insurance_notice",
             destination=EXCLUDE_DEST_MF_TAB)])
 
-        self.assertIs(out.outcome, main.ProcessOutcome.PARTIAL)
+        self.assertIs(out.outcome, main.ProcessOutcome.SUCCESS)  # 全頁除外＝正常完了（P0-10）
         self.assertEqual(writer.append_calls, 0)
         self.assertEqual(writer.placeholder_calls, [])
         self.assertEqual(len(writer.audit_rows), 1)
@@ -298,7 +298,7 @@ class ExcludedDriftTest(unittest.TestCase):
         _seed_confirmed_page(fs, 1, ticket_count=0)
         out = run_headless(writer, ledger, [excluded_page(1, 1)])
 
-        self.assertIs(out.outcome, main.ProcessOutcome.PARTIAL)  # DEAD_LETTER ではない
+        self.assertIs(out.outcome, main.ProcessOutcome.SUCCESS)  # 全頁除外＝正常完了（P0-10）
         self.assertEqual(len(writer.audit_rows), 1)
         row = writer.audit_rows[0]
         self.assertEqual(row["verdict"], AUDIT_VERDICT_DRIFT)
@@ -423,14 +423,16 @@ class AuditWriteFailureTest(unittest.TestCase):
 # ============================================================
 
 class ExcludedFileOutcomeTest(unittest.TestCase):
-    def test_all_excluded_is_partial_and_not_reported(self):
-        """全頁除外 → PARTIAL。POSTED とも死信とも偽らない（裁定2）。"""
+    def test_all_excluded_is_success_and_reported_posted(self):
+        """全頁除外 → SUCCESS＝正常完了、report_posted で終態へ（契約 v0.15
+        §5.1-b 裁定2。P0-10、趙 2026-08-01 拍板：一条も記帳すべきでない
+        ファイルは「直接算過」——沈黙で lease 超時を待たせない）。"""
         reporter = FakeReporter({DEFAULT_BASE: {"lease_epoch": 1}})
         fx = HeadlessRerunFixture(reporter=reporter)
         out = fx.run([excluded_page(1, 2), excluded_page(2, 2)], lease_epoch=1)
 
-        self.assertIs(out.outcome, main.ProcessOutcome.PARTIAL)
-        self.assertEqual(reporter.report_posted_calls, [])
+        self.assertIs(out.outcome, main.ProcessOutcome.SUCCESS)
+        self.assertEqual(reporter.report_posted_calls, [(DEFAULT_BASE, 1)])
         self.assertEqual(reporter.report_dead_letter_calls, [])
         self.assertEqual(fx.writer.append_calls, 0)
         self.assertEqual(len(fx.writer.audit_rows), 2)
@@ -510,10 +512,10 @@ class ExcludedFileOutcomeTest(unittest.TestCase):
         self.assertEqual(out.dead_letter_payload["message"],
                          "all_pages_unreadable: 2/3 pages [p2,p3]")
 
-    def test_aggregate_is_pure_and_excluded_only_yields_partial(self):
+    def test_aggregate_is_pure_and_excluded_only_yields_success(self):
         out = main._aggregate_file_outcome({1: "EXCLUDED", 2: "EXCLUDED"},
                                            [1, 2], 2)
-        self.assertIs(out.outcome, main.ProcessOutcome.PARTIAL)
+        self.assertIs(out.outcome, main.ProcessOutcome.SUCCESS)
 
     def test_excluded_pages_are_neutral_when_other_pages_remain(self):
         """除外中立性（Codex 単条複審 #6）: 非除外頁が 1 頁以上残る限り、
@@ -602,7 +604,7 @@ class ClassificationFlipTest(unittest.TestCase):
 
         ledger2 = make_ledger(fs, writer)
         out2 = run_headless(writer, ledger2, [excluded_page(1, 1)])
-        self.assertIs(out2.outcome, main.ProcessOutcome.PARTIAL)
+        self.assertIs(out2.outcome, main.ProcessOutcome.SUCCESS)  # 全頁除外＝正常完了（P0-10）
         self.assertEqual(len(writer.sheets[_TAB]), rows_after_1)  # 増行なし
         self.assertEqual(writer.audit_rows[-1]["reason"],
                          "drift:PLACEHOLDER_PRIOR->EXCLUDED")
@@ -629,7 +631,7 @@ class ClassificationFlipTest(unittest.TestCase):
             1, 1, reason="social_insurance_notice",
             destination=EXCLUDE_DEST_MF_TAB)])
 
-        self.assertIs(out.outcome, main.ProcessOutcome.PARTIAL)
+        self.assertIs(out.outcome, main.ProcessOutcome.SUCCESS)  # 全頁除外＝正常完了（P0-10）
         self.assertEqual(writer.append_calls, 0)
         self.assertEqual(writer.placeholder_calls, [])
         self.assertEqual(len(writer.audit_rows), 2)

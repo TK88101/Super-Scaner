@@ -83,8 +83,9 @@ def _assert_excluded_contract(case, writer, out):
                      "除外ページで MF 区へ占位行（append_entries）が書かれている")
     case.assertEqual(len(writer.audit_rows), 2,
                      "除外ページの留痕（監査タブ行）が頁数分ない")
-    case.assertIs(out.outcome, main.ProcessOutcome.PARTIAL,
-                  "全頁除外の終態が PARTIAL でない（死信化・POSTED 詐称の疑い）")
+    case.assertIs(out.outcome, main.ProcessOutcome.SUCCESS,
+                  "全頁除外の終態が SUCCESS でない（正常完了扱い＝契約 v0.15 "
+                  "§5.1-b 裁定2／P0-10。死信化していないかも確認）")
 
 
 class HeadlessExcludedPageBehaviourTest(unittest.TestCase):

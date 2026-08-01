@@ -118,7 +118,8 @@ Drive 原生预览忽略 `#page=N`，故每页拆成单页 PDF 上传到 `SPLIT_
 `_process_file_headless` 消费同一个 `_excluded_page`，但**不看 `_exclude_destination`**：
 封筒も社保通知書も監査タブのみ、MF 区へは書込回数ゼロ（硬冪等の器＝effect 記録が
 未実装なので、副作用そのものを起こさない。Plan §4.3／§9）。檔級終態は
-全頁除外→`PARTIAL`（POSTED を騙らず死信にも落とさない）／除外＋記帳→`SUCCESS`／
+全頁除外→`SUCCESS`（正常完了・report_posted で終態へ。契約 v0.15 §5.1-b 裁定2
+＝P0-10、趙 2026-08-01 拍板）／除外＋記帳→`SUCCESS`／
 除外＋占位→`DEAD_LETTER`（除外は母数から除くだけで、残り頁の判定を変えない）。
 重跑で前後輪の分類が食い違えば監査タブに判定＝`分類変化`・理由＝`drift:<前輪>-><今輪>`。
 **監査書込失敗時は headless だけ `ESCALATE`（ファイル保持・MF へ退避しない）**——

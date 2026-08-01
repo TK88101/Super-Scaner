@@ -1069,13 +1069,14 @@ def _aggregate_file_outcome(page_kinds, ordered_page_nums, total_pages):
     ESCALATE は呼出側で頁単位に即返しているためここには現れない）。
 
     優先順位：RETRYABLE 頁存在 → UNKNOWN 頁存在 →（以降は除外頁を母数から
-    除いて）零記帳（PARTIAL）→ 全頁占位（DEAD_LETTER）→ 一部頁占位（PARTIAL）
-    → 全頁 POSTED（SUCCESS）。
+    除いて）零記帳＝全頁除外（SUCCESS、P0-10）→ 全頁占位（DEAD_LETTER）→
+    一部頁占位（PARTIAL）→ 全頁 POSTED（SUCCESS）。
 
     除外頁（IP-402 §4.5）は「読めなかった頁」ではなく「本来記帳すべきでない頁」
-    なので母数から除く。除いた結果が空＝零記帳のファイルは POSTED と偽らず
-    PARTIAL（裁定2）。逆に記帳頁が 1 つでもあれば、封筒が混ざっていても
-    SUCCESS でよい——最頻ケース（仕訳頁＋封筒頁）を永久非終端にしない（目標3）。
+    なので母数から除く。除いた結果が空＝全頁除外は**正常完了＝SUCCESS**
+    （裁定2・P0-10、趙 2026-08-01 拍板）。記帳頁が 1 つでもあれば、封筒が
+    混ざっていても SUCCESS でよい——最頻ケース（仕訳頁＋封筒頁）を永久
+    非終端にしない（目標3）。
     """
     if not ordered_page_nums:
         return HeadlessOutcome(ProcessOutcome.FAILED)  # total_pages==0（稀有、現状維持）
@@ -1089,8 +1090,11 @@ def _aggregate_file_outcome(page_kinds, ordered_page_nums, total_pages):
 
     accounted = [k for k in kinds if k not in _EXCLUDED_KINDS]
     if not accounted:
-        # 全頁除外＝零記帳。DEAD_LETTER（死信・人工介入）でも POSTED でもない。
-        return HeadlessOutcome(ProcessOutcome.PARTIAL)
+        # 全頁除外＝正常完了（SUCCESS 側・report_posted で終態へ）。一条も
+        # 記帳すべきでないファイルは「直接算過」——契約 v0.15 §5.1-b 裁定2、
+        # P0-10（趙 2026-08-01 拍板）。旧 PARTIAL（意図的沈黙）は lease 超時
+        # 待ちの偽未完了件を対账に残していた。
+        return HeadlessOutcome(ProcessOutcome.SUCCESS)
 
     if all(k in _PLACEHOLDER_KINDS for k in accounted):
         failed_page_nums = [n for n in ordered_page_nums
