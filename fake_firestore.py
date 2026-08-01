@@ -31,6 +31,13 @@ class _DocRef:
     def get(self, transaction=None):
         return _Snap(self._fs.store.get(self._path))
 
+    def set(self, data, timeout=None):
+        """非事務 set（B7-2 page_outcomes 用）。set_hook が例外を投げれば
+        書込前に失敗する（故障注入、test_firestore_progress で使用）。"""
+        if self._fs.set_hook is not None:
+            self._fs.set_hook(self._path)
+        self._fs.store[self._path] = dict(data)
+
 
 class _CollRef:
     def __init__(self, fs, path):
@@ -54,6 +61,8 @@ class FakeFirestore:
 
     def __init__(self):
         self.store: dict = {}
+        # 非事務 set() の故障注入フック（path を受け、失敗させたい時に raise）
+        self.set_hook = None
 
     def collection(self, name):
         return _CollRef(self, (name,))

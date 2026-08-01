@@ -97,8 +97,9 @@
 - **R5 進捗タブと page_outcomes の意味錯綜**：Sheets 進捗タブ＝人向け可視化（main 由来・headless 既定不接続）、page_outcomes＝控制面の完了判定権威。役割を本檔とコード docstring に明記。
 - **R6 映射誤り＝完了判定汚染**：kind→outcome 表を単一真相源（モジュール定数）にし、table-driven テストで全行釘死；表に無い kind は書かず警告（静默 POSTED 化の禁止）。
 
-## 8. T1 現地確認結果（実施後追記）
-- TBD
+## 8. T1 現地確認結果（2026-08-01 実施）
+- **P0-10（全頁除外→SUCCESS 側）＝未済**。実証：`main.py` `_derive_headless_outcome` 系で全頁除外→`ProcessOutcome.PARTIAL`（merge 後 1066-1067 行）、PARTIAL は意図的沈黙・未回報（同 485-488 行、F06-How TBD 接縫）。契約 v0.15 §5.1-b 趙裁定 2 は「全頁除外を SUCCESS 側へ（一行判定変更）」——**本批範囲外につきコード不変更、趙へ報告**。改修時は同時に report_posted 側の挙動（SUCCESS 回報になる）と関連テスト（test_headless_excluded_page の全頁除外系）を追随させる必要あり＝実質「一行＋テスト数箇所」。
+- **P1-9（断言の歯 3 箇所再設計）＝実質消化済み**。`test_process_file_headless.py:224/606`・`test_headless_excluded_page.py:177 ほか`に `placeholder_calls==[]`／`append_calls` 零系の断言が既在（IP-402 で整備）。P0-10 実施時に全頁除外系の期待値変更として一部書き換えが発生する点のみ残る。
 
 ## 9. Codex 対抗評審と辯論裁決記録（初審 2026-08-01・13 条）
 

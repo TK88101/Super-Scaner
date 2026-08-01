@@ -580,10 +580,15 @@ def _process_one_file(service, writer, reporter, file, input_folder_id, doc_type
     # 頁級台賬（IP-304、headless のみ）: 1 ファイル＝1 job、job_key=base。
     # reporter と同一 Firestore client を再利用、witness probe は writer 提供。
     ledger = None
+    page_outcomes = None
     if reporter is not None and base is not None:
         from posting_ledger import PostingLedger
         ledger = PostingLedger(
             reporter.client, base, sheet_probe=writer.probe_page)
+        # 頁処理結果台帳 reporter（契約 §5.6、B7-2 T3）。1 ファイル＝1 個、
+        # client は檔級回報（reporter＝job 状態）と同一を再利用。
+        from firestore_progress import FirestorePageOutcomesReporter
+        page_outcomes = FirestorePageOutcomesReporter(reporter.client, base)
 
     # PDF 間分割線 + 取引No リセットは UI 版のみ（headless は取引No を
     # Sheets A 列から都度再構築＝崩潰重跑冪等、分割線リセットは不要・有害）。
@@ -599,7 +604,14 @@ def _process_one_file(service, writer, reporter, file, input_folder_id, doc_type
         # Sheets 進捗タブは UI 版のみ接続（headless の頁級可視化権威は
         # 控制面 page_outcomes——B7-2 Plan §2 非目標）。
         progress=progress_reporter if ledger is None else None,
+        page_outcomes=page_outcomes,
     )
+
+    if page_outcomes is not None:
+        # 檔終局の補写一輪（report_posted の**前**——頁時に失敗した行を
+        # 回収してから檔級終態を回報する。なお失敗は放行＝reconciler 側で
+        # 欠落として扱われる。B7-2 Plan §9 #3/#9 裁決）。
+        page_outcomes.flush_pending()
 
     if ledger is not None:
         # headless 五態（B4 Plan §2.3）。move は全出口で削除済み（§2.6 全審計、
@@ -949,7 +961,10 @@ def _handle_excluded_page(writer, ledger, resolver, page_id, destination,
         # ので、今輪のより正確な判定で上書きしてよい——こちらは終態を変え
         # ないので専用 kind を作らず素の EXCLUDED を返す（drift の事実は
         # 直前に書いた監査行が持つ、_EXCLUDED_KINDS の注記参照）。
-        return (prior if prior == "POSTED_PRIOR" else "EXCLUDED", None)
+        # detail=classification_drift（B7-2 T3）: page_outcomes の reason で
+        # drift を残す（outcome は帳務身分のまま、Codex 阻斷2 裁決）。
+        return (prior if prior == "POSTED_PRIOR" else "EXCLUDED",
+                "classification_drift")
 
     # 同頁に複数の除外 result が来た場合は理由を出現順に去重して連結する。
     # destination 不一致は escalate（行き先を推測で決めない）だが、reason は
@@ -963,7 +978,10 @@ def _handle_excluded_page(writer, ledger, resolver, page_id, destination,
             writer, resolver, results, filename, page_num, total_pages,
             AUDIT_VERDICT_EXCLUDED, reason):
         return ("ESCALATE", "audit_write_failed")
-    return ("EXCLUDED", None)
+    # detail＝producer の _exclude_reason（単一なら envelope 等の機械キーの
+    # まま page_outcomes の白名単翻訳へ届く。複数連結は reporter 側で
+    # unclassified に降級——自由文字は不透過、B7-2 T3）。
+    return ("EXCLUDED", reason)
 
 
 def _classify_and_flush_page(writer, ledger, resolver, base, doc_type,
@@ -1019,6 +1037,11 @@ def _classify_and_flush_page(writer, ledger, resolver, base, doc_type,
     if outcome == "escalate":
         return ("ESCALATE", "ledger_witness_ambiguous")
     if outcome == "written":
+        # detail 槽は page_outcomes の reason 機械キー（非 ESCALATE では従来
+        # 未使用だった、B7-2 T3）。content_error は「読めなかった」ことを
+        # closed キーで運ぶ。
+        if shape == "content_error":
+            return ("PLACEHOLDER_WRITTEN", "content_unreadable")
         return ("PLACEHOLDER_WRITTEN" if is_placeholder else "POSTED_NOW", None)
     return (_prior_page_kind(ledger, page_id), None)  # "skipped"
 
@@ -1076,7 +1099,8 @@ def _aggregate_file_outcome(page_kinds, ordered_page_nums, total_pages):
     return HeadlessOutcome(ProcessOutcome.SUCCESS)
 
 
-def _record_page_classification(classified, page_kinds, ordered_page_nums, page_num):
+def _record_page_classification(classified, page_kinds, ordered_page_nums,
+                                page_num, *, page_outcomes=None):
     """flush() の戻り値を頁級 outcome 記録へ反映する（main.py 内 2 箇所の重複統合、
     simcodex Round 1 #5/#6）。
 
@@ -1093,15 +1117,22 @@ def _record_page_classification(classified, page_kinds, ordered_page_nums, page_
         return None
     kind, reason = classified
     if kind == "ESCALATE":
+        # ESCALATE は page_outcomes へ**書かない**（B7-2 Plan §9 #14 裁決）：
+        # 行の欠落＝「未決」の正しい信号。FAILED と書くと人工核信号と矛盾する。
         print(f"🚨 頁 {page_num} ESCALATE: {reason}")
         return HeadlessOutcome(ProcessOutcome.ESCALATED)
     page_kinds[page_num] = kind
     ordered_page_nums.append(page_num)
+    if page_outcomes is not None:
+        # B7-2 T3: 頁決算の唯一の発射点（恰好一回）。kind→§5.6 outcome の
+        # 映射・reason 白名単・degrade は reporter 側が担う（emit adapter）。
+        page_outcomes.record_page(page_num, kind, reason)
     return None
 
 
 def _process_file_headless(service, writer, file_path, uploader_name, base,
-                           ledger, doc_type, drive_file_id, split_pdf_folder_id):
+                           ledger, doc_type, drive_file_id, split_pdf_folder_id,
+                           *, page_outcomes=None):
     """HEADLESS_MODE の頁級緩衝集約経路（IP-304/IP-306）。HeadlessOutcome を返す。
 
     process_pipeline の yield を page_num で連続緩衝し、頁境界で flush（形状分類→
@@ -1143,7 +1174,8 @@ def _process_file_headless(service, writer, file_path, uploader_name, base,
             classified = flush(buffered_num, buffered_total_pages,
                                buffered_results, buffered_page_bytes)
             escalated = _record_page_classification(
-                classified, page_kinds, ordered_page_nums, buffered_num)
+                classified, page_kinds, ordered_page_nums, buffered_num,
+                page_outcomes=page_outcomes)
             if escalated is not None:
                 return escalated
             seen_pages.add(buffered_num)
@@ -1164,7 +1196,8 @@ def _process_file_headless(service, writer, file_path, uploader_name, base,
     classified = flush(buffered_num, buffered_total_pages,
                        buffered_results, buffered_page_bytes)
     escalated = _record_page_classification(
-        classified, page_kinds, ordered_page_nums, buffered_num)
+        classified, page_kinds, ordered_page_nums, buffered_num,
+        page_outcomes=page_outcomes)
     if escalated is not None:
         return escalated
 
@@ -1278,7 +1311,7 @@ def _write_audit_fallback_row(sheets_writer, uploader_name, doc_type, filename,
 def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
                   doc_type=DocType.RECEIPT, drive_file_id=None,
                   split_pdf_folder_id="", base=None, ledger=None,
-                  progress=None):
+                  progress=None, page_outcomes=None):
     """process_file の薄い外殻（B7 T3）。
 
     進捗フックの発火（file_started／未預期例外時の ABORTED best-effort 記録）
@@ -1295,7 +1328,7 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
             service, sheets_writer, file_path, uploader_name, chat_id,
             doc_type=doc_type, drive_file_id=drive_file_id,
             split_pdf_folder_id=split_pdf_folder_id, base=base, ledger=ledger,
-            progress=progress)
+            progress=progress, page_outcomes=page_outcomes)
     except Exception as e:
         # best-effort: 進捗記録は reporter 自身が内部で自吞するが、二重の
         # 安全網として元例外を必ずそのまま伝播させる（main loop の既存の
@@ -1306,8 +1339,8 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
 
 def _process_file_impl(service, sheets_writer, file_path, uploader_name,
                        chat_id, doc_type=DocType.RECEIPT, drive_file_id=None,
-                       split_pdf_folder_id="", base=None, ledger=None, *,
-                       progress):
+                       split_pdf_folder_id="", base=None, ledger=None,
+                       page_outcomes=None, *, progress):
     """ファイルを処理し、Google Sheets に逐次書き込み、通知を送信する。
 
     ledger 非 None（HEADLESS_MODE）は頁級緩衝集約＋硬去重の経路へ分流し ProcessOutcome
@@ -1322,7 +1355,8 @@ def _process_file_impl(service, sheets_writer, file_path, uploader_name,
     if ledger is not None:
         return _process_file_headless(
             service, sheets_writer, file_path, uploader_name, base, ledger,
-            doc_type, drive_file_id, split_pdf_folder_id)
+            doc_type, drive_file_id, split_pdf_folder_id,
+            page_outcomes=page_outcomes)
 
     type_label = DOC_TYPE_CONFIG.get(doc_type, {}).get("label", doc_type)
     filename = os.path.basename(file_path)

@@ -614,3 +614,77 @@ class ProcessOneFileTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PageOutcomesLoopWiringTest(unittest.TestCase):
+    """B7-2 T3: _process_one_file の page_outcomes 構築・貫通・檔終局 flush。
+
+    Plan §3 T3——構築点＝base 確定後（reporter.client 再利用）、
+    flush＝report_posted の**前**（頁時失敗の補写一輪）。
+    """
+
+    class _StubOutcomes:
+        instances = []
+
+        def __init__(self, client, base):
+            self.client = client
+            self.base = base
+            self.events = None  # テストが注入
+            type(self).instances.append(self)
+
+        def record_page(self, *a, **k):
+            pass
+
+        def flush_pending(self):
+            if self.events is not None:
+                self.events.append("flush")
+            return 0
+
+    def setUp(self):
+        self._StubOutcomes.instances = []
+
+    def _run_headless_success(self, events):
+        stub_cls = self._StubOutcomes
+
+        class _EventReporter(FakeReporter):
+            def report_posted(self, base, *, lease_epoch):
+                events.append("report_posted")
+                return super().report_posted(base, lease_epoch=lease_epoch)
+
+        reporter = _EventReporter({"cust:hash": _job("cust:hash", lease_epoch=9)})
+        writer = FakeWriter()
+
+        def _bind_events(client, base):
+            inst = stub_cls(client, base)
+            inst.events = events
+            return inst
+
+        with patch("firestore_progress.FirestorePageOutcomesReporter",
+                   side_effect=_bind_events), \
+             _patch_file_processing(process_return=main.HeadlessOutcome(
+                 main.ProcessOutcome.SUCCESS)) as p:
+            _call_process_one_file(writer, reporter)
+        return p, reporter
+
+    def test_constructed_with_job_client_and_base_and_passed_to_process_file(self):
+        events = []
+        p, reporter = self._run_headless_success(events)
+        self.assertEqual(len(self._StubOutcomes.instances), 1)
+        inst = self._StubOutcomes.instances[0]
+        self.assertIs(inst.client, reporter.client)   # 同一 client 再利用
+        self.assertEqual(inst.base, "cust:hash")
+        kwargs = p.process_file.call_args.kwargs
+        self.assertIs(kwargs.get("page_outcomes"), inst)
+
+    def test_flush_pending_runs_before_report_posted(self):
+        events = []
+        self._run_headless_success(events)
+        self.assertEqual(events, ["flush", "report_posted"])
+
+    def test_ui_path_gets_no_page_outcomes(self):
+        writer = FakeWriter()
+        with _patch_file_processing(process_return=True, headless=False) as p:
+            _call_process_one_file(writer, None)
+        kwargs = p.process_file.call_args.kwargs
+        self.assertIsNone(kwargs.get("page_outcomes"))
+        self.assertEqual(self._StubOutcomes.instances, [])

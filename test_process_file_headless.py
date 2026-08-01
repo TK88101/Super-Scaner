@@ -721,3 +721,148 @@ class ContentPlaceholderRowShapeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PageOutcomesEmissionTest(unittest.TestCase):
+    """B7-2 T3 DoD①〜⑦: 頁決算点からの §5.6 page_outcomes 発射（統合、fake firestore）。
+
+    Plan: docs/plans/2026-08-01-b7-step2-headless-merge.md §3 T3。
+    fs は ledger（postings）と outcomes（page_outcomes）で同一インスタンス——
+    本番と同じく同一 Firestore を共有する。
+    """
+
+    def _env(self):
+        from firestore_progress import FirestorePageOutcomesReporter
+        from headless_rerun_fixture import DEFAULT_BASE
+        fs = FakeFirestore()
+        writer = FakeWriter()
+        ledger = _make_ledger(fs, writer)
+        rep = FirestorePageOutcomesReporter(fs, DEFAULT_BASE)
+        return fs, writer, ledger, rep
+
+    def _outcomes(self, fs):
+        from headless_rerun_fixture import DEFAULT_BASE
+        return {path[3]: doc for path, doc in fs.store.items()
+                if path[:3] == ("jobs", DEFAULT_BASE, "page_outcomes")}
+
+    def test_dod1_three_posted_pages_emit_three_rows(self):
+        fs, writer, ledger, rep = self._env()
+        pages = [_page(1, 3, "店A", 1000), _page(2, 3, "店B", 2000),
+                 _page(3, 3, "店C", 3000)]
+        out = run_headless(writer, ledger, pages, page_outcomes=rep)
+        self.assertIs(out.outcome, main.ProcessOutcome.SUCCESS)
+        docs = self._outcomes(fs)
+        self.assertEqual(len(docs), 3)
+        self.assertEqual({d["page"] for d in docs.values()}, {1, 2, 3})
+        self.assertTrue(all(d["outcome"] == "POSTED" for d in docs.values()))
+        self.assertTrue(all(d["reason"] == "posted_now" for d in docs.values()))
+
+    def test_dod2_excluded_page_emits_excluded_with_fixed_reason(self):
+        from headless_rerun_fixture import excluded_page
+        fs, writer, ledger, rep = self._env()
+        pages = [_page(1, 2, "店A", 1000), excluded_page(2, 2)]
+        out = run_headless(writer, ledger, pages, page_outcomes=rep)
+        self.assertIs(out.outcome, main.ProcessOutcome.SUCCESS)
+        docs = self._outcomes(fs)
+        by_page = {d["page"]: d for d in docs.values()}
+        self.assertEqual(by_page[2]["outcome"], "EXCLUDED")
+        self.assertEqual(by_page[2]["reason"], "excluded_envelope")
+
+    def test_dod3_retryable_error_page_emits_failed(self):
+        fs, writer, ledger, rep = self._env()
+        pages = [error_page(1, 1, error_class="RETRYABLE")]
+        out = run_headless(writer, ledger, pages, page_outcomes=rep)
+        self.assertIs(out.outcome, main.ProcessOutcome.FAILED)
+        docs = self._outcomes(fs)
+        self.assertEqual(len(docs), 1)
+        doc = next(iter(docs.values()))
+        self.assertEqual(doc["outcome"], "FAILED")
+        self.assertEqual(doc["reason"], "page_error_retryable")
+
+    def test_dod3b_content_error_page_emits_placeholder_content_unreadable(self):
+        fs, writer, ledger, rep = self._env()
+        pages = [_page(1, 2, "店A", 1000), error_page(2, 2, error_class="CONTENT")]
+        run_headless(writer, ledger, pages, page_outcomes=rep)
+        docs = self._outcomes(fs)
+        by_page = {d["page"]: d for d in docs.values()}
+        self.assertEqual(by_page[2]["outcome"], "PLACEHOLDER")
+        self.assertEqual(by_page[2]["reason"], "content_unreadable")
+
+    def test_dod4_rerun_prior_pages_report_final_ledger_identity(self):
+        from firestore_progress import FirestorePageOutcomesReporter
+        from headless_rerun_fixture import DEFAULT_BASE
+        fs, writer, ledger, rep = self._env()
+        pages = [_page(1, 2, "店A", 1000), _page(2, 2, "店B", 2000)]
+        run_headless(writer, ledger, pages, page_outcomes=rep)
+        # 再跑（新プロセス相当＝新 ledger・新 reporter、fs/writer は永続）
+        ledger2 = _make_ledger(fs, writer)
+        rep2 = FirestorePageOutcomesReporter(fs, DEFAULT_BASE)
+        pages2 = [_page(1, 2, "店A", 1000), _page(2, 2, "店B", 2000)]
+        out2 = run_headless(writer, ledger2, pages2, page_outcomes=rep2)
+        self.assertIs(out2.outcome, main.ProcessOutcome.SUCCESS)
+        docs = self._outcomes(fs)
+        self.assertEqual(len(docs), 2)  # 物理頁ごと恒に 1 件
+        self.assertTrue(all(d["outcome"] == "POSTED" for d in docs.values()))
+        self.assertTrue(
+            all(d["reason"] == "prior_confirmed" for d in docs.values()))
+
+    def test_dod5_classification_drift_keeps_ledger_outcome(self):
+        # 前輪 posted（ticket 2 件）・今輪は封筒初判 → outcome は帳務身分
+        # POSTED のまま、drift は reason で残す（Codex 阻斷2）。
+        from firestore_progress import FirestorePageOutcomesReporter
+        from headless_rerun_fixture import DEFAULT_BASE, excluded_page
+        fs, writer, ledger, rep = self._env()
+        run_headless(writer, ledger, [_page(1, 1, "店A", 1000)],
+                     page_outcomes=rep)
+        ledger2 = _make_ledger(fs, writer)
+        rep2 = FirestorePageOutcomesReporter(fs, DEFAULT_BASE)
+        out2 = run_headless(writer, ledger2, [excluded_page(1, 1)],
+                            page_outcomes=rep2)
+        self.assertIs(out2.outcome, main.ProcessOutcome.SUCCESS)
+        docs = self._outcomes(fs)
+        self.assertEqual(len(docs), 1)
+        doc = next(iter(docs.values()))
+        self.assertEqual(doc["outcome"], "POSTED")
+        self.assertEqual(doc["reason"], "classification_drift")
+
+    def test_dod6_escalate_writes_no_row(self):
+        # witness 欠損 PENDING → ESCALATE。行は書かない（欠落＝未決の信号、
+        # Plan §9 #14 裁決）。件級挙動（ESCALATED）は不変。
+        fs, writer, ledger, rep = self._env()
+        from headless_rerun_fixture import DEFAULT_BASE
+        pid = derive_page_id(DEFAULT_BASE, 1)
+        fs.store[("jobs", DEFAULT_BASE, "postings", pid)] = {
+            "status": "PENDING", "sheet_tab": "田中_領収書",
+            "predicted_row_range": None, "row_fingerprint": "",
+        }
+        out = run_headless(writer, ledger, [_page(1, 1, "店A", 1000)],
+                           page_outcomes=rep)
+        self.assertIs(out.outcome, main.ProcessOutcome.ESCALATED)
+        self.assertEqual(self._outcomes(fs), {})
+
+    def test_dod7_empty_generator_emits_nothing(self):
+        fs, writer, ledger, rep = self._env()
+        out = run_headless(writer, ledger, [], page_outcomes=rep)
+        self.assertIs(out.outcome, main.ProcessOutcome.FAILED)
+        self.assertEqual(self._outcomes(fs), {})
+
+    def test_dod7b_reappearing_page_stops_without_extra_rows(self):
+        fs, writer, ledger, rep = self._env()
+        pages = [_page(1, 3, "店A", 1000), _page(2, 3, "店B", 2000),
+                 _page(1, 3, "店C", 3000)]
+        out = run_headless(writer, ledger, pages, page_outcomes=rep)
+        self.assertIs(out.outcome, main.ProcessOutcome.ESCALATED)
+        docs = self._outcomes(fs)
+        # 再登場検知は p1 の再緩衝直前に起こるため、それ以前に真に決算済みの
+        # p1/p2（Sheets・ledger にも書かれている）だけが記録され得る。
+        # 未決算の頁（再登場した p1 の新 result）に行が立たないことが本質。
+        self.assertLessEqual(set(d["page"] for d in docs.values()), {1, 2})
+        self.assertTrue(all(d["outcome"] == "POSTED" for d in docs.values()))
+
+    def test_no_reporter_keeps_legacy_behaviour(self):
+        # page_outcomes=None（未接線）でも headless 経路は従来どおり。
+        fs, writer, ledger, _ = self._env()
+        out = run_headless(writer, ledger, [_page(1, 1, "店A", 1000)],
+                           page_outcomes=None)
+        self.assertIs(out.outcome, main.ProcessOutcome.SUCCESS)
+        self.assertEqual(self._outcomes(fs), {})

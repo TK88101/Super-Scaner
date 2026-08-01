@@ -265,14 +265,15 @@ def make_ledger(fs, writer, base=DEFAULT_BASE, runner=None):
 
 
 def run_headless(writer, ledger, page_yields, base=DEFAULT_BASE,
-                 uploader=DEFAULT_UPLOADER):
+                 uploader=DEFAULT_UPLOADER, page_outcomes=None):
     """process_file を headless 経路で駆動（process_pipeline/PageUrlResolver は fake）。"""
     with patch.object(main, "process_pipeline", return_value=iter(page_yields)), \
          patch.object(main, "PageUrlResolver", _FakeResolver):
         return main.process_file(
             service=None, sheets_writer=writer, file_path="dummy.pdf",
             uploader_name=uploader, chat_id=None, doc_type=DocType.RECEIPT,
-            drive_file_id=None, base=base, ledger=ledger)
+            drive_file_id=None, base=base, ledger=ledger,
+            page_outcomes=page_outcomes)
 
 
 class HeadlessRerunFixture:
