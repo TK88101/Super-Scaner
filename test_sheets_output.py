@@ -17,6 +17,7 @@ import gspread
 
 from doc_types import DocType
 from sheets_output import (
+    APPEND_RESULT_PLACEHOLDER, APPEND_RESULT_POSTED,
     AUDIT_HEADERS, AUDIT_TAB_NAME, _build_description, SheetsOutputWriter,
 )
 
@@ -834,6 +835,66 @@ class NextTxnAndPeekTest(unittest.TestCase):
         pw = types.SimpleNamespace(rows=[["a"], ["b"]], tab_name="従業員_領収書")
         with patch.object(SheetsOutputWriter, "_get_or_create_tab", return_value=ws):
             self.assertEqual(writer.peek_append_range(pw), (6, 7))
+def _call_append_entries(doc_type, data):
+    """append_entries を実行し、戻り値そのものを返す最小ハーネス（B7 T3①専用）。
+
+    既存の _run_append_entries は戻り値を握り潰す固定5-tupleを返す設計
+    （呼び出し側7箇所が位置引数で unpack 済み）ため、戻り値の追加検証には
+    ここを新設する（既存ハーネス・既存テストは一切変更しない）。
+    """
+    writer = _make_writer()
+    ws = _FakeWorksheet()
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(
+            SheetsOutputWriter, "_get_or_create_tab", return_value=ws))
+        stack.enter_context(patch.object(
+            SheetsOutputWriter, "_format_with_retry", lambda *a, **k: None))
+        stack.enter_context(patch.object(
+            SheetsOutputWriter, "_apply_anomaly_highlight",
+            lambda *a, **k: None))
+        with redirect_stdout(io.StringIO()):
+            return writer.append_entries("従業員", doc_type, data,
+                                         source_url="http://x")
+
+
+class AppendEntriesReturnValueTest(unittest.TestCase):
+    """B7 T3①: append_entries の戻り値（"posted"/"placeholder"）。
+
+    挙動不変の情報開示のみ（中8 裁決）——consumer(main.process_file) が
+    entries>0 でも全行金額0で占位行に転落したケースを POSTED と誤報しない
+    ようにするための追加情報。書き込み内容・分岐条件は一切変えない。
+    """
+
+    def test_contract_constants_are_pinned(self):
+        # 契約値の凍結（simcodex R2 裁決）: 定数の「値そのもの」を固定し、
+        # リネームや値変更がテスト無風で通らないようにする。本クラスの他
+        # テストの裸文字列比較は、この pin とセットで契約を二重に守る。
+        self.assertEqual(APPEND_RESULT_POSTED, "posted")
+        self.assertEqual(APPEND_RESULT_PLACEHOLDER, "placeholder")
+
+    def test_returns_posted_when_a_normal_row_is_written(self):
+        data = {"date": "2026/07/31", "vendor": "店", "invoice_num": "",
+                "memo": "", "entries": [_entry(1000)]}
+        result = _call_append_entries(DocType.RECEIPT, data)
+        self.assertEqual(result, "posted")
+
+    def test_returns_placeholder_when_all_entries_have_zero_amount(self):
+        # 中8 裁決の核心ケース: entries は非空だが全行金額0/None →
+        # 内部で占位行に転落する。POSTED と誤報してはいけない。
+        entries = [_entry(0), {"amount": None,
+                               "debit_account": "備品・消耗品費",
+                               "description": "商品",
+                               "credit_account": "未払金"}]
+        data = {"date": "2026/07/31", "vendor": "店", "invoice_num": "",
+                "memo": "", "entries": entries}
+        result = _call_append_entries(DocType.RECEIPT, data)
+        self.assertEqual(result, "placeholder")
+
+    def test_returns_placeholder_when_entries_are_empty(self):
+        data = {"date": "", "vendor": "", "invoice_num": "", "memo": "",
+                "entries": [], "_unrecognized": True}
+        result = _call_append_entries(DocType.RECEIPT, data)
+        self.assertEqual(result, "placeholder")
 
 
 class _FakeAuditWorksheet:

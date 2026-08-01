@@ -387,6 +387,56 @@ class BuildWritersTest(unittest.TestCase):
         self.assertIn("boom", out)
 
 
+class BuildProgressReportersTest(unittest.TestCase):
+    """B7 T4: writer ごとに SheetsProgressReporter を作る接線ヘルパー。
+
+    生成に失敗したプロファイルは None を割り当てて続行する
+    （進捗タブが無くても記帳自体は止めない。build_writers の縮退方針と同型）。
+    """
+
+    def test_builds_one_reporter_per_writer(self):
+        # Arrange
+        writers = {"default": MagicMock(spreadsheet=MagicMock()),
+                  "ido": MagicMock(spreadsheet=MagicMock())}
+        # Act
+        with patch("main.SheetsProgressReporter") as mock_reporter, \
+                redirect_stdout(io.StringIO()):
+            reporters = main.build_progress_reporters(writers)
+        # Assert
+        self.assertEqual({"default", "ido"}, set(reporters))
+        self.assertEqual(mock_reporter.call_count, 2)
+
+    def test_construction_failure_falls_back_to_none_and_continues(self):
+        # Arrange: writer に .spreadsheet が無い（構築時に AttributeError）
+        class _NoSpreadsheetWriter:
+            pass
+
+        writers = {"default": MagicMock(spreadsheet=MagicMock()),
+                  "broken": _NoSpreadsheetWriter()}
+        # Act
+        with redirect_stdout(io.StringIO()):
+            reporters = main.build_progress_reporters(writers)
+        # Assert: 壊れたプロファイルは欠落（build_writers と同じ欠落方式、
+        # 消費側 .get が None を返す）、残りは生きる
+        self.assertNotIn("broken", reporters)
+        self.assertIsNotNone(reporters["default"])
+
+    def test_failure_is_reported_not_swallowed_silently(self):
+        # Arrange
+        class _NoSpreadsheetWriter:
+            pass
+
+        buf = io.StringIO()
+        # Act
+        with redirect_stdout(buf):
+            main.build_progress_reporters({"broken": _NoSpreadsheetWriter()})
+        # Assert: 無言の縮退は禁止
+        self.assertIn("broken", buf.getvalue())
+
+    def test_returns_empty_dict_for_no_writers(self):
+        self.assertEqual({}, main.build_progress_reporters({}))
+
+
 class FilterActiveFoldersTest(unittest.TestCase):
     """writer が作れなかったプロファイルの入力フォルダは監視対象から外す。
 

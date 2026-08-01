@@ -67,6 +67,11 @@ def _severity_color(severity):
 # タグ列（U列 = MF_HEADERS index 20）。標色行に「赤系/橙系/黄系」を記入する。
 TAG_COL_INDEX = MF_HEADERS.index("タグ")
 
+# append_entries の戻り値（B7 T3①）。main 側の頁級進捗フックが消費する
+# 跨モジュール契約値——裸文字列の分散比較を防ぐため producer 側で定数化。
+APPEND_RESULT_POSTED = "posted"
+APPEND_RESULT_PLACEHOLDER = "placeholder"
+
 # 自動拡容バグ対策（6/18 社長指摘）: append_rows がグリッド境界（既定1000行）を
 # 跨ぐと Google が新規行に直前行の書式を継承し、標色された最終行の色が空尾行へ
 # 伝染する。書き込み前に add_rows で空きバッファを確保し、自動拡容自体を起こさない。
@@ -642,7 +647,7 @@ class SheetsOutputWriter:
                           else "有効金額の仕訳がゼロ")
                 print(f"⚠️ {reason} → 認識不能として記録")
             self._write_unrecognized_row(ws, tab_name, entries_data, source_url)
-            return
+            return APPEND_RESULT_PLACEHOLDER
 
         rows = block.rows
         anomaly_flags_list = block.anomaly_flags
@@ -722,6 +727,10 @@ class SheetsOutputWriter:
         self._sanitize_trailing_once(ws, tab_name, end_row)
 
         print(f"💾 Sheets に {len(rows)} 行追加: {tab_name}")
+        # B7 T3①: 挙動不変の情報開示のみ（中8 裁決）。consumer(main側の頁級
+        # 進捗フック)が「entries>0 だが全行金額0で占位行に転落」を POSTED と
+        # 誤報しないよう、実際にどちらへ落ちたかを戻り値で正確に伝える。
+        return APPEND_RESULT_POSTED
 
     def _get_or_create_audit_tab(self):
         """除外ページ監査タブを取得（なければ作成）。

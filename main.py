@@ -21,11 +21,19 @@ from ocr_engine import (
     EXCLUDE_DEST_AUDIT_TAB, EXCLUDE_DEST_MF_TAB, process_pipeline,
 )
 from sheets_output import (
+    APPEND_RESULT_PLACEHOLDER,
     AUDIT_VERDICT_BRANCH, AUDIT_VERDICT_DRIFT, AUDIT_VERDICT_EXCLUDED,
     AUDIT_VERDICT_MISSING, SheetsOutputWriter,
 )
 from notifier import send_notification
 from doc_types import DocType, DOC_TYPE_CONFIG
+from page_progress import (
+    NULL_REPORTER, OUTCOME_EXCLUDED, OUTCOME_FAILED, OUTCOME_PLACEHOLDER,
+    OUTCOME_POSTED, STATUS_ABORTED, STATUS_COMPLETED,
+    STATUS_COMPLETED_COVERAGE_GAP, STATUS_FAILED_RETAINED,
+    STATUS_PARSE_FAILED, STATUS_PARTIAL_ERROR, SheetsProgressReporter,
+    utc_now,
+)
 import config
 import firestore_report
 import intake_guard
@@ -492,7 +500,8 @@ def _report_headless_outcome(reporter, base, lease_epoch, outcome, file_id, cycl
 
 def _process_one_file(service, writer, reporter, file, input_folder_id, doc_type,
                       processed_folder_id, split_pdf_folder_id, quarantine_alerted,
-                      headless_memo, intake_state_memo, cycle):
+                      headless_memo, intake_state_memo, cycle, *,
+                      progress_reporter=None):
     """1 ファイルの取り込み～記帳～終態処理（main() の for file in files: 本体を
     可測化のため抽出、ロジック改変なし——IP-303/304/306/308 全接線の実体）。
 
@@ -587,6 +596,9 @@ def _process_one_file(service, writer, reporter, file, input_folder_id, doc_type
         doc_type=doc_type, drive_file_id=file_id,
         split_pdf_folder_id=split_pdf_folder_id,
         base=base, ledger=ledger,
+        # Sheets 進捗タブは UI 版のみ接続（headless の頁級可視化権威は
+        # 控制面 page_outcomes——B7-2 Plan §2 非目標）。
+        progress=progress_reporter if ledger is None else None,
     )
 
     if ledger is not None:
@@ -1265,7 +1277,37 @@ def _write_audit_fallback_row(sheets_writer, uploader_name, doc_type, filename,
 
 def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
                   doc_type=DocType.RECEIPT, drive_file_id=None,
-                  split_pdf_folder_id="", base=None, ledger=None):
+                  split_pdf_folder_id="", base=None, ledger=None,
+                  progress=None):
+    """process_file の薄い外殻（B7 T3）。
+
+    進捗フックの発火（file_started／未預期例外時の ABORTED best-effort 記録）
+    だけを担い、実処理は _process_file_impl に委譲する。progress 未指定
+    (None) なら NULL_REPORTER に落ちるため、既存の呼び出し側・テストは
+    完全に従来どおり動く（無回帰）。base/ledger（headless 経路）も
+    そのまま impl へ貫通する（merge B7-2：main 外殻×headless 分流の合成）。
+    """
+    progress = progress or NULL_REPORTER
+    filename = os.path.basename(file_path)
+    progress.file_started(filename, uploader_name, doc_type)
+    try:
+        return _process_file_impl(
+            service, sheets_writer, file_path, uploader_name, chat_id,
+            doc_type=doc_type, drive_file_id=drive_file_id,
+            split_pdf_folder_id=split_pdf_folder_id, base=base, ledger=ledger,
+            progress=progress)
+    except Exception as e:
+        # best-effort: 進捗記録は reporter 自身が内部で自吞するが、二重の
+        # 安全網として元例外を必ずそのまま伝播させる（main loop の既存の
+        # 檔滯留・再試行語義は一切不変）。
+        progress.file_finished(STATUS_ABORTED, error_class=type(e).__name__)
+        raise
+
+
+def _process_file_impl(service, sheets_writer, file_path, uploader_name,
+                       chat_id, doc_type=DocType.RECEIPT, drive_file_id=None,
+                       split_pdf_folder_id="", base=None, ledger=None, *,
+                       progress):
     """ファイルを処理し、Google Sheets に逐次書き込み、通知を送信する。
 
     ledger 非 None（HEADLESS_MODE）は頁級緩衝集約＋硬去重の経路へ分流し ProcessOutcome
@@ -1315,12 +1357,20 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
         seen_page_nums.add(page_num)
         last_total_pages = total_pages
         count += 1
+
+        def _emit(outcome, reason):
+            # 頁終局の進捗発射を一点に集約（発射時 UTC の刻印込み）。同一
+            # 迭代内で同期呼出しかされないため閉包の遅延束縛対策は不要
+            # （simcodex R2 裁決）。
+            progress.page_done(page_num, total_pages, outcome, reason,
+                               utc_now())
         # 再試可能なページエラーは Sheets へ書き込まない
         # （全頁失敗時は Failed を返しファイルを保持するため、
         #  次回再試行で同じページの占位行が重複生成されるのを防ぐ）
         if result.get("_page_error"):
             error_pages += 1
             failed_page_nums.append(page_num)
+            _emit(OUTCOME_FAILED, "page_error")
             continue
 
         # IP-401 T1/T2: 封筒等の除外ページは MF データ区に一切書かず、独立の
@@ -1344,9 +1394,14 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
                 failed_page_notes[page_num] = (
                     result.get("memo")
                     or f"除外ページ({result.get('_exclude_reason', 'unknown')})")
+                _emit(OUTCOME_FAILED, "exclude_record_failed")
                 continue
             excluded_pages += 1
             excluded_page_nums.append(page_num)
+            # 低11 裁決: 落地形式（監査タブ/MF 提示行）を問わず、_excluded_page
+            # の頁は恒に EXCLUDED。PLACEHOLDER は非除外頁が占位行に終わった
+            # 場合のみ（append_entries 戻り値の分岐、下記）。
+            _emit(OUTCOME_EXCLUDED, result.get("_exclude_reason", "unknown"))
             continue
 
         entries = result.get('entries', [])
@@ -1359,12 +1414,19 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
         page_bytes = page.get("page_bytes")
         source_url = resolver.resolve(page_num, total_pages, page_bytes)
         result['uploader'] = uploader_name
-        sheets_writer.append_entries(
+        write_result = sheets_writer.append_entries(
             employee_name=uploader_name,
             doc_type=doc_type,
             entries_data=result,
             source_url=source_url,
         )
+        # 中8 裁決: entries>0 でも append_entries 内部で占位行に転落した頁を
+        # POSTED と誤報しない（sheets_output.append_entries の戻り値で正確に
+        # 判定。戻り値を返さない duck-typed writer は POSTED 扱いに倒す）。
+        if write_result == APPEND_RESULT_PLACEHOLDER:
+            _emit(OUTCOME_PLACEHOLDER, "unrecognized")
+        else:
+            _emit(OUTCOME_POSTED, "")
 
         # IP-401 T2/R2: entries は有効だが封筒シグナルも命中したページ。
         # 記帳は止めず（Gemini 優先＝Strategy C 交差検証の設計意図）、Gemini が
@@ -1427,6 +1489,7 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
             details=f"全ページ処理エラー（{error_pages}/{count}頁）。API障害または認証エラーの可能性。ファイルは保持されます。"
         )
         print(f"⚠️ 全ページ処理エラー: {error_pages}/{count} → Failed（ファイル保持）")
+        progress.file_finished(STATUS_FAILED_RETAINED)
         return False
 
     # 部分ページエラー: 成功頁は既に書き込み済み、失敗頁は占位行で可視化
@@ -1475,6 +1538,15 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
             chat_id=chat_id,
             details=details,
         )
+        # 中6 裁決: partial_error は coverage gap より優先。頁欠落があるだけの
+        # 完了は「完了（頁欠落あり）」——「完了」と偽って矛盾させない。
+        if partial_error:
+            file_status = STATUS_PARTIAL_ERROR
+        elif missing_pages:
+            file_status = STATUS_COMPLETED_COVERAGE_GAP
+        else:
+            file_status = STATUS_COMPLETED
+        progress.file_finished(file_status)
         return True
     else:
         send_notification(
@@ -1485,6 +1557,7 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
             details="AIによる解析に失敗しました。ファイルを確認してください。"
         )
         print("⚠️ 解析に失敗しました")
+        progress.file_finished(STATUS_PARSE_FAILED)
         return False
 
 
@@ -1565,6 +1638,27 @@ def build_writers(profiles, credentials_file):
     return writers
 
 
+def build_progress_reporters(writers):
+    """writer ごとに SheetsProgressReporter を作る（B7 T4）。
+
+    build_writers と同じ縮退方針: 進捗レポーターの初期化失敗（例:
+    writer.spreadsheet 参照エラー等）はプロファイル単位で吸収し、当該
+    プロファイルは辞書から欠落させて続行する（消費側は .get(None) で受ける。
+    進捗タブが無くても記帳自体は止めない——進捗可視化は付帯機能であり、
+    記帳の可用性を道連れにしない）。
+
+    Returns: {profile_key: SheetsProgressReporter}（失敗プロファイルは欠落）
+    """
+    reporters = {}
+    for profile_key, writer in writers.items():
+        try:
+            reporters[profile_key] = SheetsProgressReporter(writer.spreadsheet)
+        except Exception as e:
+            print(f"⚠️ [{profile_key}] 進捗レポーターを初期化できません"
+                  f"（進捗タブなしで続行）: {e}")
+    return reporters
+
+
 def filter_active_folders(folder_map, writers):
     """writer を作れなかったプロファイルの入力フォルダを監視対象から外す。"""
     return {fid: entry for fid, entry in folder_map.items()
@@ -1609,6 +1703,12 @@ def main():
     intake_state_memo: dict = {}
     cycle = 0
 
+    # B7 T4: プロファイルごとの進捗レポーター（Sheets `_処理進捗` タブ）。
+    # 生成失敗は build_writers と同じ粒度で縮退——進捗タブが無くても記帳は続行。
+    # 変数名は headless の Firestore 入口守衛 reporter と衝突させない
+    # （progress_reporter ＝人向け進捗可視化／reporter ＝ Firestore 回報）。
+    progress_reporters = build_progress_reporters(writers)
+
     active_folder_map = filter_active_folders(folder_map, writers)
     if not active_folder_map:
         # 接続できたプロファイルに入力フォルダが1つも無い状態。ループに入ると
@@ -1651,6 +1751,7 @@ def main():
 
                 profile = profiles[profile_key]
                 writer = writers[profile_key]
+                progress_reporter = progress_reporters.get(profile_key)
                 processed_folder_id = profile["processed_folder_id"]
 
                 found_any = True
@@ -1663,7 +1764,8 @@ def main():
                         service, writer, reporter, file, input_folder_id,
                         doc_type, processed_folder_id,
                         profile["split_pdf_folder_id"], quarantine_alerted,
-                        headless_memo, intake_state_memo, cycle)
+                        headless_memo, intake_state_memo, cycle,
+                        progress_reporter=progress_reporter)
 
             if not found_any:
                 print(".", end="", flush=True)
