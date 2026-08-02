@@ -508,14 +508,14 @@ class AlertReasonStatsTest(unittest.TestCase):
 
         self.assertEqual(client.alerts_store["file-1"]["reason"], "job_not_found")
 
-    def test_same_reason_accumulates_occurrences(self):
+    def test_same_reason_accumulates_write_count(self):
         reporter, client, _, _ = _make_reporter()
 
         for _ in range(3):
             reporter.write_alert("file-1", {"reason": "no_posting_id"})
 
         entry = client.alerts_store["file-1"]["reason_stats"]["no_posting_id"]
-        self.assertEqual(entry["occurrences"], 3)
+        self.assertEqual(entry["write_count"], 3)
 
     def test_first_seen_is_kept_and_last_seen_advances(self):
         reporter, client, _, _ = _make_reporter()
@@ -527,6 +527,23 @@ class AlertReasonStatsTest(unittest.TestCase):
 
         self.assertEqual(second["first_seen_at"], first["first_seen_at"])
         self.assertGreaterEqual(second["last_seen_at"], first["last_seen_at"])
+
+    def test_legacy_occurrences_is_carried_over_on_rename(self):
+        """改名前の `occurrences` を数え直さない（simcodex R4・codex 指摘採納）。
+
+        本番（main 分支）には存在しない字段だが、本分支で真 Firestore 往返を
+        試した環境には残り得る。1 へ戻すのは静かなデータ損失。
+        """
+        reporter, client, _, _ = _make_reporter()
+        client.alerts_store["file-1"] = {
+            "reason": "no_posting_id",
+            "reason_stats": {"no_posting_id": {"occurrences": 7}},
+        }
+
+        reporter.write_alert("file-1", {"reason": "no_posting_id"})
+
+        entry = client.alerts_store["file-1"]["reason_stats"]["no_posting_id"]
+        self.assertEqual(entry["write_count"], 8)
 
     def test_kind_is_used_when_reason_absent(self):
         """`customer_metadata_missing` 系は reason を持たず kind で区別される。"""
@@ -583,20 +600,20 @@ class AlertReasonStatsTest(unittest.TestCase):
     def test_read_failure_never_fabricates_a_count(self):
         """**嘘をつくカウンタはカウンタが無いより悪い**（simcodex R2 の要害）。
 
-        読めなかった回に occurrences=1 を書くと、ディスク上の本物の 7 が 1 へ
+        読めなかった回に write_count=1 を書くと、ディスク上の本物の 7 が 1 へ
         書き潰される。据置くのが正しい。
         """
         reporter, client, _, _ = _make_reporter()
         for _ in range(3):
             reporter.write_alert("file-1", {"reason": "no_posting_id"})
         before = dict(client.alerts_store["file-1"]["reason_stats"]["no_posting_id"])
-        self.assertEqual(before["occurrences"], 3)
+        self.assertEqual(before["write_count"], 3)
 
         self._break_alert_reads(client)
         reporter.write_alert("file-1", {"reason": "no_posting_id"})
 
         after = client.alerts_store["file-1"]["reason_stats"]["no_posting_id"]
-        self.assertEqual(after["occurrences"], 3)
+        self.assertEqual(after["write_count"], 3)
 
     def test_read_failure_marks_the_document_as_stale(self):
         """黙って劣化させない。控制面が「厳密な現況ではない」と判る形で残す。"""

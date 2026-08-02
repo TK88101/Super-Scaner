@@ -557,7 +557,8 @@ def _resolve_tab_owner(customer_id, customer_label):
 def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_type,
                       processed_folder_id, split_pdf_folder_id, quarantine_alerted,
                       headless_memo, intake_state_memo, cycle, *,
-                      progress_reporter=None, customer_meta_alerted=None):
+                      progress_reporter=None, customer_meta_alerted=None,
+                      provider_sink=None):
     """1 ファイルの取り込み～記帳～終態処理（main() の for file in files: 本体を
     可測化のため抽出、ロジック改変なし——IP-303/304/306/308 全接線の実体）。
 
@@ -678,7 +679,6 @@ def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_
     # job_reporter と同一 Firestore client を再利用、witness probe は writer 提供。
     ledger = None
     page_outcomes = None
-    provider_sink = None
     if job_reporter is not None and base is not None:
         from posting_ledger import PostingLedger
         ledger = PostingLedger(
@@ -687,13 +687,6 @@ def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_
         # client は檔級回報（job_reporter＝job 状態）と同一を再利用。
         from firestore_progress import FirestorePageOutcomesReporter
         page_outcomes = FirestorePageOutcomesReporter(job_reporter.client, base)
-        # provider 事件（契約 §5.7、B8）。**ファイル毎に作り直す**のが肝——
-        # 上限カウンタ（job×provider×error_class で 20 件）を件を跨いで
-        # 持ち回すと、前の件の障害で使い切った予算のせいで次の件の事象が
-        # 黙って書かれなくなる。集合自体はトップレベルなので、writer の
-        # 寿命を件に揃えても控制面から見える形は変わらない。
-        from provider_events import ProviderEventWriter
-        provider_sink = ProviderEventWriter(job_reporter.client)
 
     # PDF 間分割線 + 取引No リセットは UI 版のみ（headless は取引No を
     # Sheets A 列から都度再構築＝崩潰重跑冪等、分割線リセットは不要・有害）。
@@ -713,8 +706,11 @@ def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_
             page_outcomes=page_outcomes,
             # §5.1-d T4: headless の Sheets tab キー（None＝UI 版、行為零改動）。
             tab_owner=tab_owner,
-            # §5.7 B8: provider 事件の書込口（None＝UI 版、行為零改動）。
-            event_sink=provider_sink,
+            # §5.7 B8: provider 事件の書込口。**ループが持つ 1 個**を貫通させる
+            # （檔ごとに作ると配額が檔ごとに再配分され、障害中に小さな檔が
+            # 連続した時に総書込量の上界が消える——simcodex R4）。
+            # UI 版は None が渡り、行為零改動。
+            event_sink=provider_sink if ledger is not None else None,
         )
     finally:
         if page_outcomes is not None:
@@ -1912,6 +1908,16 @@ def main():
     # 該当キーを解除（再発時に再 alert）。プロセス再起動で自然に消える
     # （alert 自体は文書 ID 冪等なので再送は無害＝重複可視化にはならない）。
     customer_meta_alerted: dict = {}
+    # provider 事件の書込口（契約 §5.7、B8）。**ループで 1 個**を持ち回す——
+    # 配額（provider×error_class ごと滑動 10 分窓）が檔ごとに再配分されると、
+    # provider 全面障害中に小さな檔が次々来た時に各檔が上限ぶん書き、総書込量の
+    # 上界が消える（simcodex R4 の Codex 独立評審で判明）。断路器は provider 単位・
+    # 10 分窓で裁くので、封じる側も同じ軸・同じ寿命に揃える。
+    # UI 版（job_reporter=None）では作らない＝行為零改動。
+    provider_sink = None
+    if job_reporter is not None:
+        from provider_events import ProviderEventWriter
+        provider_sink = ProviderEventWriter(job_reporter.client)
     cycle = 0
 
     # B7 T4: プロファイルごとの進捗レポーター（Sheets `_処理進捗` タブ）。
@@ -1977,7 +1983,8 @@ def main():
                         profile["split_pdf_folder_id"], quarantine_alerted,
                         headless_memo, intake_state_memo, cycle,
                         progress_reporter=progress_reporter,
-                        customer_meta_alerted=customer_meta_alerted)
+                        customer_meta_alerted=customer_meta_alerted,
+                        provider_sink=provider_sink)
 
             if not found_any:
                 print(".", end="", flush=True)

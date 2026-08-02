@@ -17,9 +17,17 @@ Gemini／PaddleOCR を各々 provider 単位で計数する」と要求するが
 
 1. **粒度＝頁級 1 件**。断路器の閾値は「連続 5 件」なので、頁を跨いで集約すると
    本物の provider 障害が閾値に届かず永久に熔断しない。集約は禁物。
-2. **上限＝同一 `job_id`×`provider`×`error_class` で 20 件**（`DEFAULT_JOB_CAP`）。
-   500 頁の件で provider が全面障害を起こしたときに 500 件書かないための封頂。
-   閾値 5 を十分上回るので、封頂によって熔断信号が埋もれることはない。
+2. **上限＝`provider`×`error_class` ごと、滑動 10 分窓で 20 件**（`DEFAULT_CAP` /
+   `CAP_WINDOW`）。500 頁の件で provider が全面障害を起こしたときに 500 件
+   書かないための封頂。閾値 5 を十分上回るので熔断信号は埋もれない。
+   **窓と軸を断路器（provider 単位・10 分）に揃えてあるのが要点**（simcodex R4
+   改訂）：初版は「job ごと・檔ごとに配り直す」形だったが、それだと障害中に
+   小さな檔が次々来た時に各檔が 20 件ずつ書き、全体の書込量に上界が無かった
+   ——封頂の目的そのものを果たしていなかった。したがって **writer は檔ごとに
+   作らず、プロセスで 1 個を持ち回す**（`main` のループが保持）。
+   限流に入ったことは黙らせない（日誌＋`suppressed_count`）——静默に打ち切ると
+   「20 頁しか失敗しなかった」のか「数百頁失敗して限流された」のかが
+   排障時に区別できなくなる。
 3. **書込失敗は本来の OCR 失敗を隠さない**。本モジュールは決して例外を伝播せず、
    書けたか否かを bool で返すだけ——事件記録の失敗で票の処理が落ちたら本末転倒。
 
@@ -31,7 +39,7 @@ Gemini／PaddleOCR を各々 provider 単位で計数する」と要求するが
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 # --- 契約権威値（§5.7 字段表・§5.4 三分類。勿臆造） ---------------------------
@@ -43,7 +51,16 @@ COLLECTION = "provider_events"
 
 # 断路器の閾値は 5 件（§5.4）。封頂はそれを十分上回る値でなければ、封頂自体が
 # 熔断を妨げる——`test_cap_does_not_starve_the_breaker_threshold` が番人。
-DEFAULT_JOB_CAP = 20
+# 5 ちょうどまで絞らない理由は二つ：①契約 §9 が断路器パラメータを「宽松起步・
+# U7 benchmark 後に逐步缩减」と定めており、SS 側が先回りして締めるべきでない
+# ②§5.4 の文言は「**連続** 5 件」であり、厳密な時系列連続なら間に
+# NON_RETRYABLE が挟まった時に 5 では届かない可能性がある（語義の確認は
+# 控制面側の遺留事項）。
+DEFAULT_CAP = 20
+
+# 配額の滑動窓。**断路器と同じ 10 分**（§5.4）に揃える——封じる側と裁く側が
+# 別の時間軸で動くと、どちらから見ても辻褄の合わない挙動になる。
+CAP_WINDOW = timedelta(minutes=10)
 
 # `firestore_progress.SET_TIMEOUT_SECONDS` と同値・同理由（吊るされた Firestore が
 # OCR を止めないための上限）。定数を共有しないのは、あちらが page_progress →
@@ -80,23 +97,31 @@ def _event_id(job_id: str | None, page: int | None,
 class ProviderEventWriter:
     """`provider_events/{event_id}` への書込口（§5.7）。
 
-    上限カウンタはプロセス内 dict。再起動で消えるのは意図どおり——再起動＝
-    新しい一巡であり、そこから 20 件の予算を配り直すのが自然。永続化すると
-    「昨日の障害の残額で今日の障害が書けない」という理解しにくい挙動になる。
+    **プロセスで 1 個**を持ち回す（`main` のループが保持）。檔ごとに作り直すと
+    配額が檔ごとに再配分され、障害中に小さな檔が連続した時に上界が消える
+    （simcodex R4 で塞いだ穴）。
+
+    配額の状態はプロセス内 dict で、再起動で消えるのは意図どおり——滑動窓が
+    10 分なので、再起動後に一巡ぶん多く書けても総量は窓の粒度に収まる。
+    永続化すると「昨日の障害の残額で今日の障害が書けない」という理解しにくい
+    挙動を招くうえ、断路器自身も状態を持たない側に倒れている（§5.7）。
     """
 
     def __init__(self, client: Any, *, collection: str = COLLECTION,
-                 job_cap: int = DEFAULT_JOB_CAP) -> None:
+                 cap: int = DEFAULT_CAP, clock=_utcnow) -> None:
         self._client = client
         self._collection = collection
-        self._job_cap = job_cap
-        # cap_key → 既書 event_id の集合。**冪等判定と上限計数を同じ構造に
-        # 載せる**のが肝（simplify R1 採納）：別々に持つと「冪等な再記録は上限を
-        # 食わない」という不変式が「二つとも触らないのを憶えている」ことでしか
-        # 保てず、片方だけ進める編集で静かに壊れる。集合の要素数がそのまま
-        # 上限判定になるので、構造として壊れなくなる。
-        self._seen: dict[tuple[str, str, str], set[str]] = {}
-        self._warned = False                     # 書込失敗の日誌は檔内 1 回
+        self._cap = cap
+        self._clock = clock
+        # cap_key＝(provider, error_class) → {event_id: 書込時刻}。
+        # **冪等判定と配額計数を同じ構造に載せる**のが肝（simplify R1 採納）：
+        # 別々に持つと「冪等な再記録は配額を食わない」という不変式が「二つとも
+        # 触らないのを憶えている」ことでしか保てず、片方だけ進める編集で静かに
+        # 壊れる。窓内の要素数がそのまま配額判定になるので構造として壊れない。
+        self._seen: dict[tuple[str, str], dict[str, datetime]] = {}
+        self._suppressed: dict[tuple[str, str], int] = {}
+        self._warned = False                     # 書込失敗の日誌は 1 回
+        self._suppress_logged: set[tuple[str, str]] = set()
 
     def record(self, *, provider: str, error_class: str,
                page: int | None = None, job_id: str | None = None) -> bool:
@@ -123,17 +148,34 @@ class ProviderEventWriter:
                 f"page は int か None のみ（脱敏白名単）。受領型: {type(page).__name__}"
             )
 
+        now = self._clock()
         event_id = _event_id(job_id, page, provider, error_class)
-        seen = self._seen.setdefault((job_id or "-", provider, error_class), set())
+        cap_key = (provider, error_class)
+        seen = self._seen.setdefault(cap_key, {})
+
+        # 窓外へ出た分は配額が戻る。一度の障害が口を永久に塞がないため。
+        for stale in [e for e, t in seen.items() if now - t >= CAP_WINDOW]:
+            del seen[stale]
+
         if event_id in seen:
-            return False                          # 冪等：上限も消費しない
-        if len(seen) >= self._job_cap:
+            return False                          # 冪等：配額も消費しない
+        if len(seen) >= self._cap:
+            self._suppressed[cap_key] = self._suppressed.get(cap_key, 0) + 1
+            if cap_key not in self._suppress_logged:
+                # 黙って打ち切らない——「20 頁しか失敗しなかった」のか
+                # 「数百頁失敗したが限流された」のかを排障者が区別できるように。
+                # 日誌は cap_key ごと 1 回（総数は suppressed_count で取れる）。
+                print(
+                    f"provider 事件の書込を限流（{CAP_WINDOW} 窓内 {self._cap} 件到達）"
+                    f" provider={provider} error_class={error_class}"
+                )
+                self._suppress_logged.add(cap_key)
             return False
 
         payload: Mapping[str, Any] = {
             "provider": provider,
             "error_class": error_class,
-            "occurred_at": _utcnow(),
+            "occurred_at": now,
             "job_id": job_id,
         }
         try:
@@ -148,7 +190,11 @@ class ProviderEventWriter:
                     f" event_id={event_id} error_type={type(exc).__name__}"
                 )
                 self._warned = True
-            return False                          # 上限も消費しない（復旧後に書ける）
+            return False                          # 配額も消費しない（復旧後に書ける）
 
-        seen.add(event_id)
+        seen[event_id] = now
         return True
+
+    def suppressed_count(self, provider: str, error_class: str) -> int:
+        """限流で書かれなかった件数（診断信号）。控制面へは送らない。"""
+        return self._suppressed.get((provider, error_class), 0)

@@ -7,7 +7,7 @@
 import io
 import unittest
 from contextlib import redirect_stdout
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import provider_events as pe
 
@@ -185,13 +185,35 @@ class IdempotencyTest(unittest.TestCase):
         self.assertEqual(len(client.store), 2)
 
 
-# --- 書込頻度上限（趙裁定＝job×provider×error_class ごと 20 件で打止め） -----
+# --- 書込頻度上限（趙裁定 2026-08-03 改訂＝provider×error_class×滑動 10 分窓） ---
+#
+# 初版は「job×provider×error_class ごと 20 件・**檔ごとに再配分**」だった。
+# simcodex R4 の Codex 独立評審が致命的な穴を指摘：檔ごとに配り直すと、
+# provider 全面障害中に小さな檔が連続して来れば**各檔が 20 件ずつ書く**ので
+# 全体の書込量に上界が無い。封頂の目的そのものを果たしていなかった。
+# 断路器は provider 単位・10 分窓で裁くのだから、封じる側も同じ軸に揃える。
+
+
+class _FakeClock:
+    """注入可能な時計。滑動窓の検証で実時間を待たないため。"""
+
+    def __init__(self, start):
+        self.now = start
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, **kwargs):
+        self.now = self.now + timedelta(**kwargs)
+
+
+_T0 = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
 
 
 class CapTest(unittest.TestCase):
     def test_cap_stops_writing_beyond_limit(self):
         client = FakeClient()
-        w = _writer(client, job_cap=20)
+        w = _writer(client, cap=20)
 
         for page in range(1, 101):
             w.record(provider="gemini_ocr", error_class="RETRYABLE",
@@ -200,12 +222,32 @@ class CapTest(unittest.TestCase):
         self.assertEqual(len(client.store), 20)
 
     def test_cap_does_not_starve_the_breaker_threshold(self):
-        """断路器は 5 件で熔断。上限 20 はそれを埋めない（回帰防止の明示）。"""
-        self.assertGreater(pe.DEFAULT_JOB_CAP, 5)
+        """断路器は 5 件で熔断。上限 20 はそれを埋めない（回帰防止の明示）。
 
-    def test_cap_is_per_job_provider_error_class(self):
+        契約 §9 は断路器パラメータを「宽松起步、U7 benchmark 後に逐步缩减」と
+        定めるので、SS 側が先回りして 5 ちょうどまで絞らない。加えて §5.4 の
+        文言は「**連続** 5 件」であり、厳密な時系列連続だとすると間に
+        NON_RETRYABLE が挟まった場合 5 では足りない可能性がある。
+        """
+        self.assertGreater(pe.DEFAULT_CAP, 5)
+
+    def test_cap_is_shared_across_jobs(self):
+        """**檔を跨いで効く**のが眼目（simcodex R4 で塞いだ穴）。
+
+        障害中に小さな檔が次々来ても、provider 単位の総書込量に上界がある。
+        """
         client = FakeClient()
-        w = _writer(client, job_cap=2)
+        w = _writer(client, cap=2)
+
+        for job in ("job-1", "job-2", "job-3"):
+            w.record(provider="gemini_ocr", error_class="RETRYABLE",
+                     job_id=job, page=1)
+
+        self.assertEqual(len(client.store), 2)
+
+    def test_cap_is_per_provider_and_error_class(self):
+        client = FakeClient()
+        w = _writer(client, cap=2)
 
         for page in (1, 2, 3):
             w.record(provider="gemini_ocr", error_class="RETRYABLE",
@@ -213,33 +255,59 @@ class CapTest(unittest.TestCase):
         for page in (1, 2, 3):
             w.record(provider="paddleocr", error_class="RETRYABLE",
                      job_id="job-1", page=page)
+        for page in (1, 2, 3):
+            w.record(provider="gemini_ocr", error_class="UNKNOWN",
+                     job_id="job-1", page=page)
 
-        self.assertEqual(len(client.store), 4)
+        self.assertEqual(len(client.store), 6)
+
+    def test_quota_recovers_after_the_window_slides(self):
+        """10 分窓を過ぎた分は配額が戻る（一度の障害が永久に口を塞がない）。"""
+        client = FakeClient()
+        clock = _FakeClock(_T0)
+        w = _writer(client, cap=2, clock=clock)
+
+        for page in (1, 2, 3):
+            w.record(provider="gemini_ocr", error_class="RETRYABLE",
+                     job_id="job-1", page=page)
+        self.assertEqual(len(client.store), 2)
+
+        clock.advance(minutes=11)
+        w.record(provider="gemini_ocr", error_class="RETRYABLE",
+                 job_id="job-1", page=4)
+
+        self.assertEqual(len(client.store), 3)
+
+    def test_quota_still_blocked_inside_the_window(self):
+        client = FakeClient()
+        clock = _FakeClock(_T0)
+        w = _writer(client, cap=2, clock=clock)
+
+        for page in (1, 2):
+            w.record(provider="gemini_ocr", error_class="RETRYABLE",
+                     job_id="job-1", page=page)
+        clock.advance(minutes=9)
+        w.record(provider="gemini_ocr", error_class="RETRYABLE",
+                 job_id="job-1", page=3)
+
+        self.assertEqual(len(client.store), 2)
+
+    def test_window_matches_the_breaker_window(self):
+        self.assertEqual(pe.CAP_WINDOW, timedelta(minutes=10))
 
     def test_record_reports_whether_it_wrote(self):
         client = FakeClient()
-        w = _writer(client, job_cap=1)
+        w = _writer(client, cap=1)
 
         self.assertTrue(w.record(provider="gemini_ocr", error_class="RETRYABLE",
                                  job_id="job-1", page=1))
         self.assertFalse(w.record(provider="gemini_ocr", error_class="RETRYABLE",
                                   job_id="job-1", page=2))
 
-    def test_cap_counts_are_independent_across_jobs(self):
-        client = FakeClient()
-        w = _writer(client, job_cap=1)
-
-        w.record(provider="gemini_ocr", error_class="RETRYABLE",
-                 job_id="job-1", page=1)
-        w.record(provider="gemini_ocr", error_class="RETRYABLE",
-                 job_id="job-2", page=1)
-
-        self.assertEqual(len(client.store), 2)
-
     def test_repeated_same_event_does_not_consume_cap(self):
         """冪等な再記録で上限を食い潰すと、後続の別頁が黙って落ちる。"""
         client = FakeClient()
-        w = _writer(client, job_cap=2)
+        w = _writer(client, cap=2)
 
         for _ in range(10):
             w.record(provider="gemini_ocr", error_class="RETRYABLE",
@@ -248,6 +316,44 @@ class CapTest(unittest.TestCase):
                  job_id="job-1", page=2)
 
         self.assertEqual(len(client.store), 2)
+
+
+class SuppressionIsVisibleTest(unittest.TestCase):
+    """封頂に達したことを黙って隠さない（simcodex R4 採納）。
+
+    静默に打ち切ると、排障者が「20 頁しか失敗しなかった」のか
+    「数百頁失敗したが限流された」のかを区別できない。
+    """
+
+    def test_reaching_the_cap_is_logged(self):
+        w = _writer(FakeClient(), cap=2)
+
+        with redirect_stdout(io.StringIO()) as out:
+            for page in (1, 2, 3):
+                w.record(provider="gemini_ocr", error_class="RETRYABLE",
+                         job_id="job-1", page=page)
+
+        self.assertIn("provider 事件の書込を限流", out.getvalue())
+
+    def test_suppression_log_is_not_repeated_per_page(self):
+        w = _writer(FakeClient(), cap=2)
+
+        with redirect_stdout(io.StringIO()) as out:
+            for page in range(1, 101):
+                w.record(provider="gemini_ocr", error_class="RETRYABLE",
+                         job_id="job-1", page=page)
+
+        self.assertEqual(out.getvalue().count("provider 事件の書込を限流"), 1)
+
+    def test_suppressed_count_is_reported(self):
+        """何件抑制されたかは呼出側から取れる（診断信号）。"""
+        w = _writer(FakeClient(), cap=2)
+
+        for page in range(1, 11):
+            w.record(provider="gemini_ocr", error_class="RETRYABLE",
+                     job_id="job-1", page=page)
+
+        self.assertEqual(w.suppressed_count("gemini_ocr", "RETRYABLE"), 8)
 
 
 # --- 書込失敗が本来の OCR 失敗を隠さない（Codex R1 P1 由来の規則） ------------
@@ -265,7 +371,7 @@ class WriteFailureIsolationTest(unittest.TestCase):
     def test_firestore_failure_does_not_consume_cap(self):
         """失敗を上限に数えると、復旧後に本物の事象が書けなくなる。"""
         client = FakeClient(fail=True)
-        w = _writer(client, job_cap=1)
+        w = _writer(client, cap=1)
         w.record(provider="gemini_ocr", error_class="RETRYABLE",
                  job_id="job-1", page=1)
 

@@ -235,6 +235,37 @@ class _NullClient:
         raise AssertionError("値域検証で落ちるので書込には到達しないはず")
 
 
+class SinkLifetimeTest(unittest.TestCase):
+    """sink は**ループが 1 個持つ**（檔ごとに作らない）＝simcodex R4 の修正点。
+
+    檔ごとに作り直すと配額が檔ごとに再配分され、provider 全面障害中に小さな
+    檔が次々来た時に各檔が上限ぶん書く——総書込量の上界が消え、封頂が目的を
+    果たさなくなる。配額の挙動そのものは `test_provider_events.CapTest` が
+    単体で守るが、**「誰が writer を持つか」は外から観測できない**ので、
+    ここは意図的に源コードを検査する（生産経路を二檔ぶん実走させるには
+    Drive/Sheets/Firestore の依存を丸ごと組む必要があり、割に合わない）。
+    """
+
+    def test_per_file_helper_does_not_construct_its_own_writer(self):
+        import inspect
+
+        import main
+
+        src = inspect.getsource(main._process_one_file)
+        self.assertNotIn(
+            "ProviderEventWriter", src,
+            "檔ごとの writer 生成は配額を檔ごとに配り直す＝封頂が効かなくなる。"
+            "ループ側で 1 個作り provider_sink として渡すこと")
+
+    def test_per_file_helper_receives_the_shared_sink(self):
+        import inspect
+
+        import main
+
+        self.assertIn("provider_sink",
+                      inspect.signature(main._process_one_file).parameters)
+
+
 class VisionFallbackAnomalyTest(unittest.TestCase):
     """Vision 兜底が None を返した頁も断路器から見えること（simcodex R3）。
 

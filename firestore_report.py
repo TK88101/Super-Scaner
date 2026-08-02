@@ -135,18 +135,29 @@ def _merged_reason_stats(existing: Mapping[str, Any], reason_code: str,
                          now: datetime) -> dict[str, Any]:
     """`reason_stats` を 1 原因ぶん進めた**新しい** dict を返す（就地改変せず）。
 
-    同一原因＝occurrences を増やし last_seen_at のみ進める（first_seen_at は
-    初回の値を保つ）。別原因＝新しいキーとして並置する——これが D3 の眼目で、
+    同一原因＝`write_count` を増やし `last_seen_at` のみ進める（`first_seen_at`
+    は初回の値を保つ）。別原因＝新しいキーとして並置する——これが D3 の眼目で、
     異因が覆い消されないことそのもの。
+
+    **`write_count` は「書込に成功した回数」であって「業務事象の発生回数」では
+    ない**（simcodex R4・Codex 指摘採納）。この加算自体は冪等でなく、次の二つで
+    実際より多く数え得る：①`alerted` はプロセス内キャッシュなので、再起動を
+    挟むと「alert 済み・move 未了」の件が再び書かれる ②書込がサーバ側で成功
+    したのに応答受領前に失敗した場合の再試行。正確な業務事象数が要るなら別建て
+    の事象流が要る——名前で嘘をつかないため `occurrences` とは呼ばない。
     """
     prior = existing.get(reason_code)
     prior = prior if isinstance(prior, Mapping) else {}
-    occurrences = prior.get("occurrences")
-    occurrences = occurrences + 1 if isinstance(occurrences, int) else 1
+    # `occurrences` は改名前の同義字段（commit ab634c9 のみ・main 未到達なので
+    # 本番には存在しないはずだが、遺留の「真 Firestore 往返検証」を本分支で
+    # 行った環境には残り得る）。読めたら引き継ぐ——数え直しは静かなデータ損失。
+    # 真往返の検証が済み、旧字段が無いと確認できた時点で削ってよい。
+    write_count = prior.get("write_count", prior.get("occurrences"))
+    write_count = write_count + 1 if isinstance(write_count, int) else 1
     return {
         **existing,
         reason_code: {
-            "occurrences": occurrences,
+            "write_count": write_count,
             "first_seen_at": prior.get("first_seen_at", now),
             "last_seen_at": now,
         },
@@ -413,7 +424,7 @@ class FirestoreReporter:
         採った形は**單一文檔のまま原因ごとの累計を持つ**：
 
             payload そのもの   ＝ 当前快照（最新の原因。従来どおり）
-            reason_stats[code] ＝ {occurrences, first_seen_at, last_seen_at}
+            reason_stats[code] ＝ {write_count, first_seen_at, last_seen_at}
 
         控制面は依然として**一文檔を一度読むだけ**でよい（読取面は未建設
         なので、子集合を掃く負担を先回りして負わせない）。
