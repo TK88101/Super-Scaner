@@ -59,6 +59,12 @@ _DEAD_LETTER_ERROR_REQUIRED_KEYS = frozenset({"stage", "error_class", "message"}
 _MESSAGE_MAX_LEN = 1000
 _TRUNCATION_SUFFIX = "…[截斷]"
 
+# alert 文檔の降級標記（D3 付帯・simcodex R2）。既存分の読取に失敗した回は
+# `reason_stats` を据置き、この標記を立てて「厳密な現況ではない」と宣言する。
+# 跨倉 collection なので控制面も読める形にする（黙って劣化させない）。
+ALERT_STATS_STATE_KEY = "reason_stats_state"
+ALERT_STATS_STALE = "stale_due_to_read_failure"
+
 
 class ReportOutcome(Enum):
     """_report 三種終局結果（契約 F01②語意：APPLIED / ALREADY_DONE 皆為「成功」，
@@ -97,6 +103,54 @@ class _TransactionOutcome:
 def _utcnow() -> datetime:
     """模組蓋章時戳（F49：一律 UTC）。不信任呼叫方傳入的時戳。"""
     return datetime.now(UTC)
+
+
+def _read_reason_stats(doc: Any, alert_id: str) -> Mapping[str, Any] | None:
+    """既存 alert 文檔から `reason_stats` を読む。**読取失敗は `None`**。
+
+    「正常に読めて空だった」（`{}`）と「読めなかった」（`None`）を区別するのが
+    肝（simcodex R2・Codex 指摘採納）。両方を `{}` に潰すと、呼出側は読めな
+    かった時にも「累計ゼロから開始」と解釈して `occurrences=1` を書き、
+    ディスク上の本物の `occurrences=7` を上書きしてしまう——**嘘をつく
+    カウンタは、カウンタが無いことより悪い**。
+
+    読取失敗そのものを握り潰すのは意図的：ここで例外を上げると alert 自体が
+    書けなくなり「なぜ隔離されたか」が誰にも見えない不可視状態に戻る。
+    失う物は履歴の更新、守る物は可視性——後者が重い（D3 裁決の付帯規則）。
+    """
+    try:
+        snapshot = doc.get()
+        if not getattr(snapshot, "exists", False):
+            return {}
+        existing = snapshot.to_dict() or {}
+    except Exception as exc:  # noqa: BLE001 - 履歴 < 可視性
+        print(f"alert 既存分の読取失敗（累計は据置） alert_id={alert_id} "
+              f"error_type={type(exc).__name__}")
+        return None
+    stats = existing.get("reason_stats")
+    return stats if isinstance(stats, Mapping) else {}
+
+
+def _merged_reason_stats(existing: Mapping[str, Any], reason_code: str,
+                         now: datetime) -> dict[str, Any]:
+    """`reason_stats` を 1 原因ぶん進めた**新しい** dict を返す（就地改変せず）。
+
+    同一原因＝occurrences を増やし last_seen_at のみ進める（first_seen_at は
+    初回の値を保つ）。別原因＝新しいキーとして並置する——これが D3 の眼目で、
+    異因が覆い消されないことそのもの。
+    """
+    prior = existing.get(reason_code)
+    prior = prior if isinstance(prior, Mapping) else {}
+    occurrences = prior.get("occurrences")
+    occurrences = occurrences + 1 if isinstance(occurrences, int) else 1
+    return {
+        **existing,
+        reason_code: {
+            "occurrences": occurrences,
+            "first_seen_at": prior.get("first_seen_at", now),
+            "last_seen_at": now,
+        },
+    }
 
 
 def _validate_dead_letter_error(error: Mapping[str, Any]) -> None:
@@ -350,17 +404,51 @@ class FirestoreReporter:
         return outcome.result
 
     def write_alert(self, alert_id: str, payload: Mapping[str, Any]) -> None:
-        """寫入 `alerts/{alert_id}`（覆蓋語意，一次 `set()`；文檔 ID 天然冪等鍵）。
+        """寫入 `alerts/{alert_id}`（單一文檔・`set()`；文檔 ID 天然冪等鍵）。
 
-        覆蓋語義的已知窗口（TBD 升級中，B1 不代拍）：同一 alert_id 先後因**不同**
-        原因被拒時，後寫覆蓋前寫、早先線索丟失。alerts 集合是跨倉共享 schema
-        （控制面後續建讀取面），追加式改造屬契約層決策——已隨 B1 匯報升級趙裁決；
-        在此之前維持契約既定的最小覆蓋語義（F20：文檔 ID 天然冪等）。
+        **D3 裁決（趙 2026-08-02、Codex 二輪対辯を経た共同推薦）**：舊實裝は
+        同一 alert_id が先後で**別の**原因により拒否されると後寫が前寫を覆い、
+        早先の線索が消えた。純粋な追加（auto_id 文檔）は却下——文檔 ID＝file_id
+        という F20 の「天然冪等」は刷屏防止の護欄であり、壊す代償が大き過ぎる。
+        採った形は**單一文檔のまま原因ごとの累計を持つ**：
+
+            payload そのもの   ＝ 当前快照（最新の原因。従来どおり）
+            reason_stats[code] ＝ {occurrences, first_seen_at, last_seen_at}
+
+        控制面は依然として**一文檔を一度読むだけ**でよい（読取面は未建設
+        なので、子集合を掃く負担を先回りして負わせない）。
+
+        reason code は `reason` →（無ければ）`kind` の順で採る。どちらも無い
+        場合は `reason_stats` 自体を置かない——累計する対象が無いのに空の器を
+        作らない（空 payload の既存契約も維持される）。
+
+        既存分の読取が落ちても alert 自体は必ず出す（履歴より可視性が優先。
+        alert が消えると「なぜ隔離されたか」が誰にも見えなくなる）。
 
         不可變風格：spread 展開本身即產生新 dict，絕不就地修改呼叫方的 payload。
         """
+        doc = self._alert_doc(alert_id)
+        reason_code = payload.get("reason") or payload.get("kind")
         enriched: dict[str, Any] = {**payload, "at": _utcnow(), "by": ACTOR_SUPER_SCANER}
-        self._alert_doc(alert_id).set(enriched)
+
+        if not reason_code:
+            doc.set(enriched)                      # 累計する対象が無い＝従来どおり
+            print(f"alert 已寫入 alert_id={alert_id}")
+            return
+
+        prior = _read_reason_stats(doc, alert_id)
+        if prior is None:
+            # 読取失敗。**捏造した累計を書くくらいなら書かない**——`merge=True`
+            # でディスク上の `reason_stats` を素通りさせ、当前快照だけ更新する。
+            # 代償として本回分は計上されず、payload に無い旧字段も残り得るので
+            # （merge は欠落字段を消さない）、消費側が「厳密な現況」と誤読しない
+            # よう降級標記を残す。次に読めた回の全量 set でこの標記ごと消える。
+            enriched[ALERT_STATS_STATE_KEY] = ALERT_STATS_STALE
+            doc.set(enriched, merge=True)
+        else:
+            enriched["reason_stats"] = _merged_reason_stats(
+                prior, str(reason_code), enriched["at"])
+            doc.set(enriched)
         print(f"alert 已寫入 alert_id={alert_id}")
 
 

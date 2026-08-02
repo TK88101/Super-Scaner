@@ -1823,43 +1823,109 @@ def _normalize_receipt_results(
 # メインパイプライン
 # ============================================================
 
+def _emit_provider_event(event_sink, provider, error_class, page, job_id):
+    """契約 §5.7 の事象を 1 件流す（sink 未注入なら何もしない）。
+
+    **`ValueError`/`TypeError` は握り潰さない**（simplify R1 採納）。
+    `ProviderEventWriter.record` はこの二つを、値域違反（未知 provider 等）と
+    脱敏違反（禁止字段・非 str の job_id）に対して**意図的に**送出する。
+    ここで一括して吞むと、モジュールが最も強く主張している「静かに捨てると
+    『渡したのに出ない』事故に化ける」という設計が、**唯一の生産経路でだけ
+    無効化される**（テストは record を直接呼ぶので緑のまま）。これらは
+    データ由来ではなく呼出コード由来の欠陥なので、大声で落とす方が正しい
+    ——ENTRY_BUILDERS 未登録事故と同じ先例（CLAUDE.md）。
+
+    インフラ由来の失敗（Firestore 瞬断等）は `record` の内部で既に隔離され
+    False が返るだけなので、ここで重ねて守る必要はない。残りを広く捕まえて
+    いるのは、sink が差し替え可能な口だから（想定外の実装が投げても票の処理は
+    止めない）。
+    """
+    if event_sink is None:
+        return
+    try:
+        event_sink.record(provider=provider, error_class=error_class,
+                          page=page, job_id=job_id)
+    except (ValueError, TypeError):
+        raise                                     # 呼出コードの欠陥＝落として気付く
+    except Exception as exc:  # noqa: BLE001 - 観測が本業を止めない
+        print(f"⚠️ provider 事件の記録失敗（処理は続行）: {type(exc).__name__}")
+
+
 def _route_ocr_strategy(
     data_bytes: bytes,
     mime_type: str,
     prompt: str,
     ocr_strategy: str,
     prefix: str = "",
+    event_sink=None,
+    page: int | None = None,
+    job_id: str | None = None,
 ) -> tuple[object, str, float | None]:
     """OCR 戦略に基づいてルーティング。(raw_data, ocr_text, ocr_confidence) を返す。
 
     ocr_confidence は規則②（低置信整票送審）用の PaddleOCR 平均置信度。
     raw_data が PaddleOCR テキスト経由でない場合（Gemini-Vision 兜底・例外・
     テキスト無し）は None を返す（Vision 結果に低置信を誤って付けないため）。
+
+    **try が二つに割れている理由**（契約 §5.7 の前提修正・B8）：以前は単一の
+    try が PaddleOCR 呼出と 3 つの Gemini 呼出をまとめて包み、except が一律
+    「PaddleOCR失敗」と出力していた。Gemini が落ちても PaddleOCR の失敗として
+    計上されるため、控制面の断路器が**無実の PaddleOCR を熔断し、真犯人の
+    Gemini は放置する**。provider ごとに try を割るのは様式の問題ではなく
+    断路器の正誤に直結する。ここを再び一つに統合してはいけない。
+
+    `event_sink` 未注入（UI 版経路）では事象を出さない——挙動は従来と同一。
     """
     import config
     raw_data = None
-    ocr_text = ""
     ocr_conf: float | None = None
+
     try:
         ocr_text, paddle_conf = _ocr_with_paddleocr(data_bytes, mime_type)
-        if ocr_text.strip():
-            print(f"{prefix}📝 PaddleOCR完了 ({len(ocr_text)}文字, 置信度: {paddle_conf:.3f})")
-            if ocr_strategy == "A":
-                raw_data = _call_gemini_text(ocr_text, prompt)
-                ocr_conf = paddle_conf
-            elif ocr_strategy == "B":
-                if paddle_conf >= config.OCR_CONFIDENCE_THRESHOLD:
-                    raw_data = _call_gemini_text(ocr_text, prompt)
-                    ocr_conf = paddle_conf
-                else:
-                    # Vision 兜底: raw_data は Vision 由来のため置信度は無信号(None)
-                    print(f"{prefix}⚠️ 置信度低 ({paddle_conf:.3f} < {config.OCR_CONFIDENCE_THRESHOLD}) → Gemini Vision")
-                    raw_data = _call_gemini_bytes(data_bytes, mime_type, prompt)
-            elif ocr_strategy == "C":
-                raw_data = _call_gemini_cross_validate(ocr_text, data_bytes, mime_type, prompt)
-                ocr_conf = paddle_conf
     except Exception as ocr_err:
         print(f"{prefix}⚠️ PaddleOCR失敗: {ocr_err}")
+        _emit_provider_event(event_sink, "paddleocr",
+                             _classify_page_error(ocr_err),
+                             page, job_id)
+        return None, "", None
+
+    if not ocr_text.strip():
+        # 白紙頁・OCR 無出力。provider の障害ではないので事象は出さない
+        # （断路器に雑音を送ると本物の障害が埋もれる）。
+        return None, ocr_text, None
+
+    print(f"{prefix}📝 PaddleOCR完了 ({len(ocr_text)}文字, 置信度: {paddle_conf:.3f})")
+    try:
+        if ocr_strategy == "A":
+            raw_data = _call_gemini_text(ocr_text, prompt)
+            ocr_conf = paddle_conf
+        elif ocr_strategy == "B":
+            if paddle_conf >= config.OCR_CONFIDENCE_THRESHOLD:
+                raw_data = _call_gemini_text(ocr_text, prompt)
+                ocr_conf = paddle_conf
+            else:
+                # Vision 兜底: raw_data は Vision 由来のため置信度は無信号(None)
+                print(f"{prefix}⚠️ 置信度低 ({paddle_conf:.3f} < {config.OCR_CONFIDENCE_THRESHOLD}) → Gemini Vision")
+                raw_data = _call_gemini_bytes(data_bytes, mime_type, prompt)
+        elif ocr_strategy == "C":
+            raw_data = _call_gemini_cross_validate(ocr_text, data_bytes, mime_type, prompt)
+            ocr_conf = paddle_conf
+    except Exception as gemini_err:
+        print(f"{prefix}⚠️ Gemini 失敗: {gemini_err}")
+        _emit_provider_event(event_sink, "gemini_ocr",
+                             _classify_page_error(gemini_err),
+                             page, job_id)
+        return None, ocr_text, None
+
+    # 未知 strategy では Gemini を一度も呼んでいないので事象にしない
+    # （呼んでもいない provider を断路器に数えさせない）。
+    if raw_data is None and ocr_strategy in ("A", "B", "C"):
+        # 「呼出し成功 ≠ 業務成功」：HTTP 200 でも JSON 解析不能／MAX_TOKENS
+        # 截断なら応答異常。§5.4 の「損壊/格式/空 → NON_RETRYABLE」に当たる。
+        # 本集合は事象流であって DEAD_LETTER を駆動しないので、票は殺さない。
+        _emit_provider_event(event_sink, "gemini_ocr", "NON_RETRYABLE",
+                             page, job_id)
+
     return raw_data, ocr_text, ocr_conf
 
 
@@ -2018,7 +2084,8 @@ def _page_error_payload(memo, page_num, total_pages, page_bytes, error_class):
     }
 
 
-def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, start_page=1):
+def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, start_page=1,
+                     event_sink=None, job_id=None):
     """
     文書を分析し、仕訳データを逐次 yield するジェネレータ。
 
@@ -2032,6 +2099,10 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
         doc_type: 文書タイプ (DocType 定数)
         ocr_strategy: OCR 戦略 (A/B/C, None=config.OCR_STRATEGY)
         start_page: 再開用、このページ未満はスキップ（1 始まり）
+        event_sink: 契約 §5.7 provider 事件の書込口（`ProviderEventWriter` 等）。
+            **None＝事象を出さない**——UI 版経路は従来どおり無変更で通る。
+            headless 経路だけが注入する。
+        job_id: §5.7 の任意字段（追跡用）。event_sink と対で渡す。
 
     Yields:
         dict: {"result": dict, "page_num": int, "total_pages": int}
@@ -2097,12 +2168,31 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
 
                     try:
                         page_raw_data, ocr_text, ocr_conf = _route_ocr_strategy(
-                            page_data, "application/pdf", prompt, ocr_strategy, prefix=prefix
+                            page_data, "application/pdf", prompt, ocr_strategy,
+                            prefix=prefix, event_sink=event_sink, page=idx,
+                            job_id=job_id,
                         )
 
                         if not page_raw_data:
                             print(f"{prefix}🔄 フォールバック: Gemini Vision で再試行")
-                            page_raw_data = _call_gemini_bytes(page_data, "application/pdf", prompt)
+                            try:
+                                page_raw_data = _call_gemini_bytes(page_data, "application/pdf", prompt)
+                            except Exception as vision_err:
+                                # 兜底も Gemini。ここを黙って外側 except に流すと
+                                # provider 障害が事象として残らない（§5.7）。
+                                _emit_provider_event(
+                                    event_sink, "gemini_ocr",
+                                    _classify_page_error(vision_err),
+                                    idx, job_id,
+                                )
+                                raise
+                            if page_raw_data is None:
+                                # 兜底も「呼出し成功 ≠ 業務成功」。ここを空けると
+                                # PaddleOCR 失敗→Vision 兜底→JSON 解析不能 の頁が
+                                # 断路器から完全に見えなくなる（主経路の応答異常は
+                                # 記録されるのに、という非対称。simcodex R3 採納）。
+                                _emit_provider_event(event_sink, "gemini_ocr",
+                                                     "NON_RETRYABLE", idx, job_id)
                             ocr_conf = None  # Vision 兜底は無信号（低置信を誤付しない）
                     except Exception as page_err:
                         failed_pages += 1
@@ -2205,13 +2295,28 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
         with open(file_path, "rb") as f:
             file_data = f.read()
 
-        raw_data, ocr_text, ocr_conf = _route_ocr_strategy(file_data, mime_type, prompt, ocr_strategy)
+        raw_data, ocr_text, ocr_conf = _route_ocr_strategy(
+            file_data, mime_type, prompt, ocr_strategy,
+            event_sink=event_sink, page=1, job_id=job_id,
+        )
         del file_data
         gc.collect()
 
         if not raw_data:
             print("🔄 フォールバック: Gemini Vision で再試行")
-            raw_data = _call_gemini(file_path, prompt)
+            try:
+                raw_data = _call_gemini(file_path, prompt)
+            except Exception as vision_err:
+                _emit_provider_event(
+                    event_sink, "gemini_ocr",
+                    _classify_page_error(vision_err),
+                    1, job_id,
+                )
+                raise
+            if raw_data is None:
+                # 尾段（単頁 PDF・画像）でも同じ非対称を作らない（simcodex R3）。
+                _emit_provider_event(event_sink, "gemini_ocr",
+                                     "NON_RETRYABLE", 1, job_id)
             ocr_conf = None  # Vision 兜底は無信号（低置信を誤付しない）
 
         if not raw_data:

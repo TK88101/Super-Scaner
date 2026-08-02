@@ -678,6 +678,7 @@ def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_
     # job_reporter と同一 Firestore client を再利用、witness probe は writer 提供。
     ledger = None
     page_outcomes = None
+    provider_sink = None
     if job_reporter is not None and base is not None:
         from posting_ledger import PostingLedger
         ledger = PostingLedger(
@@ -686,6 +687,13 @@ def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_
         # client は檔級回報（job_reporter＝job 状態）と同一を再利用。
         from firestore_progress import FirestorePageOutcomesReporter
         page_outcomes = FirestorePageOutcomesReporter(job_reporter.client, base)
+        # provider 事件（契約 §5.7、B8）。**ファイル毎に作り直す**のが肝——
+        # 上限カウンタ（job×provider×error_class で 20 件）を件を跨いで
+        # 持ち回すと、前の件の障害で使い切った予算のせいで次の件の事象が
+        # 黙って書かれなくなる。集合自体はトップレベルなので、writer の
+        # 寿命を件に揃えても控制面から見える形は変わらない。
+        from provider_events import ProviderEventWriter
+        provider_sink = ProviderEventWriter(job_reporter.client)
 
     # PDF 間分割線 + 取引No リセットは UI 版のみ（headless は取引No を
     # Sheets A 列から都度再構築＝崩潰重跑冪等、分割線リセットは不要・有害）。
@@ -705,6 +713,8 @@ def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_
             page_outcomes=page_outcomes,
             # §5.1-d T4: headless の Sheets tab キー（None＝UI 版、行為零改動）。
             tab_owner=tab_owner,
+            # §5.7 B8: provider 事件の書込口（None＝UI 版、行為零改動）。
+            event_sink=provider_sink,
         )
     finally:
         if page_outcomes is not None:
@@ -1242,7 +1252,7 @@ def _record_page_classification(classified, page_kinds, ordered_page_nums,
 
 def _process_file_headless(service, writer, file_path, uploader_name, base,
                            ledger, doc_type, drive_file_id, split_pdf_folder_id,
-                           *, tab_owner, page_outcomes=None):
+                           *, tab_owner, page_outcomes=None, event_sink=None):
     """HEADLESS_MODE の頁級緩衝集約経路（IP-304/IP-306）。HeadlessOutcome を返す。
 
     tab_owner は真必須（codex R1-P1 裁決＝fallback 復活ではなく fail-fast）：
@@ -1290,7 +1300,10 @@ def _process_file_headless(service, writer, file_path, uploader_name, base,
             writer, ledger, resolver, base, doc_type, tab_owner, filename,
             page_num_, total_pages_, results_, page_bytes_)
 
-    for page in process_pipeline(file_path, doc_type=doc_type):
+    # event_sink＝契約 §5.7 provider 事件（headless のみ。UI 版は注入しない）。
+    # job_id は §5.7 の任意字段で、job_key＝base と同一（1 ファイル＝1 job）。
+    for page in process_pipeline(file_path, doc_type=doc_type,
+                                 event_sink=event_sink, job_id=base):
         result = page["result"]
         page_num = page["page_num"]
         total_pages = page["total_pages"]
@@ -1438,7 +1451,8 @@ def _write_audit_fallback_row(sheets_writer, uploader_name, doc_type, filename,
 def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
                   doc_type=DocType.RECEIPT, drive_file_id=None,
                   split_pdf_folder_id="", base=None, ledger=None,
-                  progress=None, page_outcomes=None, tab_owner=None):
+                  progress=None, page_outcomes=None, tab_owner=None,
+                  event_sink=None):
     """process_file の薄い外殻（B7 T3）。
 
     進捗フックの発火（file_started／未預期例外時の ABORTED best-effort 記録）
@@ -1461,7 +1475,8 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
             service, sheets_writer, file_path, uploader_name, chat_id,
             doc_type=doc_type, drive_file_id=drive_file_id,
             split_pdf_folder_id=split_pdf_folder_id, base=base, ledger=ledger,
-            progress=progress, page_outcomes=page_outcomes, tab_owner=tab_owner)
+            progress=progress, page_outcomes=page_outcomes, tab_owner=tab_owner,
+            event_sink=event_sink)
     except Exception as e:
         # best-effort: 進捗記録は reporter 自身が内部で自吞するが、二重の
         # 安全網として元例外を必ずそのまま伝播させる（main loop の既存の
@@ -1473,7 +1488,8 @@ def process_file(service, sheets_writer, file_path, uploader_name, chat_id,
 def _process_file_impl(service, sheets_writer, file_path, uploader_name,
                        chat_id, doc_type=DocType.RECEIPT, drive_file_id=None,
                        split_pdf_folder_id="", base=None, ledger=None,
-                       page_outcomes=None, tab_owner=None, *, progress):
+                       page_outcomes=None, tab_owner=None, event_sink=None,
+                       *, progress):
     """ファイルを処理し、Google Sheets に逐次書き込み、通知を送信する。
 
     ledger 非 None（HEADLESS_MODE）は頁級緩衝集約＋硬去重の経路へ分流し ProcessOutcome
@@ -1495,7 +1511,8 @@ def _process_file_impl(service, sheets_writer, file_path, uploader_name,
             service, sheets_writer, file_path, uploader_name, base, ledger,
             doc_type, drive_file_id, split_pdf_folder_id,
             tab_owner=tab_owner,
-            page_outcomes=page_outcomes)
+            page_outcomes=page_outcomes,
+            event_sink=event_sink)
 
     type_label = DOC_TYPE_CONFIG.get(doc_type, {}).get("label", doc_type)
     filename = os.path.basename(file_path)

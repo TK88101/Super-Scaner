@@ -50,9 +50,15 @@ class FakeDocRef:
         data = self._store.get(self.id)
         return FakeSnapshot(exists=data is not None, data=data)
 
-    def set(self, data):
-        # 非事務直寫（write_alert 等の事務外パス）
-        self._store[self.id] = dict(data)
+    def set(self, data, merge=False):
+        # 非事務直寫（write_alert 等の事務外パス）。
+        # merge を**本物どおり**「欠落字段は残す」で実装するのが重要——ここを
+        # 上書きで済ませると、読取失敗時に累計が据置かれることを確かめる
+        # テストが、fake の建模誤差のせいで自洽的に緑になる。
+        if merge:
+            self._store.setdefault(self.id, {}).update(dict(data))
+        else:
+            self._store[self.id] = dict(data)
 
 
 class FakeCollection:
@@ -460,6 +466,161 @@ class WriteAlertTest(unittest.TestCase):
         stored = client.alerts_store["alert-2"]
         self.assertEqual(set(stored.keys()), {"at", "by"})
         self.assertEqual(stored["by"], ACTOR_SUPER_SCANER)
+
+
+class AlertReasonStatsTest(unittest.TestCase):
+    """D3 裁決（趙 2026-08-02、Codex 二輪対辯を経て）＝**異因追加・同因累計**。
+
+    元の欠陥：同一 file_id が先後で**別の**原因により拒否されると、後の
+    `set()` が前を覆い、早先の線索が消える。純粋な追加（auto_id）は却下——
+    文檔 ID＝file_id という F20 の「天然冪等」＝刷屏防止の護欄を壊すため。
+    採った形＝**単一文檔のまま、原因ごとの累計を持つ**。控制面は依然として
+    一文檔を一度読むだけでよい（読取面は未建設なので、子集合を掃く負担を
+    先回りして負わせない）。
+    """
+
+    def test_different_reasons_both_survive(self):
+        reporter, client, _, _ = _make_reporter()
+
+        reporter.write_alert("file-1", {"kind": "intake_rejected",
+                                        "reason": "no_posting_id"})
+        reporter.write_alert("file-1", {"kind": "intake_rejected",
+                                        "reason": "posting_id_mismatch"})
+
+        stats = client.alerts_store["file-1"]["reason_stats"]
+        self.assertEqual(set(stats), {"no_posting_id", "posting_id_mismatch"})
+
+    def test_still_exactly_one_document(self):
+        """護欄の回帰：追加式に化けていないこと。"""
+        reporter, client, _, _ = _make_reporter()
+
+        for reason in ("no_posting_id", "job_not_found", "posting_id_mismatch"):
+            reporter.write_alert("file-1", {"reason": reason})
+
+        self.assertEqual(len(client.alerts_store), 1)
+
+    def test_payload_remains_the_current_snapshot(self):
+        """最新の原因は payload そのもの。控制面の快捷参照はここを見る。"""
+        reporter, client, _, _ = _make_reporter()
+
+        reporter.write_alert("file-1", {"reason": "no_posting_id"})
+        reporter.write_alert("file-1", {"reason": "job_not_found"})
+
+        self.assertEqual(client.alerts_store["file-1"]["reason"], "job_not_found")
+
+    def test_same_reason_accumulates_occurrences(self):
+        reporter, client, _, _ = _make_reporter()
+
+        for _ in range(3):
+            reporter.write_alert("file-1", {"reason": "no_posting_id"})
+
+        entry = client.alerts_store["file-1"]["reason_stats"]["no_posting_id"]
+        self.assertEqual(entry["occurrences"], 3)
+
+    def test_first_seen_is_kept_and_last_seen_advances(self):
+        reporter, client, _, _ = _make_reporter()
+
+        reporter.write_alert("file-1", {"reason": "no_posting_id"})
+        first = dict(client.alerts_store["file-1"]["reason_stats"]["no_posting_id"])
+        reporter.write_alert("file-1", {"reason": "no_posting_id"})
+        second = client.alerts_store["file-1"]["reason_stats"]["no_posting_id"]
+
+        self.assertEqual(second["first_seen_at"], first["first_seen_at"])
+        self.assertGreaterEqual(second["last_seen_at"], first["last_seen_at"])
+
+    def test_kind_is_used_when_reason_absent(self):
+        """`customer_metadata_missing` 系は reason を持たず kind で区別される。"""
+        reporter, client, _, _ = _make_reporter()
+
+        reporter.write_alert("file-1", {"kind": "customer_metadata_missing",
+                                        "posting_id": "p-1"})
+
+        self.assertIn("customer_metadata_missing",
+                      client.alerts_store["file-1"]["reason_stats"])
+
+    def test_no_reason_code_means_no_stats(self):
+        """累計する対象が無いのに空の器を置かない（空 payload の既存契約を維持）。"""
+        reporter, client, _, _ = _make_reporter()
+
+        reporter.write_alert("file-1", {})
+
+        self.assertNotIn("reason_stats", client.alerts_store["file-1"])
+
+    def test_caller_payload_is_not_mutated(self):
+        reporter, _, _, _ = _make_reporter()
+        payload = {"reason": "no_posting_id"}
+
+        reporter.write_alert("file-1", payload)
+
+        self.assertEqual(payload, {"reason": "no_posting_id"})
+
+    @staticmethod
+    def _break_alert_reads(client):
+        """alerts の get() だけ落ちる状態にする（set は正常）。"""
+        class _ExplodingGetCollection:
+            def __init__(self, store):
+                self._store = store
+
+            def document(self, doc_id):
+                ref = FakeDocRef(doc_id, self._store)
+                ref.get = lambda transaction=None: (_ for _ in ()).throw(
+                    RuntimeError("read down"))
+                return ref
+
+        client.collection = lambda name: (
+            _ExplodingGetCollection(client.alerts_store) if name == "alerts"
+            else FakeCollection(client.jobs_store))
+
+    def test_read_failure_still_writes_the_alert(self):
+        """既存分が読めなくても alert 自体は必ず出す（履歴 < 可視性）。"""
+        reporter, client, _, _ = _make_reporter()
+        self._break_alert_reads(client)
+
+        reporter.write_alert("file-1", {"reason": "no_posting_id"})
+
+        self.assertEqual(client.alerts_store["file-1"]["reason"], "no_posting_id")
+
+    def test_read_failure_never_fabricates_a_count(self):
+        """**嘘をつくカウンタはカウンタが無いより悪い**（simcodex R2 の要害）。
+
+        読めなかった回に occurrences=1 を書くと、ディスク上の本物の 7 が 1 へ
+        書き潰される。据置くのが正しい。
+        """
+        reporter, client, _, _ = _make_reporter()
+        for _ in range(3):
+            reporter.write_alert("file-1", {"reason": "no_posting_id"})
+        before = dict(client.alerts_store["file-1"]["reason_stats"]["no_posting_id"])
+        self.assertEqual(before["occurrences"], 3)
+
+        self._break_alert_reads(client)
+        reporter.write_alert("file-1", {"reason": "no_posting_id"})
+
+        after = client.alerts_store["file-1"]["reason_stats"]["no_posting_id"]
+        self.assertEqual(after["occurrences"], 3)
+
+    def test_read_failure_marks_the_document_as_stale(self):
+        """黙って劣化させない。控制面が「厳密な現況ではない」と判る形で残す。"""
+        reporter, client, _, _ = _make_reporter()
+        reporter.write_alert("file-1", {"reason": "no_posting_id"})
+        self._break_alert_reads(client)
+
+        reporter.write_alert("file-1", {"reason": "job_not_found"})
+
+        self.assertEqual(
+            client.alerts_store["file-1"][firestore_report.ALERT_STATS_STATE_KEY],
+            firestore_report.ALERT_STATS_STALE)
+
+    def test_stale_marker_is_cleared_once_reads_recover(self):
+        reporter, client, _, _ = _make_reporter()
+        reporter.write_alert("file-1", {"reason": "no_posting_id"})
+        self._break_alert_reads(client)
+        reporter.write_alert("file-1", {"reason": "job_not_found"})
+        del client.collection                      # 読取が回復＝元の dispatch へ
+
+        reporter.write_alert("file-1", {"reason": "job_not_found"})
+
+        self.assertNotIn(firestore_report.ALERT_STATS_STATE_KEY,
+                         client.alerts_store["file-1"])
 
 
 class GetJobTest(unittest.TestCase):
