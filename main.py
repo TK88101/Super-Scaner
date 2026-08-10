@@ -4,6 +4,7 @@ import time
 import io
 import random
 import re
+from datetime import datetime
 
 # Windows console encoding fix
 if sys.platform == "win32":
@@ -21,7 +22,7 @@ from ocr_engine import (
 from sheets_output import (
     APPEND_RESULT_PLACEHOLDER,
     AUDIT_VERDICT_BRANCH, AUDIT_VERDICT_EXCLUDED, AUDIT_VERDICT_MISSING,
-    SheetsOutputWriter,
+    JST, SheetsOutputWriter,
 )
 from notifier import send_notification
 from doc_types import DocType, DOC_TYPE_CONFIG
@@ -816,6 +817,133 @@ def filter_active_folders(folder_map, writers):
             if entry[1] in writers}
 
 
+# ============ 失敗退避護欄（2026-08-10 Plan §3.6） ============
+# main.py には従来 fail_count/backoff/blacklist が皆無だった。永続的な失敗
+# （Sheets 400・Drive 故障・コードのバグ等）は SCAN_INTERVAL=3s のまま無限
+# リトライになり、毎輪 PaddleOCR + Gemini を焼き続ける（実際に事故が発生済
+# み）。ここでは IP-401「全頁失敗はファイル保持」の語義を一切変えず、
+# 再試行の"間隔"だけを制御する。状態はプロセス内メモリの dict のみ
+# （main() のローカル変数として保持）——再起動でリセットされて構わない
+# (Plan で明示許容)。ファイルの行き先（保持/移動）はこの節では一切決めない。
+
+# 級距: 3s → 30s → 5min → 30min → 上限1h（Plan §3.6 の目安どおり）
+FAILURE_BACKOFF_SCHEDULE_SECONDS = (3, 30, 300, 1800, 3600)
+
+
+def _next_backoff_seconds(fail_count):
+    """累計失敗回数 (1始まり) から次回試行までの待機秒数を返す純粋関数。
+
+    main loop を起動せずに単体検証できるよう、状態を一切持たない。
+    スケジュール長を超えたら最後の要素 (上限1h) に頭打ちする。
+    唯一の呼び出し元 _record_file_failure は常に fail_count>=1 を渡すが、
+    念のため下限は式の中で吸収する（引数を書き換えない。CLAUDE.md §7 不変）。
+    """
+    index = min(max(fail_count - 1, 0), len(FAILURE_BACKOFF_SCHEDULE_SECONDS) - 1)
+    return FAILURE_BACKOFF_SCHEDULE_SECONDS[index]
+
+
+def _record_file_failure(retry_state, file_id, now_ts):
+    """このファイルの失敗を1件加算し、次回試行可能時刻を設定する。
+
+    retry_state は {file_id: {"count": n, "next_attempt_ts": t}}。
+    呼び出し側が保持する辞書をその場で更新する（tab キャッシュ等、この
+    プロジェクトの他の行程内状態と同じ寄せ方）。更新後のエントリを返す。
+    """
+    prev_count = retry_state.get(file_id, {}).get("count", 0)
+    count = prev_count + 1
+    entry = {
+        "count": count,
+        "next_attempt_ts": now_ts + _next_backoff_seconds(count),
+    }
+    retry_state[file_id] = entry
+    return entry
+
+
+def _record_file_success(retry_state, file_id):
+    """処理成功時にこのファイルの退避記録を消す（存在しなくても no-op）。"""
+    retry_state.pop(file_id, None)
+
+
+def _is_file_backed_off(retry_state, file_id, now_ts):
+    """走査時にこのファイルを今回だけ飛ばすべきかを判定する。
+
+    記録が無い（未失敗）ファイルは常に False——他ファイルの退避に一切
+    引きずられない（護欄の核心要件: 1ファイルの退避が全体を止めない）。
+    """
+    entry = retry_state.get(file_id)
+    if entry is None:
+        return False
+    return now_ts < entry["next_attempt_ts"]
+
+
+# ---- 退避中でも他ファイルを止めない・console が沈黙しない（codex 対抗評審裁決）----
+# 従来は found_any / 「新しいファイルを検出しました！」バナーが退避 continue
+# より前に実行されており、失敗ファイルは IP-401 の語義どおり input に残り
+# 続けるため list_files が永続的に非空になり、3秒毎に誤ってバナーが印字され
+# 続けた（1h 級距まで進むと約1200回の空撃ち）。同時に、ループ末尾の "." 心拍
+# （found_any=False のときだけ出る）も退避ウィンドウ中は一切出ず、事故当時の
+# 「無限リトライで刷り潰れる」画面と見分けがつかなくなっていた。
+#
+# 対処: list_files 直後に ready/backed_off へ分割し、found_any とバナーは
+# ready_files の有無だけで決める（backed_off は無視）。退避中ファイルが
+# あることは、ただ濾すだけ（"." のみになり input 空の正常状態と区別不能）
+# ではなく、間引いた摘要行で可視化する——運用者が「護欄が効いている」と
+# 「また壊れて無限リトライしている」を見分けられる唯一の窓が console。
+
+# 摘要行の最大表示頻度（秒）。運用パラメータなので名前付き定数にする——
+# 短くすれば追跡性は上がるがログが埋まる、長くすれば逆。調整時はここだけ変える。
+BACKOFF_SUMMARY_INTERVAL_SECONDS = 60
+
+
+def _format_jst_timestamp(ts):
+    """UNIX 秒 (float) を JST 明示の "%Y/%m/%d %H:%M:%S" 表記に変換する。
+
+    倉庫慣例 (sheets_output.py:558・page_progress.py) に合わせる。ホストの
+    ローカルタイムゾーンに依存する time.strftime + time.localtime を使うと、
+    開発機やタイムゾーン設定が変わったとき、console に出る「次回試行予定」が
+    Sheets 側の全タイムスタンプと表記（区切り文字・時差）がずれる——console は
+    無人稼働機で唯一の照合手段なので、ここで JST を明示する。
+    """
+    return datetime.fromtimestamp(ts, JST).strftime("%Y/%m/%d %H:%M:%S")
+
+
+def _format_backoff_summary(count, earliest_next_attempt_ts):
+    """退避中ファイル数と最早の次回試行時刻から console 用の一行摘要を作る。
+
+    純粋関数——main loop を起動せずに検証できる（_next_backoff_seconds 等と
+    同じ寄せ方）。
+    """
+    earliest_str = _format_jst_timestamp(earliest_next_attempt_ts)
+    return f"⏳ 失敗退避中: {count}件（最早次回試行: {earliest_str}）"
+
+
+def _should_print_backoff_summary(last_printed_ts, now_ts):
+    """直近の摘要表示から BACKOFF_SUMMARY_INTERVAL_SECONDS 秒以上経過したか。
+
+    last_printed_ts=0（未表示）なら常に True——退避が始まった最初の輪で
+    即座に見えるようにする。
+    """
+    return now_ts - last_printed_ts >= BACKOFF_SUMMARY_INTERVAL_SECONDS
+
+
+def _partition_by_backoff(files, retry_state, now_ts):
+    """files を処理可能 (ready) と退避中 (backed_off) に分ける純粋関数。
+
+    退避判定は _is_file_backed_off に委譲し、呼び出し側が輪ごとに1回だけ
+    取った now_ts を全ファイルへ同じ値で適用する（ファイルごとに
+    time.time() を取り直さない）。retry_state は読み取りのみで書き換えず、
+    順序は入力の files をそのまま保つ。
+    """
+    ready_files = []
+    backed_off_files = []
+    for file in files:
+        if _is_file_backed_off(retry_state, file['id'], now_ts):
+            backed_off_files.append(file)
+        else:
+            ready_files.append(file)
+    return ready_files, backed_off_files
+
+
 def main():
     print("🚀 Super Scaner 自動化システム起動！(Sheets出力版)")
 
@@ -855,14 +983,47 @@ def main():
             print(f"      - {label}: ...{fid[-5:]}")
     print("-" * 30)
 
+    # {drive_file_id: {"count": n, "next_attempt_ts": t}}。プロセス内メモリ
+    # のみで保持し、再起動でリセットされてよい（Plan §3.6 で明示許容）。
+    file_retry_state = {}
+    # 退避中サマリの直近表示時刻（0=未表示）。file_retry_state 同様プロセス内
+    # メモリのみで、再起動でリセットされてよい。
+    last_backoff_summary_ts = 0
+
     while True:
         try:
             found_any = False
+            # この輪で全ファイルに同じ now を使う（ファイルごとに取り直さない
+            # ——codex 対抗評審裁決・Plan §1）。
+            now_ts = time.time()
+            backed_off_total = 0
+            earliest_next_attempt_ts = None
 
             for input_folder_id, (doc_type, profile_key) in active_folder_map.items():
                 files = list_files(service, input_folder_id)
 
                 if not files:
+                    continue
+
+                # 護欄（Plan §3.6）: 退避中ファイルは list_files 直後に濾す。
+                # found_any・バナーは ready_files の有無だけで決める——退避
+                # ファイルが input に残り続けても（IP-401 の語義どおり）、
+                # 誤って「新しいファイルを検出しました！」を毎輪印字しない
+                # （codex 対抗評審裁決: 旧実装はここで found_any=True にしていた）。
+                ready_files, backed_off_files = _partition_by_backoff(
+                    files, file_retry_state, now_ts)
+
+                if backed_off_files:
+                    backed_off_total += len(backed_off_files)
+                    folder_earliest_ts = min(
+                        file_retry_state[f['id']]["next_attempt_ts"]
+                        for f in backed_off_files
+                    )
+                    if (earliest_next_attempt_ts is None
+                            or folder_earliest_ts < earliest_next_attempt_ts):
+                        earliest_next_attempt_ts = folder_earliest_ts
+
+                if not ready_files:
                     continue
 
                 profile = profiles[profile_key]
@@ -875,7 +1036,7 @@ def main():
                 print(f"\n\n🔎 [{profile['label']}/{type_label}] "
                       f"新しいファイルを検出しました！")
 
-                for file in files:
+                for file in ready_files:
                     file_id = file['id']
                     file_name = file['name']
                     md5 = file.get('md5Checksum')
@@ -904,25 +1065,57 @@ def main():
                         continue
 
                     # 4. 下載與處理
-                    local_path = download_file(service, file_id, file_name)
+                    #
+                    # このファイル 1 件分の処理を丸ごとここで受け止める
+                    # （護欄・Plan §3.6）。main() 全体の外殻 try に漏らすと、
+                    # この 1 ファイルの失敗が同バッチの以降のファイルまで
+                    # 巻き添えにして走査を止めてしまう（1 個の壊れたファイルが
+                    # 行列全体を塞いではならない）。
+                    #
+                    # download_file と start_new_file も範囲に含めるのが要
+                    # （codex review P1）。特に start_new_file は内部の
+                    # _get_or_create_tab が sheets_output.py:180 の try の外に
+                    # あるため APIError をそのまま投げる——tab 消失こそ本護欄が
+                    # 守るべき当の事象なのに、そこだけ護欄の外に落ちていた。
+                    #
+                    # process_file 自体の戻り値・例外語義は一切変えない。
+                    # ファイルの行き先（失敗時は input に保持）も従来どおりで、
+                    # IP-401 の語義は不変。変わるのは再試行の間隔だけ。
+                    local_path = None
+                    try:
+                        local_path = download_file(service, file_id, file_name)
 
-                    # PDF 間分割線 + 取引No リセット
-                    writer.start_new_file(uploader_name, doc_type, file_name)
+                        # PDF 間分割線 + 取引No リセット
+                        writer.start_new_file(uploader_name, doc_type, file_name)
 
-                    success = process_file(
-                        service, writer, local_path,
-                        uploader_name, chat_id,
-                        doc_type=doc_type, drive_file_id=file_id,
-                        split_pdf_folder_id=profile["split_pdf_folder_id"],
-                        progress=reporter,
-                    )
+                        success = process_file(
+                            service, writer, local_path,
+                            uploader_name, chat_id,
+                            doc_type=doc_type, drive_file_id=file_id,
+                            split_pdf_folder_id=profile["split_pdf_folder_id"],
+                            progress=reporter,
+                        )
+                    except Exception as e:
+                        print(f"❌ ファイル処理で例外発生: {file_name}: {e}")
+                        success = False
 
                     if success:
                         move_file(service, file_id, input_folder_id, processed_folder_id)
+                        _record_file_success(file_retry_state, file_id)
                     else:
                         print("⚠️ ファイル処理失敗。")
+                        entry = _record_file_failure(
+                            file_retry_state, file_id, time.time())
+                        next_attempt = _format_jst_timestamp(entry["next_attempt_ts"])
+                        print(f"🛑 退避開始: {file_name}"
+                              f"（累計失敗 {entry['count']} 回）"
+                              f" 次回試行予定: {next_attempt}")
 
-                    if os.path.exists(local_path):
+                    # local_path は download_file 自体が失敗すると None のまま
+                    # （護欄の try に download を含めたため）。None チェックを
+                    # 挟まないとここで NameError/TypeError になり、せっかく
+                    # 受け止めた例外の直後に別の例外で走査が止まる。
+                    if local_path and os.path.exists(local_path):
                         os.remove(local_path)
                         print("🧹 一時ファイルを削除しました")
 
@@ -931,6 +1124,16 @@ def main():
                     writer.flush()
 
                     print("=" * 30)
+
+            # 退避中ファイルの可視化（護欄・Plan §3.6）。ただ濾すだけだと
+            # "." のみになり input が完全に空の正常状態と見分けがつかない
+            # ——codex 対抗評審裁決。BACKOFF_SUMMARY_INTERVAL_SECONDS 秒に
+            # 最大1行まで間引く（毎輪印字するとログが埋まる）。
+            if backed_off_total > 0 and _should_print_backoff_summary(
+                    last_backoff_summary_ts, now_ts):
+                print(_format_backoff_summary(
+                    backed_off_total, earliest_next_attempt_ts))
+                last_backoff_summary_ts = now_ts
 
             if not found_any:
                 print(".", end="", flush=True)

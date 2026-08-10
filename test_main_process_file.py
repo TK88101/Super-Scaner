@@ -614,5 +614,191 @@ class ProgressOptionalNoRegressionTest(unittest.TestCase):
         self.assertEqual(len(writer.calls), 1)
 
 
+class FailureBackoffScheduleTest(unittest.TestCase):
+    """main.py の失敗退避護欄（2026-08-10 Plan §3.6 T5）。
+
+    main.py には従来 fail_count/backoff/blacklist が皆無で、永続的な失敗
+    （Sheets 400・Drive 故障・コードのバグ等）が SCAN_INTERVAL=3s の無限
+    リトライになり毎輪 PaddleOCR + Gemini を焼く事故が実際に起きた。
+    退避計算を main loop 本体から切り離した純粋関数として検証する
+    （main loop を起動せずに検証できることが要件）。IP-401「全頁失敗は
+    ファイル保持」の語義はここでは変えない——変えるのは再試行の間隔だけ。
+    """
+
+    def test_backoff_schedule_increases_with_failure_count(self):
+        # 級距: 3s → 30s → 5min → 30min → 上限1h
+        self.assertEqual(main._next_backoff_seconds(1), 3)
+        self.assertEqual(main._next_backoff_seconds(2), 30)
+        self.assertEqual(main._next_backoff_seconds(3), 300)
+        self.assertEqual(main._next_backoff_seconds(4), 1800)
+        self.assertEqual(main._next_backoff_seconds(5), 3600)
+
+    def test_backoff_caps_at_one_hour_for_further_failures(self):
+        self.assertEqual(main._next_backoff_seconds(6), 3600)
+        self.assertEqual(main._next_backoff_seconds(100), 3600)
+
+    def test_record_failure_increments_count_and_sets_next_attempt(self):
+        state = {}
+        entry = main._record_file_failure(state, "file-A", now_ts=1000.0)
+        self.assertEqual(entry["count"], 1)
+        self.assertEqual(entry["next_attempt_ts"], 1003.0)
+        self.assertIs(state["file-A"], entry)
+
+        entry2 = main._record_file_failure(state, "file-A", now_ts=1003.0)
+        self.assertEqual(entry2["count"], 2)
+        self.assertEqual(entry2["next_attempt_ts"], 1033.0)
+
+    def test_record_success_clears_state(self):
+        state = {"file-A": {"count": 3, "next_attempt_ts": 9999.0}}
+        main._record_file_success(state, "file-A")
+        self.assertNotIn("file-A", state)
+
+    def test_record_success_on_unknown_file_is_noop(self):
+        state = {}
+        main._record_file_success(state, "file-Z")  # 存在しなくても例外にならない
+        self.assertEqual(state, {})
+
+    def test_backed_off_file_is_skipped_others_are_not_blocked(self):
+        # 護欄の核心要件: 1ファイルの退避が他ファイルの処理を止めない
+        state = {}
+        main._record_file_failure(state, "file-A", now_ts=1000.0)  # 次回 1003.0
+        self.assertTrue(main._is_file_backed_off(state, "file-A", now_ts=1001.0))
+        self.assertFalse(main._is_file_backed_off(state, "file-B", now_ts=1001.0))
+
+    def test_backed_off_file_becomes_due_after_next_attempt_ts(self):
+        state = {}
+        main._record_file_failure(state, "file-A", now_ts=1000.0)  # 次回 1003.0
+        self.assertFalse(main._is_file_backed_off(state, "file-A", now_ts=1003.0))
+
+    def test_file_with_no_history_is_never_backed_off(self):
+        self.assertFalse(main._is_file_backed_off({}, "file-new", now_ts=1000.0))
+
+
+class BackoffPartitionTest(unittest.TestCase):
+    """main.py の走査ループが「退避中でも他ファイルを止めない」を保つための
+    分割ロジック（2026-08-10 codex 対抗評審裁決）。
+
+    従来は found_any / バナー印字が退避 continue より先に実行され、退避
+    ファイルが input に残り続ける限り「新しいファイルを検出しました！」が
+    毎輪（3秒毎）誤って印字され続けた。list_files 直後に ready/backed_off
+    へ分割し、found_any はバナーは ready_files の有無だけで決める。
+    """
+
+    def test_partition_splits_ready_and_backed_off_mixed(self):
+        state = {}
+        main._record_file_failure(state, "file-A", now_ts=1000.0)  # 次回 1003.0
+        files = [{"id": "file-A"}, {"id": "file-B"}]
+
+        ready, backed_off = main._partition_by_backoff(files, state, now_ts=1001.0)
+
+        self.assertEqual(ready, [{"id": "file-B"}])
+        self.assertEqual(backed_off, [{"id": "file-A"}])
+
+    def test_partition_all_backed_off_yields_empty_ready(self):
+        state = {}
+        main._record_file_failure(state, "file-A", now_ts=1000.0)
+        main._record_file_failure(state, "file-B", now_ts=1000.0)
+        files = [{"id": "file-A"}, {"id": "file-B"}]
+
+        ready, backed_off = main._partition_by_backoff(files, state, now_ts=1001.0)
+
+        self.assertEqual(ready, [])
+        self.assertEqual(backed_off, files)
+
+    def test_partition_boundary_due_file_is_ready(self):
+        # next_attempt_ts に到達した瞬間 (now_ts == next_attempt_ts) は
+        # 処理可能側に入る（_is_file_backed_off の `<` 境界と一致させる）
+        state = {}
+        main._record_file_failure(state, "file-A", now_ts=1000.0)  # 次回 1003.0
+        files = [{"id": "file-A"}]
+
+        ready, backed_off = main._partition_by_backoff(files, state, now_ts=1003.0)
+
+        self.assertEqual(ready, files)
+        self.assertEqual(backed_off, [])
+
+    def test_partition_preserves_order_and_does_not_mutate_state(self):
+        state = {}
+        main._record_file_failure(state, "file-B", now_ts=1000.0)
+        files = [{"id": "file-A"}, {"id": "file-B"}, {"id": "file-C"}]
+
+        ready, backed_off = main._partition_by_backoff(files, state, now_ts=1001.0)
+
+        self.assertEqual(ready, [{"id": "file-A"}, {"id": "file-C"}])
+        self.assertEqual(backed_off, [{"id": "file-B"}])
+        self.assertEqual(set(state.keys()), {"file-B"})  # 呼び出しで増減しない
+
+
+class BackoffSummaryThrottleTest(unittest.TestCase):
+    """退避中サマリは BACKOFF_SUMMARY_INTERVAL_SECONDS 秒に最大1行（codex 裁決:
+    ただ濾すだけだと "." のみになり input が空の正常状態と見分けがつかない）。
+    """
+
+    def test_interval_constant_is_60_seconds(self):
+        # 運用パラメータであり本文中にマジックナンバーとして散らさない
+        self.assertEqual(main.BACKOFF_SUMMARY_INTERVAL_SECONDS, 60)
+
+    def test_should_print_immediately_when_never_printed(self):
+        self.assertTrue(
+            main._should_print_backoff_summary(last_printed_ts=0.0, now_ts=1000.0))
+
+    def test_should_not_print_within_interval(self):
+        self.assertFalse(
+            main._should_print_backoff_summary(last_printed_ts=1000.0, now_ts=1030.0))
+
+    def test_should_print_after_interval_elapsed(self):
+        self.assertTrue(
+            main._should_print_backoff_summary(last_printed_ts=1000.0, now_ts=1060.0))
+
+    def test_should_print_exactly_at_interval_boundary(self):
+        self.assertTrue(
+            main._should_print_backoff_summary(last_printed_ts=1000.0, now_ts=1060.0))
+
+
+class BackoffSummaryFormatTest(unittest.TestCase):
+    """摘要行のフォーマット。倉庫慣例 (sheets_output.py:558) と同じ JST 明示 +
+    "%Y/%m/%d %H:%M:%S" ——ホストのローカルタイムゾーンに依存しないことを、
+    JST を明示して作った datetime から逆算した epoch で検証する。
+    """
+
+    def test_format_includes_count_and_jst_timestamp(self):
+        from datetime import datetime
+        from sheets_output import JST
+
+        dt = datetime(2026, 8, 10, 14, 32, 10, tzinfo=JST)
+        message = main._format_backoff_summary(3, dt.timestamp())
+
+        self.assertEqual(
+            message,
+            "⏳ 失敗退避中: 3件（最早次回試行: 2026/08/10 14:32:10）",
+        )
+
+    def test_format_reflects_count_argument(self):
+        from datetime import datetime
+        from sheets_output import JST
+
+        dt = datetime(2026, 8, 10, 9, 0, 0, tzinfo=JST)
+        message = main._format_backoff_summary(1, dt.timestamp())
+
+        self.assertIn("1件", message)
+
+
+class BackoffFailureMessageTimezoneTest(unittest.TestCase):
+    """個別ファイルの「🛑 退避開始」メッセージも JST 明示に統一する
+    （従来の time.strftime + time.localtime はホストのタイムゾーンに依存し、
+    Sheets 側のタイムスタンプと表記が食い違う——2026-08-10 Plan 修正）。
+    """
+
+    def test_format_jst_timestamp_matches_repo_convention(self):
+        from datetime import datetime
+        from sheets_output import JST
+
+        dt = datetime(2026, 1, 5, 3, 4, 5, tzinfo=JST)
+        self.assertEqual(
+            main._format_jst_timestamp(dt.timestamp()),
+            "2026/01/05 03:04:05",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
