@@ -5,6 +5,7 @@ import io
 import random
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 
 # Windows console encoding fix
@@ -23,7 +24,7 @@ from ocr_engine import (
 from sheets_output import (
     APPEND_RESULT_PLACEHOLDER,
     AUDIT_VERDICT_BRANCH, AUDIT_VERDICT_DRIFT, AUDIT_VERDICT_EXCLUDED,
-    AUDIT_VERDICT_MISSING, SheetsOutputWriter,
+    AUDIT_VERDICT_MISSING, JST, SheetsOutputWriter,
 )
 from notifier import send_notification
 from doc_types import DocType, DOC_TYPE_CONFIG
@@ -554,6 +555,43 @@ def _resolve_tab_owner(customer_id, customer_label):
     return customer_id
 
 
+class RetryAction(Enum):
+    """`_process_one_file` が返す「失敗退避記録への操作」（Plan D4）。
+
+    業務成否ではなく**操作**で命名する（Codex 対抗評審 P2 採納）。両者は
+    一致しない: headless の `DEAD_LETTER` は業務上は失敗だが、終態を回報
+    済みで SS は二度と再試行しないので、退避記録としては CLEAR が正しい。
+    `SUCCESS/FAILURE` と名付けると、この種の対応を毎回誤らせる。
+
+    CLEAR     : 退避記録を消す（この file は決着した）
+    INCREMENT : 失敗を 1 件加算し、次回試行を後ろへ倒す
+    KEEP      : 退避記録に一切触れない（別の抑制機構が担当中）
+    """
+
+    CLEAR = "clear"
+    INCREMENT = "increment"
+    KEEP = "keep"
+
+
+def _apply_retry_action(retry_state, file_id, file_name, action, now_ts):
+    """RetryAction を退避記録へ適用し、INCREMENT なら退避開始を告知する。
+
+    純関数ではない（retry_state をその場で更新する）が、I/O は console 出力
+    だけなので main loop を起動せずに単体検証できる。KEEP は意図的な no-op
+    ——memo 等の別機構が抑制を担当している経路で、ここで加算すると二重抑制
+    になり、控制面が直した後の再開まで最大 1 時間遅れる（Plan D4）。
+    """
+    if action is RetryAction.CLEAR:
+        _record_file_success(retry_state, file_id)
+        return
+    if action is RetryAction.INCREMENT:
+        entry = _record_file_failure(retry_state, file_id, now_ts)
+        next_attempt = _format_jst_timestamp(entry["next_attempt_ts"])
+        print(f"🛑 退避開始: {file_name}"
+              f"（累計失敗 {entry['count']} 回）"
+              f" 次回試行予定: {next_attempt}")
+
+
 def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_type,
                       processed_folder_id, split_pdf_folder_id, quarantine_alerted,
                       headless_memo, intake_state_memo, cycle, *,
@@ -584,7 +622,7 @@ def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_
                 intake_state_memo, (pre_base, file_id), cycle):
             print(f"headless memo 命中（状態非対象・TTL内）→ 本輪スキップ file_id={file_id}")
             print("=" * 30)
-            return
+            return RetryAction.KEEP  # memo が抑制中（Plan D4 #1）
 
     # 0. ヘッドレスモード入口守衛（IP-303）+ 状態白名単（IP-308/T4）: 防重檢測より
     # 前に base posting_id ＋ job 状態を検証する。
@@ -597,7 +635,7 @@ def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_
                 intake_state_memo, (base, file_id), "STATE_NOT_ALLOWED",
                 input_folder_id, cycle + _ESCALATE_MEMO_TTL_CYCLES)
         print("=" * 30)
-        return
+        return RetryAction.KEEP  # gate 拒否＝intake 側の裁決（Plan D4 #2）
 
     # 0.5 memo（費用防護、IP-308/T4、headless のみ）: 同 epoch 内で既に終態記録
     # 済みの file は本輪スキップ（零下載零OCR）。
@@ -605,7 +643,7 @@ def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_
     if job_reporter is not None and _headless_memo_skip(headless_memo, memo_key, cycle):
         print(f"headless memo 命中 → 本輪スキップ file_id={file_id}")
         print("=" * 30)
-        return
+        return RetryAction.KEEP  # memo が抑制中（Plan D4 #3）
 
     # 1. 防重檢測（UI 版のみ——headless は頁級台賬(IP-304)が硬去重を担い、
     # SS はファイル単位の move も行わない、B4 Plan §2.6 move 出口全審計）
@@ -615,7 +653,9 @@ def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_
             print("   -> 処理をスキップしてアーカイブします")
             move_file(service, file_id, input_folder_id, processed_folder_id)
             print("=" * 30)
-            return
+            # archive 完了＝決着。以後 list_files に現れないので記録も消す
+            # （Plan D4 #4）。
+            return RetryAction.CLEAR
 
     # 2. 獲取上傳者信息
     user_info = file.get('lastModifyingUser', {})
@@ -630,7 +670,9 @@ def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_
     ext = os.path.splitext(file_name)[1].lower()
     if ext not in config.SUPPORTED_EXTENSIONS:
         print(f"⚠️ 未対応のフォーマットです: {file_name}")
-        return
+        # main 側の原実装もここは護欄の外（continue）だった。行為を変えない
+        # ため KEEP（Plan D4 #5）。
+        return RetryAction.KEEP
 
     # 3.5 headless tab_owner 解決（§5.1-d T4-2/T4-3、headless のみ）:
     # customer_id 欠落は奇形 job（契約 §2 違反）——ダウンロード前に冪等
@@ -665,7 +707,12 @@ def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_
             print(f"入口守衛: customer_id 欠落（奇形 job）→ 処理スキップ・"
                   f"ファイル保持 file_id={file_id} posting_id={base}")
             print("=" * 30)
-            return
+            # KEEP（Plan D4 #6・§12【3】で辯論の上 維持）。この経路の既存契約は
+            # 「控制面が job を直せば次輪で自然回復」であり、INCREMENT すると
+            # その回復検知が最大 1 時間遅れて契約自体を変えてしまう。無界の
+            # Firestore get_job と console churn は既知問題として §10 に記載
+            # （正しい対処は backoff ではなく customer_meta_alerted の TTL 化）。
+            return RetryAction.KEEP
         if customer_meta_alerted is not None:
             # 解決成功＝欠落状態の解消。memo を解いておき、将来の再発時に
             # 改めて alert が飛ぶようにする（_finish_quarantine_move の
@@ -675,75 +722,98 @@ def _process_one_file(service, writer, job_reporter, file, input_folder_id, doc_
     # 4. 下載與處理
     local_path = download_file(service, file_id, file_name)
 
-    # 頁級台賬（IP-304、headless のみ）: 1 ファイル＝1 job、job_key=base。
-    # job_reporter と同一 Firestore client を再利用、witness probe は writer 提供。
-    ledger = None
-    page_outcomes = None
-    if job_reporter is not None and base is not None:
-        from posting_ledger import PostingLedger
-        ledger = PostingLedger(
-            job_reporter.client, base, sheet_probe=writer.probe_page)
-        # 頁処理結果台帳（契約 §5.6、B7-2 T3）。1 ファイル＝1 個、
-        # client は檔級回報（job_reporter＝job 状態）と同一を再利用。
-        from firestore_progress import FirestorePageOutcomesReporter
-        page_outcomes = FirestorePageOutcomesReporter(job_reporter.client, base)
-
-    # PDF 間分割線 + 取引No リセットは UI 版のみ（headless は取引No を
-    # Sheets A 列から都度再構築＝崩潰重跑冪等、分割線リセットは不要・有害）。
-    if ledger is None:
-        writer.start_new_file(uploader_name, doc_type, file_name)
-
     try:
-        outcome = process_file(
-            service, writer, local_path,
-            uploader_name, chat_id,
-            doc_type=doc_type, drive_file_id=file_id,
-            split_pdf_folder_id=split_pdf_folder_id,
-            base=base, ledger=ledger,
-            # Sheets 進捗タブは UI 版のみ接続（headless の頁級可視化権威は
-            # 控制面 page_outcomes——B7-2 Plan §2 非目標）。
-            progress=progress_reporter if ledger is None else None,
-            page_outcomes=page_outcomes,
-            # §5.1-d T4: headless の Sheets tab キー（None＝UI 版、行為零改動）。
-            tab_owner=tab_owner,
-            # §5.7 B8: provider 事件の書込口。**ループが持つ 1 個**を貫通させる
-            # （檔ごとに作ると配額が檔ごとに再配分され、障害中に小さな檔が
-            # 連続した時に総書込量の上界が消える——simcodex R4）。
-            # UI 版は None が渡り、行為零改動。
-            event_sink=provider_sink if ledger is not None else None,
-        )
+
+        # 頁級台賬（IP-304、headless のみ）: 1 ファイル＝1 job、job_key=base。
+        # job_reporter と同一 Firestore client を再利用、witness probe は writer 提供。
+        ledger = None
+        page_outcomes = None
+        if job_reporter is not None and base is not None:
+            from posting_ledger import PostingLedger
+            ledger = PostingLedger(
+                job_reporter.client, base, sheet_probe=writer.probe_page)
+            # 頁処理結果台帳（契約 §5.6、B7-2 T3）。1 ファイル＝1 個、
+            # client は檔級回報（job_reporter＝job 状態）と同一を再利用。
+            from firestore_progress import FirestorePageOutcomesReporter
+            page_outcomes = FirestorePageOutcomesReporter(job_reporter.client, base)
+
+        # PDF 間分割線 + 取引No リセットは UI 版のみ（headless は取引No を
+        # Sheets A 列から都度再構築＝崩潰重跑冪等、分割線リセットは不要・有害）。
+        if ledger is None:
+            writer.start_new_file(uploader_name, doc_type, file_name)
+
+        try:
+            outcome = process_file(
+                service, writer, local_path,
+                uploader_name, chat_id,
+                doc_type=doc_type, drive_file_id=file_id,
+                split_pdf_folder_id=split_pdf_folder_id,
+                base=base, ledger=ledger,
+                # Sheets 進捗タブは UI 版のみ接続（headless の頁級可視化権威は
+                # 控制面 page_outcomes——B7-2 Plan §2 非目標）。
+                progress=progress_reporter if ledger is None else None,
+                page_outcomes=page_outcomes,
+                # §5.1-d T4: headless の Sheets tab キー（None＝UI 版、行為零改動）。
+                tab_owner=tab_owner,
+                # §5.7 B8: provider 事件の書込口。**ループが持つ 1 個**を貫通させる
+                # （檔ごとに作ると配額が檔ごとに再配分され、障害中に小さな檔が
+                # 連続した時に総書込量の上界が消える——simcodex R4）。
+                # UI 版は None が渡り、行為零改動。
+                event_sink=provider_sink if ledger is not None else None,
+            )
+        finally:
+            if page_outcomes is not None:
+                # 檔終局の補写一輪（report_posted の**前**——頁時に失敗した行を
+                # 回収してから檔級終態を回報する。なお失敗は放行＝reconciler 側で
+                # 欠落として扱われる。B7-2 Plan §9 #3/#9 裁決）。finally なのは
+                # 途中例外でも真に決算済みの頁の行を落とさないため（flush 自体は
+                # 決して raise しない）。
+                page_outcomes.flush_pending()
+
+        if ledger is not None:
+            # headless 五態（B4 Plan §2.3）。move は全出口で削除済み（§2.6 全審計、
+            # SUCCESS も含め move 零呼出——回報 report_posted/report_dead_letter に
+            # 代替）。memo は outcome_label が非 None のときのみ記録する。
+            outcome_label, expire_cycle = _report_headless_outcome(
+                job_reporter, base, lease_epoch, outcome, file_id, cycle)
+            if outcome_label is not None:
+                _record_headless_memo(headless_memo, memo_key, outcome_label,
+                                      input_folder_id, expire_cycle)
+            # headless が HeadlessOutcome を正常に返した以上、**五態すべて** CLEAR
+            # （Plan D4 #9）。headless は outcome ごとの再試行抑制を memo 側で完結
+            # させており、そこへ backoff を重ねると:
+            #   ESCALATED          → memo TTL 20 輪との二重抑制。控制面の修復後の
+            #                        再判定が最大 1 時間遅れる
+            #   FAILED(retryable)  → B4 が意図的に設けた「3 秒自癒窓」（memo 不記）
+            #                        が 3s→30s→5min→30min→1h へ変質する＝既定設計の
+            #                        静かな転覆
+            # backoff が headless で担当するのは例外だけ（outcome も memo も無く、
+            # 唯一の無限リトライ経路になるため）。それは main() 側の try で拾う。
+            retry_action = RetryAction.CLEAR
+        elif outcome:
+            move_file(service, file_id, input_folder_id, processed_folder_id)
+            retry_action = RetryAction.CLEAR
+        else:
+            print("⚠️ ファイル処理失敗。")
+            # UI 経路の失敗＝backoff が担当する唯一の正常系経路（Plan D4 #8）。
+            # ファイルは IP-401 どおり input に保持され、行き先は変わらない。
+            retry_action = RetryAction.INCREMENT
+
+        return retry_action
     finally:
-        if page_outcomes is not None:
-            # 檔終局の補写一輪（report_posted の**前**——頁時に失敗した行を
-            # 回収してから檔級終態を回報する。なお失敗は放行＝reconciler 側で
-            # 欠落として扱われる。B7-2 Plan §9 #3/#9 裁決）。finally なのは
-            # 途中例外でも真に決算済みの頁の行を落とさないため（flush 自体は
-            # 決して raise しない）。
-            page_outcomes.flush_pending()
+        # 一時ファイル削除と flush は finally に置く（Plan D4・Codex 採納）。
+        # per-file の例外捕捉を main() 側へ移したので、ここで例外が抜けると
+        # そのまま関数を出る——正常系にだけ削除を書くと、失敗のたびに
+        # 一時ファイルが残り続ける。
+        if os.path.exists(local_path):
+            os.remove(local_path)
+            print("🧹 一時ファイルを削除しました")
 
-    if ledger is not None:
-        # headless 五態（B4 Plan §2.3）。move は全出口で削除済み（§2.6 全審計、
-        # SUCCESS も含め move 零呼出——回報 report_posted/report_dead_letter に
-        # 代替）。memo は outcome_label が非 None のときのみ記録する。
-        outcome_label, expire_cycle = _report_headless_outcome(
-            job_reporter, base, lease_epoch, outcome, file_id, cycle)
-        if outcome_label is not None:
-            _record_headless_memo(headless_memo, memo_key, outcome_label,
-                                  input_folder_id, expire_cycle)
-    elif outcome:
-        move_file(service, file_id, input_folder_id, processed_folder_id)
-    else:
-        print("⚠️ ファイル処理失敗。")
+        # 取引No はタブの A 列から都度算出するため書き戻し不要。
+        # flush() は将来の後処理フック用に呼び出しだけ残す。
+        writer.flush()
 
-    if os.path.exists(local_path):
-        os.remove(local_path)
-        print("🧹 一時ファイルを削除しました")
-
-    # 取引No はタブの A 列から都度算出するため書き戻し不要。
-    # flush() は将来の後処理フック用に呼び出しだけ残す。
-    writer.flush()
-
-    print("=" * 30)
+        print("=" * 30)
 
 
 def is_duplicate_file(service, md5_checksum, processed_folder_id):
@@ -1867,6 +1937,133 @@ def filter_active_folders(folder_map, writers):
             if entry[1] in writers}
 
 
+# ============ 失敗退避護欄（2026-08-10 Plan §3.6） ============
+# main.py には従来 fail_count/backoff/blacklist が皆無だった。永続的な失敗
+# （Sheets 400・Drive 故障・コードのバグ等）は SCAN_INTERVAL=3s のまま無限
+# リトライになり、毎輪 PaddleOCR + Gemini を焼き続ける（実際に事故が発生済
+# み）。ここでは IP-401「全頁失敗はファイル保持」の語義を一切変えず、
+# 再試行の"間隔"だけを制御する。状態はプロセス内メモリの dict のみ
+# （main() のローカル変数として保持）——再起動でリセットされて構わない
+# (Plan で明示許容)。ファイルの行き先（保持/移動）はこの節では一切決めない。
+
+# 級距: 3s → 30s → 5min → 30min → 上限1h（Plan §3.6 の目安どおり）
+FAILURE_BACKOFF_SCHEDULE_SECONDS = (3, 30, 300, 1800, 3600)
+
+
+def _next_backoff_seconds(fail_count):
+    """累計失敗回数 (1始まり) から次回試行までの待機秒数を返す純粋関数。
+
+    main loop を起動せずに単体検証できるよう、状態を一切持たない。
+    スケジュール長を超えたら最後の要素 (上限1h) に頭打ちする。
+    唯一の呼び出し元 _record_file_failure は常に fail_count>=1 を渡すが、
+    念のため下限は式の中で吸収する（引数を書き換えない。CLAUDE.md §7 不変）。
+    """
+    index = min(max(fail_count - 1, 0), len(FAILURE_BACKOFF_SCHEDULE_SECONDS) - 1)
+    return FAILURE_BACKOFF_SCHEDULE_SECONDS[index]
+
+
+def _record_file_failure(retry_state, file_id, now_ts):
+    """このファイルの失敗を1件加算し、次回試行可能時刻を設定する。
+
+    retry_state は {file_id: {"count": n, "next_attempt_ts": t}}。
+    呼び出し側が保持する辞書をその場で更新する（tab キャッシュ等、この
+    プロジェクトの他の行程内状態と同じ寄せ方）。更新後のエントリを返す。
+    """
+    prev_count = retry_state.get(file_id, {}).get("count", 0)
+    count = prev_count + 1
+    entry = {
+        "count": count,
+        "next_attempt_ts": now_ts + _next_backoff_seconds(count),
+    }
+    retry_state[file_id] = entry
+    return entry
+
+
+def _record_file_success(retry_state, file_id):
+    """処理成功時にこのファイルの退避記録を消す（存在しなくても no-op）。"""
+    retry_state.pop(file_id, None)
+
+
+def _is_file_backed_off(retry_state, file_id, now_ts):
+    """走査時にこのファイルを今回だけ飛ばすべきかを判定する。
+
+    記録が無い（未失敗）ファイルは常に False——他ファイルの退避に一切
+    引きずられない（護欄の核心要件: 1ファイルの退避が全体を止めない）。
+    """
+    entry = retry_state.get(file_id)
+    if entry is None:
+        return False
+    return now_ts < entry["next_attempt_ts"]
+
+
+# ---- 退避中でも他ファイルを止めない・console が沈黙しない（codex 対抗評審裁決）----
+# 従来は found_any / 「新しいファイルを検出しました！」バナーが退避 continue
+# より前に実行されており、失敗ファイルは IP-401 の語義どおり input に残り
+# 続けるため list_files が永続的に非空になり、3秒毎に誤ってバナーが印字され
+# 続けた（1h 級距まで進むと約1200回の空撃ち）。同時に、ループ末尾の "." 心拍
+# （found_any=False のときだけ出る）も退避ウィンドウ中は一切出ず、事故当時の
+# 「無限リトライで刷り潰れる」画面と見分けがつかなくなっていた。
+#
+# 対処: list_files 直後に ready/backed_off へ分割し、found_any とバナーは
+# ready_files の有無だけで決める（backed_off は無視）。退避中ファイルが
+# あることは、ただ濾すだけ（"." のみになり input 空の正常状態と区別不能）
+# ではなく、間引いた摘要行で可視化する——運用者が「護欄が効いている」と
+# 「また壊れて無限リトライしている」を見分けられる唯一の窓が console。
+
+# 摘要行の最大表示頻度（秒）。運用パラメータなので名前付き定数にする——
+# 短くすれば追跡性は上がるがログが埋まる、長くすれば逆。調整時はここだけ変える。
+BACKOFF_SUMMARY_INTERVAL_SECONDS = 60
+
+
+def _format_jst_timestamp(ts):
+    """UNIX 秒 (float) を JST 明示の "%Y/%m/%d %H:%M:%S" 表記に変換する。
+
+    倉庫慣例 (sheets_output.py:558・page_progress.py) に合わせる。ホストの
+    ローカルタイムゾーンに依存する time.strftime + time.localtime を使うと、
+    開発機やタイムゾーン設定が変わったとき、console に出る「次回試行予定」が
+    Sheets 側の全タイムスタンプと表記（区切り文字・時差）がずれる——console は
+    無人稼働機で唯一の照合手段なので、ここで JST を明示する。
+    """
+    return datetime.fromtimestamp(ts, JST).strftime("%Y/%m/%d %H:%M:%S")
+
+
+def _format_backoff_summary(count, earliest_next_attempt_ts):
+    """退避中ファイル数と最早の次回試行時刻から console 用の一行摘要を作る。
+
+    純粋関数——main loop を起動せずに検証できる（_next_backoff_seconds 等と
+    同じ寄せ方）。
+    """
+    earliest_str = _format_jst_timestamp(earliest_next_attempt_ts)
+    return f"⏳ 失敗退避中: {count}件（最早次回試行: {earliest_str}）"
+
+
+def _should_print_backoff_summary(last_printed_ts, now_ts):
+    """直近の摘要表示から BACKOFF_SUMMARY_INTERVAL_SECONDS 秒以上経過したか。
+
+    last_printed_ts=0（未表示）なら常に True——退避が始まった最初の輪で
+    即座に見えるようにする。
+    """
+    return now_ts - last_printed_ts >= BACKOFF_SUMMARY_INTERVAL_SECONDS
+
+
+def _partition_by_backoff(files, retry_state, now_ts):
+    """files を処理可能 (ready) と退避中 (backed_off) に分ける純粋関数。
+
+    退避判定は _is_file_backed_off に委譲し、呼び出し側が輪ごとに1回だけ
+    取った now_ts を全ファイルへ同じ値で適用する（ファイルごとに
+    time.time() を取り直さない）。retry_state は読み取りのみで書き換えず、
+    順序は入力の files をそのまま保つ。
+    """
+    ready_files = []
+    backed_off_files = []
+    for file in files:
+        if _is_file_backed_off(retry_state, file['id'], now_ts):
+            backed_off_files.append(file)
+        else:
+            ready_files.append(file)
+    return ready_files, backed_off_files
+
+
 def main():
     print("🚀 Super Scaner 自動化システム起動！(Sheets出力版)")
 
@@ -1948,10 +2145,22 @@ def main():
             print(f"      - {label}: ...{fid[-5:]}")
     print("-" * 30)
 
+    # {drive_file_id: {"count": n, "next_attempt_ts": t}}。プロセス内メモリ
+    # のみで保持し、再起動でリセットされてよい（Plan §3.6 で明示許容）。
+    file_retry_state = {}
+    # 退避中サマリの直近表示時刻（0=未表示）。file_retry_state 同様プロセス内
+    # メモリのみで、再起動でリセットされてよい。
+    last_backoff_summary_ts = 0
+
     while True:
         try:
             found_any = False
             cycle += 1
+            # この輪で全ファイルに同じ now を使う（ファイルごとに取り直さない
+            # ——codex 対抗評審裁決・Plan §1）。
+            now_ts = time.time()
+            backed_off_total = 0
+            earliest_next_attempt_ts = None
 
             for input_folder_id, (doc_type, profile_key) in active_folder_map.items():
                 files = list_files(service, input_folder_id)
@@ -1966,6 +2175,27 @@ def main():
                 if not files:
                     continue
 
+                # 護欄（Plan §3.6）: 退避中ファイルは list_files 直後に濾す。
+                # found_any・バナーは ready_files の有無だけで決める——退避
+                # ファイルが input に残り続けても（IP-401 の語義どおり）、
+                # 誤って「新しいファイルを検出しました！」を毎輪印字しない
+                # （codex 対抗評審裁決: 旧実装はここで found_any=True にしていた）。
+                ready_files, backed_off_files = _partition_by_backoff(
+                    files, file_retry_state, now_ts)
+
+                if backed_off_files:
+                    backed_off_total += len(backed_off_files)
+                    folder_earliest_ts = min(
+                        file_retry_state[f['id']]["next_attempt_ts"]
+                        for f in backed_off_files
+                    )
+                    if (earliest_next_attempt_ts is None
+                            or folder_earliest_ts < earliest_next_attempt_ts):
+                        earliest_next_attempt_ts = folder_earliest_ts
+
+                if not ready_files:
+                    continue
+
                 profile = profiles[profile_key]
                 writer = writers[profile_key]
                 progress_reporter = progress_reporters.get(profile_key)
@@ -1976,15 +2206,45 @@ def main():
                 print(f"\n\n🔎 [{profile['label']}/{type_label}] "
                       f"新しいファイルを検出しました！")
 
-                for file in files:
-                    _process_one_file(
-                        service, writer, job_reporter, file, input_folder_id,
-                        doc_type, processed_folder_id,
-                        profile["split_pdf_folder_id"], quarantine_alerted,
-                        headless_memo, intake_state_memo, cycle,
-                        progress_reporter=progress_reporter,
-                        customer_meta_alerted=customer_meta_alerted,
-                        provider_sink=provider_sink)
+                # 回すのは ready_files（Plan C4・Codex P0）。HEAD 側は
+                # `for file in files:` だったので字義どおり採ると、直前で
+                # 算出した ready_files を無視して退避中ファイルを毎輪処理
+                # する＝護欄が完全に無力化する。
+                for file in ready_files:
+                    # per-file の例外隔離は**ここ**に置く（Plan D4・Codex 採納）。
+                    # _process_one_file の内側で download/start/process だけを
+                    # 包む案だと、_report_headless_outcome（Firestore 書込）や
+                    # move_file、intake gate の例外が main() の外殻 try まで
+                    # 逃げ、同バッチの後続ファイルを巻き添えにして走査を
+                    # 止める——1 個の壊れたファイルが行列全体を塞いではならない。
+                    try:
+                        action = _process_one_file(
+                            service, writer, job_reporter, file, input_folder_id,
+                            doc_type, processed_folder_id,
+                            profile["split_pdf_folder_id"], quarantine_alerted,
+                            headless_memo, intake_state_memo, cycle,
+                            progress_reporter=progress_reporter,
+                            customer_meta_alerted=customer_meta_alerted,
+                            provider_sink=provider_sink)
+                    except Exception as e:
+                        print(f"❌ ファイル処理で例外発生: {file['name']}: {e}")
+                        # 例外は UI/headless 共通で backoff の担当（Plan D4 #10）:
+                        # outcome も memo も残らないので、ここを INCREMENT に
+                        # しないと唯一の無限リトライ経路が塞がらない。
+                        action = RetryAction.INCREMENT
+
+                    _apply_retry_action(file_retry_state, file['id'],
+                                        file['name'], action, time.time())
+
+            # 退避中ファイルの可視化（護欄・Plan §3.6）。ただ濾すだけだと
+            # "." のみになり input が完全に空の正常状態と見分けがつかない
+            # ——codex 対抗評審裁決。BACKOFF_SUMMARY_INTERVAL_SECONDS 秒に
+            # 最大1行まで間引く（毎輪印字するとログが埋まる）。
+            if backed_off_total > 0 and _should_print_backoff_summary(
+                    last_backoff_summary_ts, now_ts):
+                print(_format_backoff_summary(
+                    backed_off_total, earliest_next_attempt_ts))
+                last_backoff_summary_ts = now_ts
 
             if not found_any:
                 print(".", end="", flush=True)

@@ -58,8 +58,12 @@ def _call_process_one_file(writer, job_reporter, *, file=None, headless_memo=Non
                            intake_state_memo=None, cycle=1,
                            customer_meta_alerted=None):
     """main._process_one_file の呼出し足場（ProcessOneFileTest と
-    IntakeStatePreGateMemoTest で共用、simcodex Round 2 #11 と同型の DRY）。"""
-    main._process_one_file(
+    IntakeStatePreGateMemoTest で共用、simcodex Round 2 #11 と同型の DRY）。
+
+    戻り値＝`main.RetryAction`（merge 2026-08-11 で追加）。既存の呼出側は
+    戻り値を見ないので無影響で、RetryActionTest だけが消費する。
+    """
+    return main._process_one_file(
         service=None, writer=writer, job_reporter=job_reporter,
         file=file if file is not None else _file(), input_folder_id="in",
         doc_type="receipt", processed_folder_id="processed",

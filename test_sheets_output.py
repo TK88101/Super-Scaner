@@ -5,6 +5,7 @@ sheets_output は gspread を import するため venv311 で実行する:
     venv311/bin/python -m pytest test_sheets_output.py -v
 """
 import io
+import json
 import os
 import sys
 import unittest
@@ -14,6 +15,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(__file__))
 
 import gspread
+import requests
 
 from doc_types import DocType
 from sheets_output import (
@@ -21,6 +23,19 @@ from sheets_output import (
     AUDIT_HEADERS, AUDIT_TAB_NAME, _build_description, _tab_name,
     SheetsOutputWriter,
 )
+
+
+def _make_api_error(status_code, message="Unable to parse range: 'x'"):
+    """gspread.exceptions.APIError の最小合成。判定は response.status_code で
+    行う（Plan 2026-08-10 §3.1: 文字列一致は診断ログ用のみで判定根拠にしない）。
+    """
+    resp = requests.models.Response()
+    resp.status_code = status_code
+    resp._content = json.dumps(
+        {"error": {"code": status_code, "message": message,
+                   "status": "INVALID_ARGUMENT"}}
+    ).encode("utf-8")
+    return gspread.exceptions.APIError(resp)
 
 
 class BuildDescriptionTest(unittest.TestCase):
@@ -63,17 +78,28 @@ class _FakeWorksheet:
         self._values.extend(rows)
 
 
-def _make_writer(tab_namer=None):
+def _make_writer(spreadsheet=None, audit_row_count=0, tab_namer=None):
     """gspread 認証を回避した SheetsOutputWriter を組み立てる。
+
+    __init__ の私有属性を一箇所で全て揃える単一ファクトリ（3本の手抄
+    ファクトリがそれぞれ違う部分集合しか設定せず非同期化していた反省——
+    __init__ に快取属性が増えたら、直すのはここ1箇所で足りる）。
+    `spreadsheet` を省略すると None のままになるため、`_get_or_create_tab`
+    等を patch せず本物のスプレッドシート経路を通すテストは
+    `_FakeAuditSpreadsheet`（sheetId 引きの get_worksheet_by_id も持つ）を
+    明示的に渡すこと。
 
     `_tab_namer` の既定はクラス属性が供給する（§5.1-d T4・simcodex R1）ため、
     注入時（headless の `lambda owner, doc_type: owner` 等を模す場合）のみ
     インスタンスへ上書きする。
     """
     writer = SheetsOutputWriter.__new__(SheetsOutputWriter)
-    # _get_next_txn_no（line 59）が try 外で参照する属性。欠けると AttributeError
+    writer.spreadsheet = spreadsheet
+    writer._ws_cache = {}
+    writer._tab_has_data = {}
     writer._tab_next_txn = {}
     writer._tabs_sanitized = set()  # _sanitize_trailing_once が参照する
+    writer._audit_row_count = audit_row_count
     if tab_namer is not None:
         writer._tab_namer = tab_namer
     return writer
@@ -115,8 +141,7 @@ def _run_append_entries(doc_type, data, patch_highlight=True,
                                max_retries=5):
         call_log.append(("doc", cell_ref, fmt))
 
-    def fake_unrecognized(self, worksheet, tab_name, entries_data,
-                          source_url):
+    def fake_unrecognized(self, tab_name, entries_data, source_url):
         placeholder_calls.append((tab_name, entries_data, source_url))
 
     with ExitStack() as stack:
@@ -708,7 +733,15 @@ class TabNamerInjectionTest(unittest.TestCase):
                 writer.append_entries(
                     "20220401　株式会社緒方材木店", DocType.RECEIPT, data,
                     source_url="http://x")
-        m_tab.assert_called_once_with("20220401　株式会社緒方材木店")
+        # main 合流後、append_entries は tab を 2 回解決する（先頭の 1 回＋
+        # _with_tab_recovery 内の _resolve_tab。後者は _ws_cache 命中なので
+        # 追加 API は発生しない）。本テストが固定したいのは「注入した
+        # tab_namer が出す名前で引いているか」であって回数ではないので、
+        # 全呼出しの引数が注入名であることを検証する——復旧経路が別名で
+        # 引いてしまう退行も、これなら捕まえられる。
+        self.assertGreaterEqual(m_tab.call_count, 1)
+        for c in m_tab.call_args_list:
+            self.assertEqual(c.args, ("20220401　株式会社緒方材木店",))
 
 
 class CommitPageTest(unittest.TestCase):
@@ -978,13 +1011,25 @@ class AppendEntriesReturnValueTest(unittest.TestCase):
 
 
 class _FakeAuditWorksheet:
-    """監査タブ用の worksheet スタブ（ヘッダ1行のみの素のタブ）。"""
+    """監査タブ用の worksheet スタブ（ヘッダ1行のみの素のタブ）。
+
+    id は自動採番（9000起点、全インスタンス共通のクラス変数カウンタ）。
+    add_worksheet 経由で新規作成されたタブも get_worksheet_by_id
+    （Plan §3.1 の sheetId 引き失効判定）で引けるようにするため
+    （旧 _FakeSpreadsheetWithId が個別に持っていた採番ロジックを統合）。
+    明示的な sheetId が要るテストはサブクラス _FakeRecoveryWorksheet が
+    __init__ でこの値を上書きする。
+    """
+
+    _next_id = 9000
 
     def __init__(self, values=None):
         self._values = [list(r) for r in values] if values is not None else []
         self.appended = []
         self.row_count = 1000
         self.added_rows = 0
+        self.id = _FakeAuditWorksheet._next_id
+        _FakeAuditWorksheet._next_id += 1
 
     def get_all_values(self):
         return [list(r) for r in self._values]
@@ -1005,10 +1050,26 @@ class _FakeAuditWorksheet:
 
 
 class _FakeAuditSpreadsheet:
-    """worksheet 取得/作成だけを提供するスプレッドシート代役。"""
+    """worksheet 取得/作成を提供するスプレッドシート代役。
+
+    名前引き（worksheet）に加えて sheetId 引き（get_worksheet_by_id）も
+    ベースクラスで提供する（Plan §3.1 の失効判定の権威）。旧
+    _FakeSpreadsheetWithId は add_worksheet の大半が本クラスと逐字重複した
+    サブクラスに過ぎなかったため統合し、自増 id は _FakeAuditWorksheet
+    側へ下放した。
+
+    **クラス名は `_FakeAuditSpreadsheet` を維持すること**（Plan D5）。
+    main 側はこれを `_FakeSpreadsheet` と名付けていたが、本ファイルには
+    既に probe テスト用の別語義の `_FakeSpreadsheet`（`{tab: [[rows]]}` を
+    受ける）が上流に定義されており、同名にすると後定義が勝って
+    `ProbePageTest` が `{ws.id ...}` で AttributeError になる。git は
+    この衝突を一切警告しない。
+    """
+
 
     def __init__(self, existing=None):
         self._sheets = dict(existing or {})
+        self._by_id = {ws.id: ws for ws in self._sheets.values()}
         self.created = []
 
     def worksheet(self, title):
@@ -1019,19 +1080,19 @@ class _FakeAuditSpreadsheet:
     def add_worksheet(self, title, rows, cols):
         ws = _FakeAuditWorksheet()
         self._sheets[title] = ws
+        self._by_id[ws.id] = ws
         self.created.append({"title": title, "rows": rows, "cols": cols})
         return ws
 
+    def get_worksheet_by_id(self, sheet_id):
+        if sheet_id not in self._by_id:
+            raise gspread.exceptions.WorksheetNotFound(sheet_id)
+        return self._by_id[sheet_id]
+
 
 def _make_audit_writer(existing=None):
-    """gspread 認証を回避した、監査タブ用の SheetsOutputWriter。"""
-    writer = SheetsOutputWriter.__new__(SheetsOutputWriter)
-    writer._ws_cache = {}
-    writer._tab_has_data = {}
-    writer._tab_next_txn = {}
-    writer._tabs_sanitized = set()
-    writer.spreadsheet = _FakeAuditSpreadsheet(existing)
-    return writer
+    """監査タブ用の SheetsOutputWriter（_make_writer に _FakeAuditSpreadsheet を積む）。"""
+    return _make_writer(spreadsheet=_FakeAuditSpreadsheet(existing))
 
 
 class AuditTabTest(unittest.TestCase):
@@ -1138,6 +1199,454 @@ class AuditTabTest(unittest.TestCase):
         # Assert: 新規作成せず追記のみ
         self.assertEqual(writer.spreadsheet.created, [])
         self.assertEqual(len(existing.get_all_values()), 3)
+
+
+class _FakeRecoveryWorksheet(_FakeAuditWorksheet):
+    """tab 失効復旧テスト用の worksheet スタブ。sheetId（.id）を持ち、
+    fail_calls 回だけ get_all_values/append_rows を APIError で失敗させる
+    （実際の事故と同様、どちらのメソッドを先に叩いても同じ 400 を返す）。
+    """
+
+    def __init__(self, sheet_id, values=None, fail_calls=0, error_factory=None):
+        super().__init__(values)
+        self.id = sheet_id
+        self._fail_calls = fail_calls
+        self._error_factory = error_factory or (lambda: _make_api_error(400))
+
+    def _consume_failure(self):
+        if self._fail_calls > 0:
+            self._fail_calls -= 1
+            raise self._error_factory()
+
+    def get_all_values(self):
+        self._consume_failure()
+        return super().get_all_values()
+
+    def append_rows(self, rows, value_input_option=None):
+        self._consume_failure()
+        return super().append_rows(rows, value_input_option=value_input_option)
+
+
+def _make_recovery_writer(existing=None, audit_row_count=0):
+    """tab 失効復旧テスト用の SheetsOutputWriter（_make_writer に
+    get_worksheet_by_id を持つ _FakeAuditSpreadsheet を積む。同名タブが別 id で
+    作り直された事故は、既存 worksheet に明示的な sheetId を持つ
+    _FakeRecoveryWorksheet を渡すことで模せる——名前 registry と id
+    registry は _FakeAuditSpreadsheet.__init__ が existing から独立に構築する）。
+    """
+    return _make_writer(spreadsheet=_FakeAuditSpreadsheet(existing),
+                        audit_row_count=audit_row_count)
+
+
+class TabDeletedRecoveryTest(unittest.TestCase):
+    """Plan 2026-08-10 worksheet-cache-invalidation T1: tab が実行中に
+    削除されても（GAS の毎晩 22:00 一括削除 / 手動削除）次の書込で自己修復
+    する。判定の権威は tab 名ではなく sheetId（get_worksheet_by_id）。
+    文字列一致（'Unable to parse range'）は診断ログ用のみで判定根拠にしない。
+    """
+
+    def test_append_entries_recovers_when_sheet_id_gone(self):
+        # Arrange: 旧 tab（sheetId=1）を快取済みだが、spreadsheet 上には
+        # 既に実在しない（GAS 削除 or 手動削除を模す）
+        tab = "従業員_領収書"
+        old_ws = _FakeRecoveryWorksheet(sheet_id=1, fail_calls=1)
+        writer = _make_recovery_writer()
+        writer._ws_cache[tab] = old_ws
+        writer._tab_next_txn[tab] = 3  # 快取ヒットのみで API を叩かない値
+
+        data = {"date": "2026/08/10", "vendor": "テスト商店", "invoice_num": "",
+                "memo": "", "entries": [_entry(1000)]}
+
+        # Act
+        with redirect_stdout(io.StringIO()):
+            result = writer.append_entries("従業員", DocType.RECEIPT, data,
+                                           source_url="https://x/1")
+
+        # Assert: 修正前は APIError が漏れる。修正後は 'posted' が返り、
+        # 行が新 ws に入る
+        self.assertEqual(result, APPEND_RESULT_POSTED)
+        new_ws = writer._ws_cache[tab]
+        self.assertIsNot(new_ws, old_ws)
+        values = new_ws.get_all_values()
+        self.assertTrue(
+            any(len(row) > 8 and row[8] == 1000 for row in values),
+            f"金額1000の行が新 tab に見当たらない: {values}")
+
+    def test_recovery_rebinds_cache_to_new_worksheet(self):
+        # Arrange: 名前引きで見つかる新 tab（sheetId=2、既存1行=取引No 9）と、
+        # 旧 sheetId=1 の快取が食い違っている状況
+        tab = "従業員_領収書"
+        old_ws = _FakeRecoveryWorksheet(sheet_id=1, fail_calls=1)
+        new_ws = _FakeRecoveryWorksheet(sheet_id=2, values=[["9"]])
+        writer = _make_recovery_writer({tab: new_ws})
+        writer._ws_cache[tab] = old_ws
+        writer._tab_next_txn[tab] = 7
+
+        # Act
+        with redirect_stdout(io.StringIO()):
+            writer._with_tab_recovery(tab, lambda w: w.get_all_values())
+
+        # Assert（Codex HIGH 採用の訂正 DoD）: 復旧後は快取が再充填され、
+        # 新しい sheetId を指す。_tab_next_txn は破棄済みなので、次回参照時に
+        # 新 tab の A 列を実測し直す（既存最大9 → 次は10）
+        self.assertIs(writer._ws_cache[tab], new_ws)
+        self.assertEqual(writer._ws_cache[tab].id, 2)
+        self.assertNotIn(tab, writer._tab_next_txn)
+        self.assertEqual(writer._get_next_txn_no(tab, writer._ws_cache[tab]), 10)
+
+    def test_same_name_tab_recreated_is_treated_as_loss(self):
+        # Arrange: 同名タブが別 sheetId(2) で作り直されている。名前引きなら
+        # 「見つかる」ため誤って失効ではないと判定してしまう反例（Plan §3.1）
+        tab = "従業員_領収書"
+        old_ws = _FakeRecoveryWorksheet(sheet_id=1, fail_calls=1)
+        new_ws = _FakeRecoveryWorksheet(sheet_id=2)
+        writer = _make_recovery_writer({tab: new_ws})
+        writer._ws_cache[tab] = old_ws
+
+        calls = []
+
+        def fn(w):
+            calls.append(1)
+            return w.get_all_values()
+
+        # Act
+        with redirect_stdout(io.StringIO()):
+            result = writer._with_tab_recovery(tab, fn)
+
+        # Assert: id 引きなので失効と判定して復旧する。同名で既に存在する
+        # ため add_worksheet は呼ばれない
+        self.assertEqual(result, [])
+        self.assertIs(writer._ws_cache[tab], new_ws)
+        self.assertEqual(writer.spreadsheet.created, [])
+        self.assertEqual(len(calls), 2)
+
+    def test_recovery_retries_only_once(self):
+        # Arrange: 復旧後の再試行も失敗し続けるケース
+        tab = "従業員_領収書"
+        old_ws = _FakeRecoveryWorksheet(sheet_id=1, fail_calls=1)
+        writer = _make_recovery_writer()
+        writer._ws_cache[tab] = old_ws
+
+        call_count = [0]
+
+        def fn(w):
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                raise _make_api_error(400)
+            return w.get_all_values()
+
+        # Act / Assert: 2 回目の失敗は呼出側へ伝播する
+        with redirect_stdout(io.StringIO()):
+            with self.assertRaises(gspread.exceptions.APIError):
+                writer._with_tab_recovery(tab, fn)
+
+        # Assert: fn は初回失敗＋再試行1回の計2回。add_worksheet は1回のみ
+        # （無限再構築ループを作らない）
+        self.assertEqual(call_count[0], 2)
+        self.assertEqual(len(writer.spreadsheet.created), 1)
+
+    def test_other_400_is_not_treated_as_tab_loss(self):
+        # Arrange: get_worksheet_by_id が見つかる = 失効ではない
+        tab = "従業員_領収書"
+        old_ws = _FakeRecoveryWorksheet(sheet_id=1)
+        writer = _make_recovery_writer({tab: old_ws})
+        writer._ws_cache[tab] = old_ws
+
+        original_error = _make_api_error(400)
+        call_count = [0]
+
+        def fn(w):
+            call_count[0] += 1
+            raise original_error
+
+        # Act / Assert: 元例外がそのまま伝播、add_worksheet 不呼出
+        with redirect_stdout(io.StringIO()):
+            with self.assertRaises(gspread.exceptions.APIError) as ctx:
+                writer._with_tab_recovery(tab, fn)
+
+        self.assertIs(ctx.exception, original_error)
+        self.assertEqual(call_count[0], 1)
+        self.assertEqual(writer.spreadsheet.created, [])
+
+    def test_append_audit_row_recovers_and_remeasures_count(self):
+        # Arrange: 監査タブの快取(sheetId=1)が消滅し、名前引きで見つかる
+        # 新タブ（sheetId=2、ヘッダ+既存1行）に復旧する
+        old_ws = _FakeRecoveryWorksheet(sheet_id=1, fail_calls=1)
+        new_ws = _FakeRecoveryWorksheet(sheet_id=2, values=[
+            list(AUDIT_HEADERS),
+            ["2026/08/01 10:00:00", "old.pdf", 1, "除外", "envelope", 10, ""],
+        ])
+        writer = _make_recovery_writer({AUDIT_TAB_NAME: new_ws},
+                                       audit_row_count=99)
+        writer._ws_cache[AUDIT_TAB_NAME] = old_ws
+
+        # Act
+        with redirect_stdout(io.StringIO()):
+            writer.append_audit_row(filename="new.pdf", page_num=2,
+                                    verdict="除外", reason="envelope",
+                                    ocr_text_len=20, source_url="https://x/2")
+
+        # Assert: 快取は新 ws を指し、行数は実測(2)+今回1=3（旧99が残らない）
+        self.assertIs(writer._ws_cache[AUDIT_TAB_NAME], new_ws)
+        self.assertEqual(writer._audit_row_count, 3)
+        self.assertEqual(len(new_ws.get_all_values()), 3)
+
+    def test_general_tab_loss_does_not_reset_audit_counter(self):
+        # Arrange: 一般 tab の失効。監査カウンタが巻き添えにならないことを
+        # 確認する（Codex MEDIUM 採用）
+        tab = "従業員_領収書"
+        old_ws = _FakeRecoveryWorksheet(sheet_id=1, fail_calls=1)
+        writer = _make_recovery_writer(audit_row_count=5)
+        writer._ws_cache[tab] = old_ws
+
+        # Act
+        with redirect_stdout(io.StringIO()):
+            writer._with_tab_recovery(tab, lambda w: w.get_all_values())
+
+        # Assert
+        self.assertEqual(writer._audit_row_count, 5)
+
+    def test_unrecognized_row_path_recovers(self):
+        # Arrange
+        tab = "従業員_領収書"
+        old_ws = _FakeRecoveryWorksheet(sheet_id=1, fail_calls=1)
+        writer = _make_recovery_writer()
+        writer._ws_cache[tab] = old_ws
+        writer._tab_next_txn[tab] = 4
+
+        entries_data = {"date": "", "vendor": "", "_unrecognized": True,
+                        "memo": ""}
+
+        # Act
+        with redirect_stdout(io.StringIO()):
+            writer._write_unrecognized_row(tab, entries_data, "https://x/1")
+
+        # Assert: 占位行経路でも復旧する
+        new_ws = writer._ws_cache[tab]
+        self.assertIsNot(new_ws, old_ws)
+        values = new_ws.get_all_values()
+        self.assertTrue(
+            any(len(row) > 18 and row[18] == "⚠ 認識不能ページ" for row in values),
+            f"占位行が新 tab に見当たらない: {values}")
+
+    def test_txn_no_remeasured_from_new_tab_after_recovery(self):
+        """趙 2026-08-10 拍板: 取引No の採番も復旧範囲に含める。
+
+        旧 tab の取引No キャッシュを 5 に温めておく（append_entries の初回
+        _get_next_txn_no 呼び出しはキャッシュヒットで API を叩かない＝rows は
+        5 で構築される）。復旧先の新タブは空なので実測なら次は1のはず。
+        直さないと rows に焼き込み済みの5がそのまま新タブへ書かれ、
+        新タブの実際の状態（空）と食い違う欠番/誤番になる。
+        """
+        # Arrange
+        tab = "従業員_領収書"
+        old_ws = _FakeRecoveryWorksheet(sheet_id=1, fail_calls=1)
+        new_ws = _FakeRecoveryWorksheet(sheet_id=2)  # 空タブ
+        writer = _make_recovery_writer({tab: new_ws})
+        writer._ws_cache[tab] = old_ws
+        writer._tab_next_txn[tab] = 5
+
+        data = {"date": "2026/08/10", "vendor": "テスト商店", "invoice_num": "",
+                "memo": "", "entries": [_entry(1000)]}
+
+        # Act
+        with redirect_stdout(io.StringIO()):
+            result = writer.append_entries("従業員", DocType.RECEIPT, data,
+                                           source_url="https://x/1")
+
+        # Assert: 新表実測(1)で書かれる。旧表基準の5ではない
+        self.assertEqual(result, APPEND_RESULT_POSTED)
+        written_row = new_ws.appended[-1]
+        self.assertEqual(written_row[0], 1)
+        # 次回採番も実測値+1（6ではなく2）に更新されている
+        self.assertEqual(writer._tab_next_txn[tab], 2)
+
+    def test_ensure_row_capacity_targets_recovered_worksheet(self):
+        """趙 2026-08-10 拍板: append_audit_row の _ensure_row_capacity を
+        復旧範囲に含める。旧実装は復旧前に取得した ws に対して1回だけ呼び、
+        新 tab には一度も効かなかった（既に消えた sheet への空振りが
+        best-effort の try/except に自吞まれる）。
+        """
+        # Arrange: 監査タブの快取(sheetId=1)が消滅し、新タブ(sheetId=2、
+        # 既存1行=ヘッダのみ)に復旧するケース
+        old_ws = _FakeRecoveryWorksheet(sheet_id=1, fail_calls=1)
+        new_ws = _FakeRecoveryWorksheet(sheet_id=2, values=[list(AUDIT_HEADERS)])
+        writer = _make_recovery_writer({AUDIT_TAB_NAME: new_ws},
+                                       audit_row_count=99)
+        writer._ws_cache[AUDIT_TAB_NAME] = old_ws
+
+        capacity_calls = []
+
+        def fake_ensure_row_capacity(self, worksheet, needed_last_row):
+            capacity_calls.append((worksheet, needed_last_row))
+
+        # Act
+        with redirect_stdout(io.StringIO()):
+            with patch.object(SheetsOutputWriter, "_ensure_row_capacity",
+                              fake_ensure_row_capacity):
+                writer.append_audit_row(filename="r.pdf", page_num=1,
+                                        verdict="除外", reason="envelope",
+                                        ocr_text_len=10, source_url="")
+
+        # Assert: 復旧後の新 ws に対して、実測し直した行数(1)+1=2 で容量確保
+        # が呼ばれている（旧実装は旧 ws・旧 audit_row_count(99+1) にしか
+        # 呼ばれず、新 ws には一度も効かなかった）
+        self.assertIn((new_ws, 2), capacity_calls)
+
+    def test_normal_path_makes_no_extra_api_calls(self):
+        """趙 2026-08-10 拍板: 復旧が起きない通常経路では、取引No 再測定を
+        同じ復旧単位に加えても追加の Google API 呼び出しが発生しないこと
+        （_get_next_txn_no はタブ単位キャッシュのためキャッシュヒットで
+        get_all_values を呼ばない）。復旧の代償は例外時のみに限定する。
+        """
+        # Arrange: 失効なし（fail_calls=0）。取引No キャッシュを温めておき、
+        # 通常経路での get_all_values 呼び出し回数を数える
+        tab = "従業員_領収書"
+
+        class _CountingWorksheet(_FakeRecoveryWorksheet):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self.get_all_values_calls = 0
+
+            def get_all_values(self):
+                self.get_all_values_calls += 1
+                return super().get_all_values()
+
+        ws = _CountingWorksheet(sheet_id=1)
+        writer = _make_recovery_writer({tab: ws})
+        writer._ws_cache[tab] = ws
+        writer._tab_next_txn[tab] = 3  # キャッシュヒットで採番の API 呼び出しを避ける
+
+        data = {"date": "2026/08/10", "vendor": "テスト商店", "invoice_num": "",
+                "memo": "", "entries": [_entry(1000)]}
+
+        # Act
+        with redirect_stdout(io.StringIO()):
+            result = writer.append_entries("従業員", DocType.RECEIPT, data,
+                                           source_url="https://x/1")
+
+        # Assert: 失効なし経路では取引No 再測定はキャッシュヒットで済み、
+        # get_all_values は書込前の行数実測1回のみ（追加 API 呼び出しなし）
+        self.assertEqual(result, APPEND_RESULT_POSTED)
+        self.assertEqual(ws.get_all_values_calls, 1)
+
+    def test_unrecognized_row_txn_no_remeasured_after_recovery(self):
+        """趙 2026-08-10 拍板: _write_unrecognized_row（占位行経路）でも
+        取引No の採番を復旧範囲に含める（append_entries と同一機構。
+        片方だけ直すと必ず漂移する——sheets_output.py 既存コメント方針）。
+        """
+        # Arrange: 旧タブのキャッシュを 4 に温めておくが、復旧先の新タブは空
+        tab = "従業員_領収書"
+        old_ws = _FakeRecoveryWorksheet(sheet_id=1, fail_calls=1)
+        new_ws = _FakeRecoveryWorksheet(sheet_id=2)  # 空タブ
+        writer = _make_recovery_writer({tab: new_ws})
+        writer._ws_cache[tab] = old_ws
+        writer._tab_next_txn[tab] = 4
+
+        entries_data = {"date": "", "vendor": "", "_unrecognized": True,
+                        "memo": ""}
+
+        # Act
+        with redirect_stdout(io.StringIO()):
+            writer._write_unrecognized_row(tab, entries_data, "https://x/1")
+
+        # Assert: 新表実測(1)で書かれる。旧表基準の4ではない
+        written_row = new_ws.appended[-1]
+        self.assertEqual(written_row[0], 1)
+        self.assertEqual(writer._tab_next_txn[tab], 2)
+
+
+class RenumberLogOnNormalPathTest(unittest.TestCase):
+    """C6: 復旧が起きていない通常経路で「取引No を再採番」を印字しない。
+
+    merge 合成時に `block.next_txn_no`（＝**次の**票の番号）を復旧判定の比較
+    対象にしてしまうと、+1 された値と実測値を比べることになり、tab が消えて
+    いない通常経路でも毎回このログが出続ける。しかも行値だけは偶然正しい値
+    へ再代入されるため、**既存のどのテストでも検出できない**——だからここで
+    ログ自体を固定する（Plan C6・Codex P1）。
+    """
+
+    def test_append_entries_does_not_log_renumber(self):
+        # module 直下の共通ハーネスを再利用する（戻り値 [2] が stdout）。
+        # 同じ patch 一式を手写きすると、ハーネス側が育った時に取り残される。
+        _, _, stdout_text, _, _ = _run_append_entries(
+            DocType.RECEIPT, _receipt_result("店A", [_entry(5000)], total=5000))
+        self.assertNotIn("再採番", stdout_text)
+
+    def test_unrecognized_row_does_not_log_renumber(self):
+        writer = _make_writer()
+        ws = _FakeWorksheet()
+        buf = io.StringIO()
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(
+                SheetsOutputWriter, "_get_or_create_tab", return_value=ws))
+            with redirect_stdout(buf):
+                writer._write_unrecognized_row(
+                    "従業員_領収書", {"_unrecognized": True, "memo": "x"},
+                    "http://x")
+        self.assertNotIn("再採番", buf.getvalue())
+
+
+class HeadlessWritePathKnownLimitationTest(unittest.TestCase):
+    """D3【既知欠陥・意図的に残す】headless 書込点に tab 失効自愈が無い。
+
+    立項先: docs/plans/2026-08-11-merge-main-into-headless.md §4 D3 / §10。
+
+    UI 経路の 3 書込点（append_entries / _write_unrecognized_row /
+    append_audit_row）は `_with_tab_recovery` を通るが、headless の
+    `commit_page` / `peek_append_range` は解決済み worksheet を直接使うため、
+    tab が実行中に消えると 400 がそのまま外へ出る。素朴に closure を被せると
+    posting_ledger の witness（予測行範囲＋行指紋）と食い違う——復旧時の
+    取引No再採番で指紋そのものが変わるため——ので、本 merge では直さず
+    事実を固定するに留める。
+
+    **D3 を修正する際は本クラスを反転または削除すること**（欠陥が直れば
+    これらのテストは落ちるべき）。
+    """
+
+    def _writer_with_dead_tab(self):
+        """1 回目の API 呼出しで 400 を返す worksheet を積んだ writer。"""
+        writer = _make_writer()
+        dead = _FakeRecoveryWorksheet(sheet_id=101, fail_calls=1)
+        return writer, dead
+
+    def _page_write(self, writer):
+        return writer.build_page_write(
+            "従業員", DocType.RECEIPT,
+            [_receipt_result("店A", [_entry(5000)], total=5000)],
+            ["http://x"], 1)
+
+    def test_commit_page_does_not_self_heal(self):
+        writer, dead = self._writer_with_dead_tab()
+        pw = self._page_write(writer)
+        with patch.object(SheetsOutputWriter, "_get_or_create_tab",
+                          return_value=dead):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(gspread.exceptions.APIError):
+                    writer.commit_page(pw)
+
+    def test_peek_append_range_does_not_self_heal(self):
+        writer, dead = self._writer_with_dead_tab()
+        pw = self._page_write(writer)
+        with patch.object(SheetsOutputWriter, "_get_or_create_tab",
+                          return_value=dead):
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(gspread.exceptions.APIError):
+                    writer.peek_append_range(pw)
+
+    def test_next_txn_no_degrades_to_one_instead_of_healing(self):
+        """読取失敗を `_get_next_txn_no` が握るため 1 へ縮退する。
+
+        これが D3 の「復旧時の再採番で fingerprint が変わる」経路の実行可能な
+        証拠——番号が変われば A 列が変わり、compute_page_fingerprint の値
+        そのものが変わる。
+        """
+        writer, dead = self._writer_with_dead_tab()
+        with patch.object(SheetsOutputWriter, "_get_or_create_tab",
+                          return_value=dead):
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    writer.next_txn_no("従業員", DocType.RECEIPT), 1)
 
 
 if __name__ == "__main__":

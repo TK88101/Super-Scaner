@@ -457,8 +457,19 @@ class SheetsOutputWriter:
                 anomaly_flags_list.append((len(rows) - 1, flags))
 
         if not rows:
+            # 純ビルダなので分流しない——占位行への切替は呼出側の責務
+            # （append_entries / build_page_write がそれぞれ自分の書込経路で
+            # 処理する）。ここで書込むと headless の build_page_write まで
+            # 副作用経路へ巻き込む（Plan C5）。
             return None
 
+        # 次の票の番号へ進める。**merge で消してはならない**（Plan D6）:
+        # main 側は append_entries を closure 内の再採番へ寄せたのでこの行を
+        # 削除したが、こちらの _build_result_rows は「次番号」を
+        # ResultBlock.next_txn_no として返す契約の純ビルダで、build_page_write
+        # は頁内の票ごとにこの値で採番を進める。git は main 側の削除を衝突
+        # ブロックの外で自動適用するため、消えても警告が出ない——症状は
+        # 「1 頁に複数票あると全票が同じ取引No になる」。
         transaction_no += 1
 
         # --- 色判定を書き込み前に確定（色塗りは行番号が要るため後段で実施）---
@@ -650,14 +661,19 @@ class SheetsOutputWriter:
         from receipt_aggregation import coerce_tax_amount
 
         tab_name = self._tab_namer(employee_name, doc_type)
-        ws = self._get_or_create_tab(tab_name)
 
-        transaction_no = self._get_next_txn_no(tab_name, ws)
+        # built_txn_no＝この票に**今回書く**番号。block.next_txn_no は「次の票の
+        # 番号」（+1 済み）なので、下の復旧判定の比較対象にしてはならない
+        # （Plan C6。混同すると通常経路でも毎回「再採番」を誤印字する）。
+        # tab 解決は _resolve_tab へ寄せる（simcodex R1）: 事前に掴んだ ws は
+        # _append_rows_with_recovery の戻り値で上書きされるだけの死んだ局所変数
+        # だった上、tab 解決の入口が 2 系統に割れていた。
+        built_txn_no = self._get_next_txn_no(tab_name, self._resolve_tab(tab_name))
         vendor_name = entries_data.get('vendor', '')
 
         # Phase A（rows 構築＋異常メタ）は共通ビルダへ抽出（UI/headless 共用）。
         block = self._build_result_rows(
-            employee_name, doc_type, entries_data, source_url, transaction_no)
+            employee_name, doc_type, entries_data, source_url, built_txn_no)
 
         if block is None:
             # 書ける MF 行がゼロ（entries 空 / 全行金額0/None）でも無音 return
@@ -670,28 +686,27 @@ class SheetsOutputWriter:
                 reason = ("仕訳ゼロ（_unrecognized 未設定）" if not entries
                           else "有効金額の仕訳がゼロ")
                 print(f"⚠️ {reason} → 認識不能として記録")
-            self._write_unrecognized_row(ws, tab_name, entries_data, source_url)
+            # ws は渡さない（Plan D1）——_write_unrecognized_row は自身で
+            # _resolve_tab し、失効していれば _with_tab_recovery が新 tab を掴む。
+            self._write_unrecognized_row(tab_name, entries_data, source_url)
             return APPEND_RESULT_PLACEHOLDER
 
         rows = block.rows
         anomaly_flags_list = block.anomaly_flags
         conf_flags = block.conf_flags
         red_flags = block.red_flags
-        transaction_no = block.next_txn_no
 
-        # 書き込み前のデータを取得（ハイライト位置計算+重複検出用）
-        existing_data = ws.get_all_values()
-        pre_write_count = len(existing_data)
+        # 実測 → 容量確保 → 書込 → 取引No の再採番を一つの復旧単位で実行する
+        # （詳細は _append_rows_with_recovery の docstring）。占位行経路と同じ
+        # 一本を使うことで、片方だけ直して漂移する事故を構造的に塞ぐ。
+        pre_write_count, ws, actual_txn_no = self._append_rows_with_recovery(
+            tab_name, rows, built_txn_no)
 
-        # 自動拡容バグ対策: append が境界を跨ぐ前に空きバッファを確保し、
-        # Google の自動拡容（直前行の色を空尾行へ継承）自体を起こさせない。
-        self._ensure_row_capacity(ws, pre_write_count + len(rows))
-
-        # 一括書き込み（リトライ付き）
-        self._write_with_retry(ws, rows)
-
-        # 取引No をタブごとにメモリ更新
-        self._tab_next_txn[tab_name] = transaction_no
+        # 取引No をタブごとにメモリ更新（post-write 副作用。fn の外・
+        # 書込成功後に一度だけ実行——fn に入れるとローカル状態が二重更新される）。
+        # actual_txn_no を使う（built_txn_no ではない）: 復旧が起きていれば
+        # 新表の実測値が正で、旧表基準の built_txn_no を使うと欠番/誤番になる。
+        self._tab_next_txn[tab_name] = actual_txn_no + 1
 
         start_row = pre_write_count + 1
         end_row = start_row + len(rows) - 1
@@ -807,6 +822,123 @@ class SheetsOutputWriter:
         self._write_with_retry(ws, [AUDIT_HEADERS])
         self._audit_row_count += 1
 
+    def _invalidate_tab(self, tab_name, old_ws):
+        """tab 失効確定時、tab 単位の快取状態を漏れなくリセットする
+        （Plan 2026-08-10 worksheet-cache-invalidation §3.2）。
+
+        `_ws_cache` だけ消すと取引No の起点が古いまま残り、再構築後の空タブに
+        誤った採番をする——一括で消すことが要。
+
+        `_tab_has_data`（死碼。読取点が全檔に存在しない。Codex 指摘）は対象外。
+        復旧対象に加えると死碼を増殖させるだけなので Plan §3.2 で明示的に除外。
+
+        `_audit_row_count` は tab 単位の状態ではなく監査タブ専用の単一
+        カウンタなので、`tab_name == AUDIT_TAB_NAME` の時のみ 0 へ戻す
+        （一般 tab の失効で巻き添えにしない。Codex MEDIUM 採用）。
+        """
+        print(f"🔧 tab 失効を検知・快取を再構築します: {tab_name}（旧sheetId={old_ws.id}）")
+        self._ws_cache.pop(tab_name, None)
+        self._tab_next_txn.pop(tab_name, None)
+        self._tabs_sanitized.discard(tab_name)
+        if tab_name == AUDIT_TAB_NAME:
+            self._audit_row_count = 0
+
+    def _resolve_tab(self, tab_name):
+        """tab 名から worksheet を取得する（キャッシュ付き）。監査タブは専用の
+        `_get_or_create_audit_tab`、それ以外は汎用の `_get_or_create_tab` へ
+        振り分ける——`_with_tab_recovery` が初回解決・復旧後の再解決の両方で
+        同じ経路を通すための単一入口。
+        """
+        return (self._get_or_create_audit_tab() if tab_name == AUDIT_TAB_NAME
+                else self._get_or_create_tab(tab_name))
+
+    def _with_tab_recovery(self, tab_name, fn):
+        """tab が実行中に削除されても次の書込で自己修復する
+        （Plan 2026-08-10 worksheet-cache-invalidation §3.1/§3.3/§3.4）。
+
+        `fn` は `fn(ws)` の形で、失効判定が可能な単一の API 操作に限る。
+        post-write の副作用（`_tab_next_txn` 更新・格式化・`_sanitize_trailing_once`・
+        `_audit_row_count += 1` 等）は fn の外・呼び出し側で書込成功後に一度だけ
+        実行すること——fn に入れるとローカル状態が二重更新される（§3.3 厳守事項）。
+
+        失効判定の権威は tab 名ではなく sheetId（gid）。
+        `spreadsheet.worksheet(tab_name)`（名前引き）は使わない: 同名タブが
+        作り直されていた場合に誤って「失効ではない」と判定してしまうため（§3.1）。
+        """
+        try:
+            return fn(self._resolve_tab(tab_name))
+        except gspread.exceptions.APIError as e:
+            old_ws = self._ws_cache.get(tab_name)
+            status = getattr(e.response, "status_code", None)
+            if status != 400 or old_ws is None:
+                raise
+            if "Unable to parse range" not in str(e):
+                # 診断ログ用の補助情報のみ。判定根拠にはしない（§3.1）。
+                print(f"🔍 400（メッセージが想定と異なる・診断用）: {e}")
+            try:
+                self.spreadsheet.get_worksheet_by_id(old_ws.id)
+            except gspread.exceptions.WorksheetNotFound:
+                pass  # 旧 sheetId が実在しない = 失効確定
+            else:
+                raise e  # sheetId が実在する = 失効ではない。元例外をそのまま送出
+
+            self._invalidate_tab(tab_name, old_ws)
+            # 1 回だけ再試行。ここで再度失敗したら raise（無限再構築しない）
+            return fn(self._resolve_tab(tab_name))
+
+    def _append_rows_with_recovery(self, tab_name, rows, built_txn_no):
+        """rows を tab へ追記する。tab が実行中に消えていれば自己修復する。
+
+        「行数の実測 → 容量確保 → 一括書込」を**一つの復旧単位**にする
+        （Plan 2026-08-10 §3.1/§3.3、codex review P2）。読取だけを別単位に
+        すると、読取成功後・書込前に tab が消えた場合、書込は新しい空 tab へ
+        行くのに行数は消えた tab のまま残り、異常ハイライトが無関係な行を塗り、
+        本当に警告すべき行が塗られないまま MF へ流れる。
+
+        取引No も同じ単位に含める（趙 2026-08-10 拍板）。`built_txn_no` は rows
+        構築時点（復旧前）に確定した「**今回書く**番号」なので、tab が復旧される
+        と新表の実測値と食い違う（新表は空なのに旧表基準の続き番号を書いて
+        しまう）。`_get_next_txn_no` はタブ単位でメモリキャッシュしており
+        `_invalidate_tab` が復旧時にそれを消すため、ここで再度呼んでも非復旧時は
+        キャッシュヒット（追加 API 呼び出しなし）、復旧時のみ新表を実測する。
+        rows は既に構築済みなので、実測値が違えば書込直前に焼き直す。
+
+        比較対象を `ResultBlock.next_txn_no`（＝**次の**票の番号）にしてはならない
+        （Plan C6）。+1 された値と実測値を比べると、復旧が起きていない通常経路でも
+        毎回不一致になり「取引No を再採番」を誤って印字し続ける。行値だけは偶然
+        正しい値へ再代入されるため、既存テストでは検出できない。
+
+        再実行しても二重記帳にならない理由: `_with_tab_recovery` は「旧 sheetId が
+        実在しない」ことを確認した時だけ再実行する。書込先が存在しない以上、前回の
+        append が部分的に成功していた可能性がない（Plan §3.4 の 2 条件）。
+        `get_all_values` は冪等、`_ensure_row_capacity` は例外を自吞する best-effort。
+
+        戻り値 `(pre_write_count, ws, actual_txn_no)`:
+          pre_write_count … 書込直前の行数（`start_row = pre_write_count + 1`）
+          ws              … **復旧後**の worksheet。呼出側はこれで書式を当てる
+          actual_txn_no   … 実際に書いた取引No（`_tab_next_txn` 更新に使う）
+
+        `append_entries`（複数行）と `_write_unrecognized_row`（占位 1 行）の共用。
+        分けて書くと片方だけ直して漂移する——実際 main 側の codex review は
+        `append_entries` だけを指摘し、占位行経路は後から手で揃えていた。1 本に
+        まとめることで「両方直す」が規律ではなく構造で担保される（simcodex R1）。
+        """
+        def _read_ensure_and_write(target_ws):
+            actual_txn_no = self._get_next_txn_no(tab_name, target_ws)
+            if actual_txn_no != built_txn_no:
+                for row in rows:
+                    row[0] = actual_txn_no
+                print(f"🔧 tab 復旧に伴い取引No を再採番: "
+                      f"{built_txn_no} → {actual_txn_no}")
+            count = len(target_ws.get_all_values())
+            # 自動拡容バグ対策: append が境界を跨ぐ前に空きバッファを確保し、
+            # Google の自動拡容（直前行の色を空尾行へ継承）自体を起こさせない。
+            self._ensure_row_capacity(target_ws, count + len(rows))
+            self._write_with_retry(target_ws, rows)
+            return count, target_ws, actual_txn_no
+
+        return self._with_tab_recovery(tab_name, _read_ensure_and_write)
+
     def append_audit_row(self, filename, page_num, verdict, reason,
                          ocr_text_len, source_url=""):
         """除外/分岐ページを監査タブへ 1 行追記する。
@@ -816,7 +948,6 @@ class SheetsOutputWriter:
           分岐記録   → 警告ログのみ（MF は既に正しく書けており帳簿は正しい）
           真の除外   → 監査タブが唯一の留痕なので MF の赤い認識不能行へ退避
         """
-        ws = self._get_or_create_audit_tab()
         row = [
             datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S"),
             filename,
@@ -826,8 +957,22 @@ class SheetsOutputWriter:
             ocr_text_len,
             source_url,
         ]
-        self._ensure_row_capacity(ws, self._audit_row_count + 1)
-        self._write_with_retry(ws, [row])
+
+        # _ensure_row_capacity を closure 内へ（趙 2026-08-10 拍板）: 以前は
+        # ここで復旧前の ws を掴んで先に呼んでいたため、tab が実行中に消えて
+        # いると既に存在しない sheet への空振り呼び出しになり、best-effort の
+        # try/except に自吞まれて容量確保が実質無効化されていた。
+        # tab が実行中に消えていれば自己修復する（Plan §3.1/§3.3）。
+        # _with_tab_recovery が渡す w は都度解決済み（復旧時は新 tab）なので、
+        # closure 内で呼べば復旧後の新 worksheet に対して確実に効く。
+        # _resolve_tab → _get_or_create_audit_tab が復旧時に _audit_row_count
+        # を実測し直すため、closure 実行時点の self._audit_row_count は
+        # 既に新タブに対する正しい値になっている。
+        def _ensure_and_write(w):
+            self._ensure_row_capacity(w, self._audit_row_count + 1)
+            self._write_with_retry(w, [row])
+
+        self._with_tab_recovery(AUDIT_TAB_NAME, _ensure_and_write)
         self._audit_row_count += 1
 
     def flush(self):
@@ -959,22 +1104,29 @@ class SheetsOutputWriter:
                     format_cell_range(worksheet, cell_ref, fmt)
 
 
-    def _write_unrecognized_row(self, ws, tab_name, entries_data, source_url):
+    def _write_unrecognized_row(self, tab_name, entries_data, source_url):
         """認識不能/部分認識ページの占位行を書き込み、ハイライト適用。
 
         摘要は標準ラベル（date/vendor の有無で選択）。memo を通すのは
         _unrecognized を明示した producer（main の部分エラー占位行等）だけ —
         兜底経路で Gemini の memo が標準ラベルを乗っ取らないよう遮断する。
         """
-        txn_no = self._get_next_txn_no(tab_name, ws)
-        block = self._build_unrecognized_block(entries_data, source_url, txn_no)
+        # tab 解決は main の新経路（_resolve_tab。ws 引数は署名から廃止済み
+        # ——Plan D1/D2）。row 構築は分支の共通ビルダを使う: UI と headless で
+        # 占位行の内容を一字一句同じに保つため（Plan C7）。
+        built_txn_no = self._get_next_txn_no(tab_name, self._resolve_tab(tab_name))
+        block = self._build_unrecognized_block(entries_data, source_url,
+                                               built_txn_no)
         row = block.row
         has_partial = block.has_partial
 
-        pre_write = len(ws.get_all_values())
-        self._ensure_row_capacity(ws, pre_write + 1)
-        self._write_with_retry(ws, [row])
-        self._tab_next_txn[tab_name] = block.next_txn_no
+        # append_entries と**同一の**復旧単位を使う（詳細は
+        # _append_rows_with_recovery の docstring）。ここを別実装にすると、
+        # 片方だけ直して漂移する——実際 main 側の codex review は
+        # append_entries だけを指摘し、占位行経路は後から手で揃えていた。
+        pre_write, ws, actual_txn_no = self._append_rows_with_recovery(
+            tab_name, [row], built_txn_no)
+        self._tab_next_txn[tab_name] = actual_txn_no + 1
 
         actual_row = pre_write + 1
 

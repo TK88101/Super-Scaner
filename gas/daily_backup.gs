@@ -33,8 +33,20 @@ function dailyBackupAndClear() {
   try {
     var result = backupAllTabs_();
     if (result.success) {
-      deleteSourceTabs_(result.tabNames);
-      Logger.log('Backup and clear completed: ' + result.tabNames.length + ' tabs');
+      var deleteResult = deleteSourceTabs_(result.tabs);
+      if (deleteResult.abortedAll) {
+        Logger.log(
+          'Backup and clear completed: ' + result.tabs.length + ' tabs backed up, deletion ' +
+          'ABORTED for all of them (all-or-nothing) because ' + deleteResult.skipped.length +
+          ' tab(s) changed since backup read them; all ' + result.tabs.length +
+          ' tab(s) kept for tomorrow\'s backup.'
+        );
+      } else {
+        Logger.log(
+          'Backup and clear completed: ' + result.tabs.length + ' tabs backed up, ' +
+          deleteResult.deletedCount + ' deleted, 0 skipped'
+        );
+      }
     } else {
       Logger.log('No data to backup. Nothing deleted.');
     }
@@ -57,7 +69,12 @@ function dailyBackupAndClear() {
 
 /**
  * Read all data tabs from MF_Import_Data and write a consolidated backup sheet.
- * Returns {success: boolean, tabNames: string[]}
+ * Returns {success: boolean, tabs: [{name: string, sheetId: number, lastRow: number}]}
+ *
+ * sheetId + lastRow are captured at the moment each tab is read here, so
+ * deleteSourceTabs_() can re-measure just before deleting and skip a tab
+ * whose data changed underneath us (see deleteSourceTabs_ doc comment for
+ * why this only narrows, not closes, the read-then-delete race).
  */
 function backupAllTabs_() {
   var source = SpreadsheetApp.openById(SOURCE_SS_ID);
@@ -74,7 +91,7 @@ function backupAllTabs_() {
   }
 
   if (dataTabs.length === 0) {
-    return {success: false, tabNames: []};
+    return {success: false, tabs: []};
   }
 
   // Open backup spreadsheet and create today's sheet
@@ -95,11 +112,14 @@ function backupAllTabs_() {
   backupSheet.getRange(1, 1, 1, TOTAL_COLUMNS).setFontWeight('bold');
 
   var currentRow = 2;
+  var tabs = []; // snapshot of {name, sheetId, lastRow} taken at read time, for deleteSourceTabs_
 
   for (var t = 0; t < dataTabs.length; t++) {
     var tab = dataTabs[t];
     var lastRow = tab.sheet.getLastRow();
     var dataRowCount = lastRow - HEADER_ROWS;
+
+    tabs.push({name: tab.name, sheetId: tab.sheet.getSheetId(), lastRow: lastRow});
 
     // Section header row
     var sectionRow = new Array(TOTAL_COLUMNS);
@@ -134,21 +154,163 @@ function backupAllTabs_() {
 
   SpreadsheetApp.flush();
 
-  var tabNames = dataTabs.map(function(t) { return t.name; });
-  return {success: true, tabNames: tabNames};
+  return {success: true, tabs: tabs};
 }
 
 
 /**
  * Delete the backed-up tabs from MF_Import_Data.
  * main.py _get_or_create_tab() will auto-recreate them with legend + headers.
+ *
+ * `tabs` is the [{name, sheetId, lastRow}] snapshot backupAllTabs_() took at
+ * read time.
+ *
+ * Two-phase, all-or-nothing:
+ *   Phase 1 (verify): re-fetch every tab by name and re-measure its
+ *     sheetId + lastRow. Nothing is deleted here. Every mismatch is
+ *     recorded in `skipped[]`, classified by cause (not found / sheetId
+ *     changed / lastRow changed).
+ *   Phase 2 (commit): if `skipped` is non-empty, delete NOTHING and return
+ *     {deletedCount: 0, skipped, abortedAll: true}. Only when every single
+ *     tab still matches its snapshot do we delete all of them.
+ *
+ * Why sheetId, not just name: if the source tab was deleted and a same-named
+ * tab was recreated between backup and delete, getSheetByName() returns the
+ * new tab. Comparing lastRow alone could false-match (same row count by
+ * coincidence) and delete data that was never backed up. sheetId is
+ * immutable per physical sheet, so comparing it rules that out.
+ *
+ * Why lastRow: catches the ordinary case — Python appended a row to the
+ * *same* tab after backupAllTabs_() read it. That row exists in the live
+ * sheet but not in today's backup snapshot; deleting the tab now would lose
+ * it silently (no error, no trace).
+ *
+ * Why all-or-nothing instead of "just delete the tabs that are still clean"
+ * (the previous, more "efficient"-looking behavior — DO NOT reintroduce it,
+ * this is the exact bug this rewrite fixes): partial deletion creates a
+ * dangerous straddle state across a same-day rerun of dailyBackupAndClear()
+ * (manual retry, trigger retry, anything that fires it twice in one day):
+ *   1. Run #1 backs up tabs A/B/C into today's backup sheet.
+ *   2. Old partial-delete logic: A and B are unchanged so they get deleted;
+ *      C changed underneath us so it is skipped.
+ *   3. Run #2 fires the SAME day. backupAllTabs_() now only sees C in the
+ *      source spreadsheet (A/B are already gone).
+ *   4. backupAllTabs_()'s idempotent-rerun step ("delete existing sheet for
+ *      today") DELETES today's backup sheet — the one that still held A's
+ *      and B's backed-up rows — and rebuilds it containing ONLY C.
+ *   5. A and B's backed-up rows are gone (overwritten in step 4) AND their
+ *      source tabs are gone (deleted in step 2). Unrecoverable, and nothing
+ *      about it looks like an error — deleteSourceTabs_() "succeeded" both
+ *      times.
+ * All-or-nothing removes the straddle: either every tab backed up this run
+ * is still exactly what got backed up (safe to delete all of them), or at
+ * least one changed and we delete NOTHING, so every source tab (and its
+ * live data) survives intact for tomorrow's backup to pick up cleanly. The
+ * cost is one extra day of latency on clearing ALL of today's tabs on the
+ * rare day a mid-backup write lands in the window — far cheaper than
+ * silently losing already-backed-up rows.
+ *
+ * KNOWN RESIDUAL RACE (still not eliminated by this function — see Plan
+ * §3.5): Phase 1 (check) and Phase 2 (delete) are two separate passes over
+ * `tabs`, so the gap between "we confirmed tab X is unchanged" and "we
+ * actually call deleteSheet() on tab X" is no longer just a few
+ * milliseconds for a single tab — it now spans however long it takes to
+ * check (and, for earlier tabs, also delete) every OTHER tab in this run:
+ *   1. Phase 1 re-measures tab A -> matches snapshot, no skip recorded
+ *   2. Phase 1 re-measures tabs B, C, ... (elapsed time passes)
+ *   3. Phase 2 begins deleting; before it reaches A, Python appends a row
+ *      to A                                                    <- lost here
+ *   4. Phase 2 calls deleteSheet() on A without re-checking it
+ * That row is backed up nowhere and disappears with the tab, silently.
+ * This is a DELIBERATE trade-off, not an oversight: re-checking each tab
+ * immediately before its own deleteSheet() call (like the old single-pass
+ * version did) would re-introduce the exact bug this rewrite exists to
+ * close — a late change on one tab would skip only that tab while its
+ * siblings still get deleted, recreating the partial-delete +
+ * same-day-rerun data-loss path above. Phase 2 therefore deletes
+ * unconditionally once Phase 1 has committed to "zero skips", trading a
+ * wider (but still much narrower than backupAllTabs_()'s own read window)
+ * race for a guarantee that the outcome is always all-or-nothing. A real
+ * fix needs mutual exclusion between the Python writer and this backup
+ * run, or a different deletion model (P2, out of scope for this change per
+ * Plan §3.5/§7-3).
+ *
+ * Returns {deletedCount: number, skipped: [{name, reason}], abortedAll: boolean}
  */
-function deleteSourceTabs_(tabNames) {
+function deleteSourceTabs_(tabs) {
   var source = SpreadsheetApp.openById(SOURCE_SS_ID);
-  var allSheets = source.getSheets();
+
+  // Phase 1: verify only. Re-measure every tab; delete nothing yet.
+  var skipped = [];
+
+  for (var i = 0; i < tabs.length; i++) {
+    var snapshot = tabs[i];
+    var sheet = source.getSheetByName(snapshot.name);
+
+    if (!sheet) {
+      skipped.push({name: snapshot.name, reason: 'sheet not found (renamed or already deleted)'});
+      continue;
+    }
+
+    var currentSheetId = sheet.getSheetId();
+    var currentLastRow = sheet.getLastRow();
+
+    if (currentSheetId !== snapshot.sheetId) {
+      skipped.push({
+        name: snapshot.name,
+        reason: 'sheetId changed: backup=' + snapshot.sheetId + ' now=' + currentSheetId +
+          ' (tab was recreated after backup read it)'
+      });
+      continue;
+    }
+
+    if (currentLastRow !== snapshot.lastRow) {
+      skipped.push({
+        name: snapshot.name,
+        reason: 'lastRow changed: backup=' + snapshot.lastRow + ' now=' + currentLastRow +
+          ' (data was written after backup read it)'
+      });
+      continue;
+    }
+  }
+
+  // Phase 2: commit. All-or-nothing — see doc comment above for why a
+  // "delete the clean ones, skip the rest" middle ground is NOT safe here.
+  if (skipped.length > 0) {
+    var lines = skipped.map(function(s) { return '  - ' + s.name + ': ' + s.reason; });
+    Logger.log(
+      'deleteSourceTabs_: ' + skipped.length + ' of ' + tabs.length + ' tab(s) changed since ' +
+      'backup read them. Aborting deletion for ALL ' + tabs.length + ' tab(s) this run ' +
+      '(all-or-nothing):\n' + lines.join('\n')
+    );
+    try {
+      MailApp.sendEmail(
+        Session.getActiveUser().getEmail(),
+        'Super Scaner: Backup skipped deleting ALL tabs this run',
+        'The following ' + skipped.length + ' tab(s) changed between backup read and delete:\n\n' +
+          lines.join('\n') +
+          '\n\nBecause of this, NONE of today\'s ' + tabs.length + ' backed-up tab(s) were deleted ' +
+          '(all-or-nothing policy - all tabs are kept for tomorrow\'s backup, not just the changed ' +
+          'ones).\n\nWhy not just delete the tabs that were still clean? Deleting some but not all ' +
+          'creates a dangerous straddle if this backup is re-run later the same day: the re-run ' +
+          'would only see the tabs still remaining in the source sheet, and its idempotent ' +
+          '"delete existing sheet for today" step would overwrite today\'s backup sheet with only ' +
+          'that partial data - silently losing the backup of whatever was already deleted. This is ' +
+          'not itself data loss on its own - every source tab and its rows are still intact. See ' +
+          'daily_backup.gs deleteSourceTabs_() comment for full details and the residual TOCTOU ' +
+          'race this still does not cover.'
+      );
+    } catch (mailErr) {
+      Logger.log('Failed to send skip-notification email: ' + mailErr.message);
+    }
+    return {deletedCount: 0, skipped: skipped, abortedAll: true};
+  }
+
+  // Every tab still matches its snapshot -> safe to delete all of them.
 
   // Ensure at least 1 sheet remains (Sheets API requirement)
-  var remainCount = allSheets.length - tabNames.length;
+  var allSheets = source.getSheets();
+  var remainCount = allSheets.length - tabs.length;
   if (remainCount < 1) {
     // Keep _config or create a placeholder
     var configSheet = source.getSheetByName('_config');
@@ -157,14 +319,16 @@ function deleteSourceTabs_(tabNames) {
     }
   }
 
-  for (var i = 0; i < tabNames.length; i++) {
-    var sheet = source.getSheetByName(tabNames[i]);
-    if (sheet) {
-      source.deleteSheet(sheet);
-    }
+  var deletedCount = 0;
+  for (var j = 0; j < tabs.length; j++) {
+    var sheetToDelete = source.getSheetByName(tabs[j].name);
+    source.deleteSheet(sheetToDelete);
+    deletedCount++;
   }
 
   SpreadsheetApp.flush();
+
+  return {deletedCount: deletedCount, skipped: [], abortedAll: false};
 }
 
 
