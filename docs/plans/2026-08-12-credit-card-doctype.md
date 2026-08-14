@@ -80,11 +80,27 @@ resolve_page_disposition(dedup_verdict, entry_count, page_class) -> Disposition
   1. duplicate            → 記帳しない。監査タブのみ（AD-1）
   2. entry_count > 0      → 必ず記帳（族シグナルは _audit_signal に落とすだけ）
   3. has_detail_rows      → 除外させない。赤い認識不能占位行
-  4. family が非記帳族     → 監査タブ（cc_summary / points_only / info_notice）
+  4. family が非記帳族     → cc_summary は **MF タブへ金額 0 の提示行**（裁定 8）
+                            points_only / info_notice は監査タブ
   5. それ以外              → 赤い認識不能占位行
 ```
 
+> **2026-08-14 訂正**: 優先序 4 は当初「非記帳族はすべて監査タブ」と書いていたが、
+> これは裁定 8（合計表のみの頁は MF タブへ金額 0 の提示行。顧客が「合計表を
+> 上げたのに何も出てこない」状態にならないようにする）より前の記述だった。
+> 裁定 8 が後であり趙の拍板なので、`cc_summary` の落とし先を MF タブへ訂正する。
+> 実装は `page_family.resolve_page_disposition` の 1 箇所（`EXCLUDE_DEST_MF_TAB`）。
+
 どのモジュールもこの関数を経由せずに頁の去向を決めてはならない。
+
+> **移行の完了条件（2026-08-14 追記）**: T2 時点でこの関数は
+> `page_family.resolve_page_disposition` に**存在するだけ**で、本番経路からは
+> 1 箇所も呼ばれていない。`ocr_engine._yield_page_results`（1943-1996）が今も
+> 独立に頁の去向を決めており、**システム全体としては単一裁決点になっていない**。
+> 当初の T3〜T6 の DoD はどれもこの移行を要求していなかったため、放置すると
+> AD-0 の不変式が黙って永久に着地しない。よって **T9 の DoD に移行完了を明記する**
+> （下記）。この追記が無いと「モジュールは書いたが誰も使っていない」状態が
+> 完成扱いになる。
 
 ### AD-1. 重複検出は D3 に一本化し、**書込前ゲート**として働かせる
 
@@ -362,11 +378,74 @@ MF 本番の実測（附録 C）で判明した井戸会計事務所の記帳習
 - 事実台帳 32 頁のうち族が確定している 28 頁分のフィクスチャで族ラベル一致
 - UC p2 相当（ポイント語＋明細12行）が `points_only` に**ならない**
 - アメックス p1≡p3 相当が `duplicate`、**片側署名のみは `duplicate` にならない**
-- F-4 の 3 例で `reconciliation_sum` が印字合計と一致
+- F-4 の 3 例で `CardVerdict.detail_sum` が印字合計と一致
 - `classify()` が全入力で非 None（property test）
 - **特例に命中せず、かつ少額特例未確認のとき必ず `not_deductible` を返す**
 - `resolve_page_disposition` の優先序（AD-0）を全組合せで固定
 - 各モジュール カバレッジ ≥ 80%
+
+**実施記録（2026-08-14 完了。simplify 4 視点 ＋ Codex 8 ラウンド評審後）**
+
+| モジュール | テスト | カバレッジ |
+|---|---|---|
+| `page_dedup.py` | 13 | 95% |
+| `page_family.py` | 47 | 93% |
+| `card_reconciliation.py` | 62 | 96% |
+| `invoice_classification.py` | 66 | 97% |
+
+全量回帰 626 tests 緑（既存 doc_type への影響なし）。Codex 最終ラウンドは
+「no discrete correctness issues」。実装で Plan から動いた点:
+
+1. **AD-0 の単一裁決関数は `page_family.resolve_page_disposition`** に置いた。
+   専用モジュールを新設していない（§4 の 4 モジュール構成を維持）。
+   `page_dedup` の `VERDICT_DUPLICATE` だけを import する単方向依存。
+2. **元帳は重複を自前判定しない**（AD-1 の徹底）。D2 疑似コードは `(key, n)` の
+   再出現で自前判定していたが、二重署名 AND 規則を通っていない一致で
+   金額を落とすことになるので削除し、caller が `is_duplicate=True` で宣言する形にした。
+3. **少額特例を R07 / R08 に分割**。事業者要件が未確認のとき R08 が
+   `not_deductible` へ倒す（T2 DoD の要求）。rule_id を分けたのは
+   「そもそも特例圏外」と「確認さえ取れれば特例圏内」を監査集計で区別するため。
+4. **判定根拠は監査集計にのみ出す**。摘要（S列）・仕訳メモ（T列）には載せない。
+   H列を空欄にするのは事務所慣例の踏襲であって税法判断の自動化ではない（AD-8）ため、
+   摘要に「少額特例」と書けばそれ自体が帳簿上の税法主張になってしまう。
+5. **`page_family` は定数 2 種（`EXCLUDE_DEST_*`）と簡体字写像を ocr_engine から複製**
+   している（venv 非依存を保つため）。乖離は `test_page_family` の突合テストが検出する。
+6. **config 項目は 13 項目すべて追加済み**（2026-08-14。趙拍板）。
+   各モジュールは自前の既定値を持ち、`try: from config import X / except ImportError`
+   で override を読む。うち**読み取り点が在るのは 8 項目**で、残る 5 項目
+   （`CREDIT_ADJUST_CREDIT_ACCOUNT` / `CC_WINDOW_SIZE` / `CC_MAX_WINDOWS` /
+   `GEMINI_MAX_OUTPUT_TOKENS_BULK` / `CC_TAX_TYPE_RENDERING`）は T4・T5 の実装が
+   まだ無いため**書いても効かない**。`test_credit_card_config.UnwiredItemsTest` が
+   「いつの間にか結線された」ことを検知して、Plan と一覧の更新を促す。
+7. **`invoice_classification.derive_line_kind` を新設**。Plan の prompt 契約
+   （AD-4 の `sec` ＋ AD-5 の `kind`）には**実体軸 `line_kind` が無い**ため、
+   T4 をそのまま実装すると nimoca の電車行も ETC 通行料も一律 `general` に落ち、
+   R05/R06 が永久に発火しないうえ「要:税率8%(軽減)の可能性」という
+   通行料・給油には無意味な caveat が全行に付く（Codex 指摘）。
+   AD-4 と同じ方針で**逐語から Python 側が決定論的に導出**する形にした。
+   T4 は行ごとにこの関数を呼ぶこと。
+8. **重複頁の扱いに `dedup_mode` を通した**（§9.5 の `CREDIT_CARD_DEDUP_MODE`）。
+   当初は `resolve_page_disposition` が exclude を直書きしており、設定項目に
+   落とし先が無かった。偽陽性は仕訳を消すので、実運用で誤検出が出たときに
+   コード変更なしで `mark`（記帳しつつ注記）／`off` へ落とせる必要がある。
+
+**Codex 評審で塞いだ実害（8 ラウンド。全て P2 だが会計値に効く）**
+
+| # | 実害 | 根因 |
+|---|---|---|
+| 1 | 会員番号が 1 頁も読めない文書が頁ごとに別カードへ割れ、全カードが偽の赤系 | `current_key` を `member_no` 由来のときだけ更新していた（§2.2 のフォールバック 3/4 が到達不能） |
+| 2 | 2023/9 以前の往年資料が「少額特例で適格」に集計される | 期間の**下限**（2023/10/1）を見ていなかった |
+| 3 | 発行体が先頭頁にしか印字されない文書が 2 枚のカードに割れる | `_find_mergeable` が `?`（読めなかった）を「別の発行体」と同一視 |
+| 4 | 「お支払い金額合計」だけ読めた頁で、当月利用の明細と突合して 35,808 円ずれた偽の不一致（F-5 アメックス カードB 型） | 区画フォールバックが payment_summary を current_usage に読み替えていた |
+| 5 | ポイント残高を請求金額として検算 | ポイント区画のラベルが未登録で SECTION_UNKNOWN に落ちていた |
+| 6 | 券面ヘッダの T番号（T＋13桁）がカード番号として抽出され、同一発行体の全カードが合流 | `_RE_CARD_KEY` に境界条件が無かった |
+| 7 | **`−3,000`（U+2212）等の負号が解析できず F-4 の黄金検算 15,503 が 18,503 になる** | `_coerce_int` が ASCII の `-` しか認めなかった。**事実台帳 F-5 の原文がまさに U+2212** |
+| 8 | 先頭頁の識別が読めず次頁で読めた場合、印字合計と明細が別々の元帳へ割れる | 仮キーから本キーへの引き継ぎが無かった |
+
+7 は 3 モジュール（page_dedup / card_reconciliation / invoice_classification）
+同時修正が要った。同時修正を強制したのは、`test_card_reconciliation` に
+入れた**3 者の挙動突合テスト** —— 同じ概念の実装が 3 箇所にあるので、
+片方だけ直すと検算と記帳で金額の解釈が割れる。
 
 ### T3. `_route_ocr_strategy` の resolver 化 ＋ `PageOcr` 契約【前置依存】
 
@@ -433,6 +512,14 @@ JCB の 3 行（9,238 / 3,494 / 1,578 円）が円貨額で記帳され、
 
 **DoD**: 重複頁が `append_entries` に到達しないことをモックで固定。
 既存の Failed / 部分失敗の終態判定が変わらない。
+**AD-0 の移行完了**: 新 doc_type の頁の去向を決める経路が
+`page_family.resolve_page_disposition` の 1 本だけになっていること —— 具体的には
+(a) `ocr_engine._yield_page_results` が新 doc_type について独自に
+`_excluded_page` / 認識不能行を決めていない、(b) 除外マーカーは
+`page_family.exclusion_fields` の戻り値をそのまま使う、(c) 既存 doc_type
+（receipt 等）の裁決経路は 1 行も変えない。
+**既存経路を巻き込まないことをテストで固定する**（新旧の分岐が同じ関数に
+同居すると、AD-0 を守るつもりの改修が本番の封筒判定を壊す）。
 
 ### T10. IP-401 回帰の拡張
 
@@ -457,16 +544,24 @@ E2E 後に MF タブ・監査タブを CSV dump し、スクリプトで検証�
 | # | 基準 | 機械判定の方法 |
 |---|---|---|
 | A1 | 32 頁すべてが 1 件以上の出力を持つ | pipeline の頁カバレッジログ + `test_ip401_regression` |
-| A2 | 検算値が印字合計と一致 | `reconciliation_sum == printed_total`。ENEOS は **15,503** |
-| A3 | 記帳合計が記帳対象行の和と一致 | `bookable_sum == Σ(kind ∈ {expense, fee})`。ENEOS は **18,503** |
+| A2 | 検算値が印字合計と一致 | `CardVerdict.detail_sum == CardVerdict.printed_total`。ENEOS は **15,503** |
+| A3 | 記帳合計が記帳対象行の和と一致 | `CardVerdict.expense_sum == Σ(kind ∈ {expense, fee, unknown})`。ENEOS は **18,503** |
 | A4 | アメックス p3/p4 が MF タブに存在しない | MF dump に p3/p4 の指紋（日付+金額の並び）が 1 度しか出現しない |
 | A5 | 除外頁が監査タブに残る | 監査 dump に p3/p4 の `duplicate_page:orig=p1` 等の理由行が存在 |
 | A6 | 負数行が MF タブに存在しない | 金額 < 0 が 0 件、**かつ** 摘要に `ENEOSポイントキャッシュバック` / `前回分口座振替金額` が 0 件（abs() 転正の検出） |
 | A7 | ポイント専用頁が MF タブに無く監査タブに在る | amex p6 / arekore p3 の頁番号で両タブを突合 |
 | A8 | nimoca の年が推定なら必ず異常マーク | 単体テスト + dump のタグ列 |
-| A9 | H列が空欄の行が 0 件 | MF dump の H列を count（過大控除の防止） |
+| A9 | **H列が全行空欄** ＋ `amount >= 10000` の行に U列タグ | MF dump の H列で「空欄でない行」が 0 件。かつタグ列に `INVOICE_CONFIRM_TAG` を含む行数 == 1万円以上の行数 |
 | A10 | 既存 doc_type の全テストが無修正で緑 | `unittest discover` |
-| A11 | 新規モジュールのカバレッジ ≥ 80% | `pytest --cov` |
+| A11 | 新規モジュールのカバレッジ ≥ 80% | `venv311/bin/python -m coverage run --source=<mods> -m unittest discover -p "test_*.py"` → `coverage report`（**pytest は venv311 に未導入**。requirements.txt にも無い） |
+
+> **A9 の 2026-08-14 反転**: 旧 A9 は「H列が空欄の行が 0 件」だった。これは
+> AD-8 全面改訂（趙裁定 9: H列は空欄）より前の記述で、**現行の裁定と正反対**に
+> なっていたため反転した。判定木そのものは残っている（`invoice_classification.classify`
+> は全域関数として qualified / not_deductible / out_of_scope を返す）が、
+> レンダリングが全て空文字に落ちる。「判定できないから空欄」ではなく
+> 「判定したうえで事務所慣例に従って空欄」であり、TBD が動いたときに触るのは
+> `config.INVOICE_COL_RENDERING` の 1 箇所だけになる。
 
 ---
 
@@ -534,7 +629,12 @@ E2E 後に MF タブ・監査タブを CSV dump し、スクリプトで検証�
 
 ## 9.5 config.py へ一括追加する設定項目（趙 2026-08-14 指示）
 
-`config.py` は本番の中核なので、細切れに何度も触らず **3 モジュール実装後に一括で追加する**。
+**状態: 13 項目すべて追加済み（2026-08-14）。** `config.py` は本番の中核なので、
+細切れに何度も触らず 3 モジュール実装後に一括で追加した（純追加 96 行・既存行の
+変更 0）。結線は `test_credit_card_config.py` が縛る —— `try/except ImportError`
+は名前を間違えても静かに既定値へ回帰するため、「config を直したのに効かない」が
+無音で成立しうる。同テストは変異検証で 6/6（設定名タイポ / H列写像の穴 /
+MF 正規値外 / 税区分キーの半角スペース欠落 / 閾値ずれ / 未実測トークン数）を検出する。
 
 **そのための実装ルール**: 各モジュールは**自前の既定値を持ち**、config は override として読む。
 
@@ -563,6 +663,23 @@ except ImportError:
 | `CC_MAX_WINDOWS` | `8` | 1 頁あたりの窓数上限（320 行まで） | T5 |
 | `GEMINI_MAX_OUTPUT_TOKENS_BULK` | `0`（＝既存値を流用） | 逐行記帳 doc_type 用の出力上限。**check_models.py で実測してから入れる**（記憶で 65536 等と書かない） | T5 / D4 |
 | `CC_TAX_TYPE_RENDERING` | `{"課対仕入10%": "課仕 10%", "課対仕入8% (軽)": "課仕 8%(軽)"}` | 出力層のみの省略名変換。`receipt_aggregation.determine_tax_types()` はグローバルに変えない | AD-11 |
+| `SMALL_AMOUNT_TAXPAYER_CONFIRMED` | `False` | 少額特例の**事業者要件**（基準期間の課税売上高 1 億円以下等）を事務所が確認済みか。プログラムには判定不能なので、既定は未確認＝控除なしへ倒す。確認が取れたら True にするだけで R08 → R07 へ移る | AD-8 / T2 DoD |
+
+**§7 の影響面表が挙げていた `TAX_POLICY` がこの表から漏れていた**（2026-08-14 追補）。
+ただし実装側の足場は `TAX_POLICY` という名前では入っていない —— `TaxPolicy` は
+NamedTuple のままで、config から動かせるのは既定値 1 個
+（`SMALL_AMOUNT_TAXPAYER_CONFIRMED`）だけである。`config.py` に `TAX_POLICY` を
+書いても **no-op** になるので、追加するのは上表の名前のとおりにすること。
+
+**足場の実数（2026-08-14 実測）**: 上表 13 項目のうち、実装側に
+`try/except ImportError` の読み取りが在るのは 8 項目
+（`RECON_TOLERANCE_YEN` / `TRANSIT_IC_BOOK_CHARGE_ROWS` / `CREDIT_CARD_DEDUP_MODE` /
+`INVOICE_COL_VALUES` / `INVOICE_COL_RENDERING` / `INVOICE_CONFIRM_THRESHOLD_YEN` /
+`INVOICE_CONFIRM_TAG` / `SMALL_AMOUNT_TAXPAYER_CONFIRMED`）。
+残り 5 項目（`CREDIT_ADJUST_CREDIT_ACCOUNT` / `CC_WINDOW_SIZE` / `CC_MAX_WINDOWS` /
+`GEMINI_MAX_OUTPUT_TOKENS_BULK` / `CC_TAX_TYPE_RENDERING`）は T4・T5 で
+実装する側がまだ存在しないため読み取り点も無い。**config に書くだけでは効かない**ので、
+該当タスクの実装時に足場も一緒に入れること。
 
 **注意**: `CC_TAX_TYPE_RENDERING` の 8% 側の省略名（`課仕 8%(軽)`）は MF 実帳で未確認。
 10% 側（`課仕 10%`）のみ実測済み（附録 C）。8% 行を出す前に要確認。
