@@ -81,6 +81,16 @@ def _normalize_date(raw):
     return f"{m.group(1)}/{int(m.group(2)):02d}/{int(m.group(3)):02d}" if m else s
 
 
+# 券面と OCR 出力に現れる負号のゆれ。**先頭 1 文字だけ**を見る
+# （店名中のダッシュを符号として解釈しないため）。
+#   − U+2212 … 事実台帳 F-5 の「ENEOSポイントキャッシュバック −3,000」がこれ
+#   ▲ △      … 日本の会計慣習の負数表記
+# card_reconciliation / invoice_classification と挙動を揃えること
+# （test_card_reconciliation.LabelTableDriftTest が 3 者の一致を突合する）。
+_RE_LEADING_MINUS = re.compile(r"^[-\u2010-\u2015\u2212▲△]")
+_AMOUNT_JUNK = (",", "￥", "¥", "円", " ", "　")
+
+
 def _coerce_int(v):
     """数値化できなければ None（例外にしない）。"""
     if isinstance(v, bool):
@@ -90,7 +100,10 @@ def _coerce_int(v):
     if isinstance(v, float):
         return int(v)
     if isinstance(v, str):
-        s = v.replace(",", "").replace("￥", "").replace("¥", "").strip()
+        s = unicodedata.normalize("NFKC", v).strip()
+        for junk in _AMOUNT_JUNK:
+            s = s.replace(junk, "")
+        s = _RE_LEADING_MINUS.sub("-", s, count=1)
         if re.fullmatch(r"[+-]?\d+", s):
             return int(s)
     return None

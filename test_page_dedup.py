@@ -155,6 +155,63 @@ class FalsePositiveGuardTest(unittest.TestCase):
         self.assertEqual(verdict.kind, VERDICT_NOT_ELIGIBLE)
 
 
+class FreshPageTest(unittest.TestCase):
+    """本番で最頻の経路 —— まだ見たことのない正常な明細頁。
+
+    既存テストは全て「remember 済みの内容と突き合わせる」か「not_eligible に
+    落ちる入力」しか使っておらず、`VERDICT_UNIQUE` を返す通常経路が
+    一度も実行されていなかった（毎頁通る経路が未固定という状態）。
+    """
+
+    def test_first_eligible_page_is_unique(self):
+        idx = PageDedupIndex()
+        verdict = idx.classify(safe_fingerprint(_OCR, _raw()), 1)
+
+        self.assertEqual(verdict.kind, VERDICT_UNIQUE)
+        self.assertIsNone(verdict.origin_page)
+
+    def test_second_distinct_card_is_also_unique(self):
+        idx = PageDedupIndex()
+        idx.remember(safe_fingerprint(_OCR, _raw()), 1)
+
+        ocr_b = "ご利用代金明細書 ****-******-11004 1/3 ページ 2026年5月21日"
+        other = _raw(member_no="****-******-11004", page="1/3",
+                     rows=[{"date": "2026/04/24", "amount": 5799},
+                           {"date": "2026/04/28", "amount": 3220}],
+                     total=9019)
+        verdict = idx.classify(safe_fingerprint(ocr_b, other), 5)
+
+        self.assertEqual(verdict.kind, VERDICT_UNIQUE)
+
+
+class IdentityCrossCheckTest(unittest.TestCase):
+    """docstring が中心的契約と呼ぶ「Gemini 構造化フィールド × OCR 生テキスト」の裏取り。
+
+    片方にしか無い要素は欠損に倒し、その頁は重複判定の資格を失う（＝記帳される）。
+    """
+
+    def test_member_no_absent_from_ocr_text_is_dropped(self):
+        """Gemini が会員番号を報告しても、OCR 本文に無ければ採らない。"""
+        fp = safe_fingerprint("明細書 1/6 ページ 合計 17,295", _raw())
+
+        self.assertEqual(fp.identity.account_key, "")
+        self.assertFalse(fp.is_eligible())
+
+    def test_page_label_absent_from_ocr_text_is_dropped(self):
+        fp = safe_fingerprint("ご利用代金明細書 ****-******-26003 合計 17,295", _raw())
+
+        self.assertEqual(fp.identity.page_label, "")
+        self.assertFalse(fp.is_eligible())
+
+    def test_identity_requires_both_sources_to_agree(self):
+        """両方に在るときだけ資格を得る（＝除外の候補になれる）。"""
+        fp = safe_fingerprint(_OCR, _raw())
+
+        self.assertTrue(fp.identity.account_key)
+        self.assertTrue(fp.identity.page_label)
+        self.assertTrue(fp.is_eligible())
+
+
 class FailOpenTest(unittest.TestCase):
     """指紋生成に失敗しても記帳を止めない（fail-open）。"""
 
@@ -169,6 +226,41 @@ class FailOpenTest(unittest.TestCase):
         idx.remember(safe_fingerprint(_OCR, _raw()), 1)
 
         self.assertEqual(idx.classify(None, 2).kind, VERDICT_NOT_ELIGIBLE)
+
+    def test_an_input_that_actually_raises_is_swallowed(self):
+        """握りつぶし分岐そのものを通す。
+
+        従来の壊れ入力（None / {} / {"rows": None}）はいずれも内部で例外を
+        起こさず正常経路を素通りしていたため、except 本体は 1 度も実行されて
+        いなかった。属性アクセスで例外を投げる raw_data を渡して確かめる。
+        """
+        class _Exploding(dict):
+            def __init__(self):
+                # 空 dict は falsy で `raw_data or {}` に差し替えられてしまう
+                super().__init__(rows=[])
+
+            def get(self, *args, **kwargs):
+                raise RuntimeError("boom")
+
+        fp = safe_fingerprint(_OCR, _Exploding())
+
+        self.assertIsNone(fp, "指紋生成の失敗は None（＝重複ではない）に倒す")
+
+    def test_a_raising_page_is_never_excluded(self):
+        """fail-open の帰結: 指紋を作れなかった頁は必ず記帳される。"""
+        class _Exploding(dict):
+            def __init__(self):
+                # 空 dict は falsy で `raw_data or {}` に差し替えられてしまう
+                super().__init__(rows=[])
+
+            def get(self, *args, **kwargs):
+                raise RuntimeError("boom")
+
+        idx = PageDedupIndex()
+        idx.remember(safe_fingerprint(_OCR, _raw()), 1)
+
+        verdict = idx.classify(safe_fingerprint(_OCR, _Exploding()), 3)
+        self.assertEqual(verdict.kind, VERDICT_NOT_ELIGIBLE)
 
 
 class RegistrationGuardTest(unittest.TestCase):
