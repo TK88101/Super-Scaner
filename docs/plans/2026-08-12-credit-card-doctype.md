@@ -449,6 +449,12 @@ MF 本番の実測（附録 C）で判明した井戸会計事務所の記帳習
 
 ### T3. `_route_ocr_strategy` の resolver 化 ＋ `PageOcr` 契約【前置依存】
 
+> **実施 Plan は `docs/plans/2026-08-17-t3-page-ocr-resolver.md`**（2026-08-17 定稿。
+> Codex 対抗評審 1 往復済み）。以下の記述のうち **3 点は同 Plan §10 で訂正済み**:
+> ①「タブ suffix も actual_doc_type が決める」→ タブは folder doc_type に従う
+> （AD-T3-1）、②「5 ファイル 7 箇所」→ 実測 5 ファイル 6 箇所、
+> ③ Vision 兜底の行番号 `:2079` → 実測 `:1885` / `:2122` / `:2221` の 3 箇所。
+
 戻り値を 3-tuple から `PageOcr` dataclass（`actual_doc_type` / `prompt` /
 `page_class` / `family_signal` を運ぶ）へ。prompt をファイル頭 1 回の解決から
 頁ごとの resolver へ。Vision 兜底（`ocr_engine.py:2079`）にも解決済み prompt を渡す。
