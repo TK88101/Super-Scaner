@@ -477,6 +477,22 @@ builder の強制ガード: **負数なのに `expense` と申告された行は
 JCB の 3 行（9,238 / 3,494 / 1,578 円）が円貨額で記帳され、
 `foreign_amount` を金額に使わないことを固定。
 
+> **実施 Plan は `docs/plans/2026-08-17-t4-card-prompts-builders.md`**（2026-08-17 完了。
+> Codex 対抗評審 2 往復 ＋ simcodex 2 ラウンド）。上の DoD 文言のうち **1 点を訂正済み**:
+>
+> - **「負数なのに `expense` と申告された行は `credit_adjust` に矯正」は採らない**。
+>   趙裁定 10 は「クレカ相殺は**ポイント充当のみ**」であり、返品・取消など
+>   ポイント以外の負数を `credit_adjust`（借方 未払金 ／ 貸方 **雑収入**）に倒すと
+>   **収益が無症状で過大**になる。負数はラベルで積極的に同定できたものだけ
+>   `credit_adjust` にし、同定できない負数は占位 entry にして人へ回す（AD-T4-3）。
+>   同じ理由で、`credit_adjust` と申告されたのに金額が負でない行も占位にする
+>   （Gemini が負号を落とした疑い）。
+>
+> 実装は `card_prompts.py` / `card_entries.py`（`ocr_engine.py` は登録のみ。§4 の
+> 「これ以上積まない」に従う）。T6 への追加要求 4 件が同 Plan §10 に在る
+> —— **L列の結線 / `未払金` の `CREDIT_ONLY_ACCOUNTS` 豁免 / 占位行を書く /
+> 省略名変換** の 4 つで、どれも欠くと逐行記帳が帳簿上で壊れる。
+
 ### T5. 出力切断の窓分割リトライ ＋ 行欠け検出
 
 プロンプトに `rows_on_page`（この頁の印字明細行数）を出力させ、
@@ -590,6 +606,15 @@ E2E 後に MF タブ・監査タブを CSV dump し、スクリプトで検証�
 2. `FOLDER_TRANSIT_IC_ID` は**値を設定しない**（裁定 5）
 3. miniPC で `git pull` → 再起動
 
+> **⚠ 1 の実施条件（趙裁定 2026-08-17）: `T4 ＋ T6 ＋ T7` の 3 つが揃うまで禁止。**
+> folder ID を配った瞬間に新 doc_type が本番で可達になる。従来は「T4＋T7」と
+> していたが、**T6（`line_mode` ゲート）が無いと帳簿が誤る** —— 取引No が全行同一・
+> B列が doc 級日付・credit_adjust の借方 `未払金` が「未確定勘定」に潰れる・
+> 外貨占位行が無音で消える。根拠の詳細は
+> `docs/plans/2026-08-17-t4-card-prompts-builders.md` §0。
+>
+> 逆に言えば、**コードが main に入るだけなら安全**（ID が無い限り到達不能）。
+
 ---
 
 ## 8. リスクと回退
@@ -677,15 +702,26 @@ NamedTuple のままで、config から動かせるのは既定値 1 個
 （`SMALL_AMOUNT_TAXPAYER_CONFIRMED`）だけである。`config.py` に `TAX_POLICY` を
 書いても **no-op** になるので、追加するのは上表の名前のとおりにすること。
 
-**足場の実数（2026-08-14 実測）**: 上表 13 項目のうち、実装側に
-`try/except ImportError` の読み取りが在るのは 8 項目
+**足場の実数（2026-08-17 更新。T4 完了時点）**: 上表 13 項目のうち、実装側に
+`try/except ImportError` の読み取りが在るのは **9 項目**
 （`RECON_TOLERANCE_YEN` / `TRANSIT_IC_BOOK_CHARGE_ROWS` / `CREDIT_CARD_DEDUP_MODE` /
 `INVOICE_COL_VALUES` / `INVOICE_COL_RENDERING` / `INVOICE_CONFIRM_THRESHOLD_YEN` /
-`INVOICE_CONFIRM_TAG` / `SMALL_AMOUNT_TAXPAYER_CONFIRMED`）。
-残り 5 項目（`CREDIT_ADJUST_CREDIT_ACCOUNT` / `CC_WINDOW_SIZE` / `CC_MAX_WINDOWS` /
-`GEMINI_MAX_OUTPUT_TOKENS_BULK` / `CC_TAX_TYPE_RENDERING`）は T4・T5 で
-実装する側がまだ存在しないため読み取り点も無い。**config に書くだけでは効かない**ので、
-該当タスクの実装時に足場も一緒に入れること。
+`INVOICE_CONFIRM_TAG` / `SMALL_AMOUNT_TAXPAYER_CONFIRMED` ＋
+**`CREDIT_ADJUST_CREDIT_ACCOUNT`（T4 で `card_entries` が結線）**）。
+
+残り 4 項目（`CC_WINDOW_SIZE` / `CC_MAX_WINDOWS` / `GEMINI_MAX_OUTPUT_TOKENS_BULK` /
+`CC_TAX_TYPE_RENDERING`）は T5・T6 で実装する側がまだ存在しないため読み取り点も無い。
+**config に書くだけでは効かない**ので、該当タスクの実装時に足場も一緒に入れること。
+
+> **`CC_TAX_TYPE_RENDERING` を T4 で結線しなかった理由**（Codex 評審で明確化）:
+> builder は canonical の税区分（`課対仕入10%`）を出し、省略名（`課仕 10%`）への
+> 変換は **T6 の出力層**で行う（AD-11「出力層のみ」）。T4 で結線すると内部値が
+> 省略名になり、`anomaly_detector` 等の精確等値判定と食い違う。
+>
+> **番人の探索対象も更新した**（`test_credit_card_config.UnwiredItemsTest.WATCHED`）:
+> 従来の 4 モジュールに `card_entries.py` / `card_prompts.py` を追加し、検出パターンを
+> `from config import X` **と** `config.X` の両方にした。旧実装は前者しか見ておらず、
+> 新モジュールで結線しても番人は緑のままだった（T4 Plan §2 訂正 4）。
 
 **注意**: `CC_TAX_TYPE_RENDERING` の 8% 側の省略名（`課仕 8%(軽)`）は MF 実帳で未確認。
 10% 側（`課仕 10%`）のみ実測済み（附録 C）。8% 行を出す前に要確認。
