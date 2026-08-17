@@ -522,6 +522,15 @@ def _process_file_impl(service, sheets_writer, file_path, uploader_name,
         if result.get("_page_error"):
             error_pages += 1
             failed_page_nums.append(page_num)
+            # producer は memo に具体的な原因を書いている（「PDF分割が中断」
+            # 「AI応答のJSON解析失敗」「整形処理エラー: XxxError」等）のに、
+            # ここで捨てると顧客が見る集計行は頁番号だけになり、
+            # 「再アップロードで直るのか、原票が壊れているのか」を判断できない。
+            # failed_page_notes の宣言時コメント（上記）が元々意図していた
+            # 用途でもある（従来は _excluded_page の監査失敗経路でしか
+            # 埋まっておらず、意図が _page_error では兌現されていなかった）。
+            if result.get("memo"):
+                failed_page_notes[page_num] = result["memo"]
             _emit(OUTCOME_FAILED, "page_error")
             continue
 

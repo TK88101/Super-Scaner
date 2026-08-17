@@ -2229,6 +2229,16 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                 # 経路で欠落が生まれたときに気づけるようにする。
                 # 裁決により警告のみ（成否判定は変えない、P2 繰延）。
                 seen_pages = set()
+                # IP-401 §11.0: 逐頁ループの**本体に入った**頁番号。
+                # seen_pages（＝一度でも yield した頁）と分ける理由は、
+                # 「頁が消える」には性質の違う 2 種があるため:
+                #   ・進入したが何も出さなかった → §8-中7 の裁定で警告のみ
+                #   ・そもそも進入しなかった     → producer が静かに尽きた
+                # 後者は per-page try の埒外なので占位すら作られず、前 k 頁が
+                # 成功していると main は Success 判定で歸檔してしまう。
+                # 1 つの集合で見ていると両者を区別できず、片方を直すと
+                # もう片方の裁定を巻き添えにする。
+                entered_pages = set()
 
                 def _mark(payload):
                     """出力を記録してから payload を返す（yield と対で使う）。
@@ -2249,6 +2259,15 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
 
                     if idx < start_page:
                         continue
+
+                    # 記録は start_page スキップの後。名前どおり「本体に
+                    # 入った頁」だけを持たせるためで、**差集合の結果は
+                    # 位置に依らない**（被減数が range(start_page, total+1)
+                    # なので、飛ばした頁番号はそもそも母集団に居ない）。
+                    # 当初「前に置くと誤報になる」と書いていたが、変異検証で
+                    # 位置を動かしても 1 件も落ちず、その理由付けが誤りだと
+                    # 判明した。効くのは可読性であって正しさではない。
+                    entered_pages.add(idx)
 
                     try:
                         page_ocr = _route_ocr_strategy(
@@ -2333,9 +2352,35 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                         yielded += 1
                     gc.collect()
 
+                # IP-401 §11.0: producer が静かに尽きた頁を占位で可視化する。
+                # `_split_pdf_pages` は例外を自分で握って return するので、
+                # 消費側からは「宣言より少ない頁数で尽きた」としか見えない
+                # （中途失敗と「本当に k 頁だった」を区別できない）。これらの
+                # 頁は逐頁ループに一度も入らないため per-page try が届かず、
+                # 前 k 頁が成功していると main は error_pages==0 で Success →
+                # **歸檔** —— 欠落頁の仕訳はどこにも入らず再試行もされない。
+                #
+                # 分類が `_page_error` なのは「保持」させたいからではない。
+                # 保持か歸檔かはファイル全体の成否で main が決め、本件は必ず
+                # 「前頁成功 ＋ 後続失敗」なので partial_error → 歸檔になる。
+                # 歸檔でよい: 前 k 頁は既に書かれており、保持して再試行すると
+                # その k 頁が重複計上される。
+                never_entered = sorted(
+                    set(range(start_page, total + 1)) - entered_pages)
+                for miss in never_entered:
+                    failed_pages += 1
+                    print(f"[p{miss}] ❌ PDF分割が中断: この頁を取得できません"
+                          f"でした（占位行を記録します）")
+                    yield _mark(_page_error_payload(
+                        "PDF分割が中断（この頁を取得できませんでした）",
+                        miss, total, None))
+
                 # ページカバレッジ突合（IP-401 §8-中7）
                 # 個別の欠落経路を塞いだ後の最終哨戒。将来また別経路で無音
                 # 欠落が生まれたときに、顧客が枚数を数えるより先に気づく。
+                # 上の補填で占位を出した頁は _mark 経由で seen_pages に入る
+                # ので、ここに残るのは entered_pages - seen_pages ——
+                # すなわち §8-中7 が「警告のみ」と裁定したまさにその集合だけ。
                 missing = sorted(set(range(start_page, total + 1)) - seen_pages)
                 if missing:
                     print(f"⚠️ ページカバレッジ警告: {len(missing)}/{total}頁が"

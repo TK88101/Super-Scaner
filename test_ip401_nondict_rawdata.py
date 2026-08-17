@@ -34,8 +34,8 @@ from ocr_test_helpers import (
     page_ocr_from_tuple, page_ocrs_from_tuples, pdf_pages,
 )
 from page_progress import (
-    OUTCOME_PLACEHOLDER, STATUS_COMPLETED, STATUS_FAILED_RETAINED,
-    STATUS_PARTIAL_ERROR,
+    OUTCOME_FAILED, OUTCOME_PLACEHOLDER, STATUS_COMPLETED,
+    STATUS_FAILED_RETAINED, STATUS_PARTIAL_ERROR,
 )
 from sheets_output import APPEND_RESULT_PLACEHOLDER, APPEND_RESULT_POSTED
 
@@ -552,10 +552,14 @@ class TruncatedSplitTest(unittest.TestCase):
     def test_start_page_skip_is_not_reported_as_missing(self):
         """`--start-page N` で意図的に飛ばした頁を欠落と誤報しない。
 
-        `entered_pages` の記録位置が `if idx < start_page: continue` の
-        **後**であることに依存する。前に置くと、飛ばした頁が「入った」
-        ことになって欠落判定から漏れる——逆に言えば、記録位置を前に
-        動かすとこの test は落ちる。
+        当初この docstring は「`entered_pages` の記録位置が start_page
+        スキップの後であることに依存し、前に動かすとこの test が落ちる」と
+        書いていた。**変異検証したら落ちなかった** —— 差集合の被減数が
+        `range(start_page, total+1)` なので、飛ばした頁番号はそもそも母集団に
+        居らず、`entered_pages` に混ざっても結果は変わらない。
+        この test が実際に守っているのは記録位置ではなく
+        「`never_entered` の母集団が start_page 起点であること」である
+        （母集団を `range(1, total+1)` に変えるとこの test は落ちる）。
         """
         # Arrange: 2 頁とも産出されるが start_page=2 で p1 を飛ばす
         routes = [(_normal_gemini(), NORMAL_OCR, 0.95),
@@ -741,6 +745,63 @@ class ProcessFileTerminalStateTest(unittest.TestCase):
         self.assertEqual(len(writer.calls[0]["entries"]), 1)
         self.assertIn("ページ処理エラー", writer.calls[1]["memo"])
         progress.file_finished.assert_called_once_with(STATUS_PARTIAL_ERROR)
+
+    def test_truncated_split_is_archived_with_summary_row(self):
+        """欠落頁が在っても歸檔し、MF タブに集計行を残す（§3.2）。
+
+        歸檔でよい理由: 前頁は既に Sheets へ書かれているので、保持して
+        再試行するとその頁が重複計上される。顧客への通知は集計行が担う。
+        """
+        # Arrange: 尾段ではなく逐頁経路の実出力を使う（producer が尽きた形）
+        pages, _ = _run_paged_pdf_truncated(
+            [(_normal_gemini(), NORMAL_OCR, 0.95)], declared_total=3)
+        progress = mock.MagicMock()
+
+        # Act
+        ok, writer = _run_process_file(pages, progress=progress)
+
+        # Assert: 歸檔（True）／ 成功頁 ＋ 集計行の 2 行
+        self.assertTrue(ok)
+        self.assertEqual(len(writer.calls), 2)
+        summary = writer.calls[1]["memo"]
+        self.assertIn("ページ処理エラー", summary)
+        self.assertIn("p2", summary)
+        self.assertIn("p3", summary)
+        progress.file_finished.assert_called_once_with(STATUS_PARTIAL_ERROR)
+
+    def test_truncated_split_emits_failed_outcome_per_missing_page(self):
+        # Arrange
+        pages, _ = _run_paged_pdf_truncated(
+            [(_normal_gemini(), NORMAL_OCR, 0.95)], declared_total=3)
+        progress = mock.MagicMock()
+
+        # Act
+        _run_process_file(pages, progress=progress)
+
+        # Assert: 成功 1 件 ＋ 欠落 2 件
+        outcomes = [c.args[2] for c in progress.page_done.call_args_list]
+        self.assertEqual(outcomes.count(OUTCOME_FAILED), 2)
+
+    def test_page_error_memo_reaches_the_summary_row(self):
+        """`_page_error` 頁の memo が集計行に届く（G11 の是正の番人）。
+
+        本件の「PDF分割が中断」に限らず、既存の `_page_error`（AI応答の
+        JSON解析失敗・整形処理エラー等）でも効く改善であることを、
+        本件と無関係な memo で 1 件示す。従来は `failed_page_notes` が
+        `_excluded_page` の監査失敗経路でしか埋まらず、集計行には頁番号
+        しか出なかった。
+        """
+        # Arrange: 成功頁 ＋ 既存経路の _page_error 占位
+        good = _results_from_producer(_normal_gemini(), ocr_text=NORMAL_OCR)
+        pages = [{"result": good[0], "page_num": 1, "total_pages": 2},
+                 ocr_engine._page_error_payload(
+                     "AI応答のJSON解析失敗", 2, 2, None)]
+
+        # Act
+        _, writer = _run_process_file(pages)
+
+        # Assert
+        self.assertIn("AI応答のJSON解析失敗", writer.calls[1]["memo"])
 
     def test_tail_falsy_is_retained_not_archived(self):
         """falsy / None は従来どおり保持・再試行（§3.4 行 4）。
