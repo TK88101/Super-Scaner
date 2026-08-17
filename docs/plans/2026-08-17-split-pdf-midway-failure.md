@@ -348,3 +348,53 @@ Codex の最終評価「『全ての頁消失を覆う』ではなく『producer
 書くべきという指摘があり、覆う/覆わないの対照表として反映した。
 
 **Plan 定稿**（2026-08-17）。
+
+---
+
+## 附録 B: 実施記録（2026-08-17）
+
+commit: `bd9f3c2`（Plan）→ `5191eff`（TDD RED）→ `0845a17`（実装）。
+**799 tests 緑**（着手時 791）。
+
+### 実装
+
+| 箇所 | 内容 |
+|---|---|
+| `ocr_engine.process_pipeline` | `entered_pages` の宣言・記録・ループ後の補填（3 箇所） |
+| `main._process_file_impl` | `_page_error` 分岐で `failed_page_notes` へ memo を引き継ぐ（1 行 ＋ 理由コメント） |
+| `test_ip401_nondict_rawdata.py` | `TruncatedSplitTest`（5 件）＋ `ProcessFileTerminalStateTest` に 3 件 |
+
+`_split_pdf_pages` / `sheets_output.py` / 既存テストは**無改変**。
+`test_ip401_regression` と `test_main_process_file`（57 件）は無修正で緑 ——
+H3 達成。
+
+### 変異検証 — 4 件中 1 件が**当方のコメントの誤りを暴いた**
+
+| 変異 | FAIL したテスト |
+|---|---|
+| A: 補填の yield を削除 | 5 件（`TruncatedSplitTest` 3 ＋ main 側終態 2） |
+| B: `entered_pages.add(idx)` を start_page スキップの**前**へ | **0 件** ← 想定外 |
+| C: `main.py` の memo 引継ぎを戻す | 1 件（`test_page_error_memo_reaches_the_summary_row`） |
+| D: 母集団を `range(1, total+1)` へ | 1 件（`test_start_page_skip_is_not_reported_as_missing`） |
+
+**B が何も殺さなかった**ことで、§3.1 に書いた
+「記録位置を前に置くと『飛ばしたのに欠落として占位が出る』誤報になる」が
+**誤りだった**と判明した。差集合の被減数が `range(start_page, total+1)` である
+以上、飛ばした頁番号はそもそも母集団に居らず、`entered_pages` に混ざっても
+結果は変わらない。記録位置が効くのは**可読性であって正しさではない**。
+
+コードのコメントと test の docstring を訂正し、当該 test が実際に守っている
+のは「母集団が `start_page` 起点であること」だと書き直したうえで、
+**変異 D でそれが実際に落ちることを確認**した（訂正した主張を再度変異で
+裏取りする）。
+
+これは前 commit（IP-401 非 dict）で 3 件見つかった「テストが守っていると
+主張する対象と実際に守っている対象のずれ」と同族だが、今回ずれていたのは
+テストではなく**実装コメントの理由付け**だった。変異検証は
+「テストの牙」だけでなく「**自分の因果説明が正しいか**」も検査する。
+
+### 未実施
+
+**simcodex（実施後評審）は未実施**。趙の指示が「T-b c d を完成」であり、
+かつ usage limit 接近の通知が出ていたため、subagent を伴う評審は起動して
+いない。必要なら `/simcodex` を別途発行のこと。
