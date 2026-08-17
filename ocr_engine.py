@@ -19,6 +19,8 @@ from doc_types import (DocType, DOC_TYPE_CONFIG, DOC_TYPE_TAB_SUFFIX,
 # 純関数モジュール（gspread / paddleocr 非依存）。依存は単方向で、
 # page_family 側は ocr_engine を import しない（定数は複製し、乖離は
 # test_page_family の突合テストが検出する）。
+import card_entries
+import card_prompts
 import page_family
 from receipt_aggregation import (
     KEIYUZEI_DEBIT_ACCOUNT,
@@ -1661,45 +1663,16 @@ def _build_entries_from_salary_slip(raw_data):
     return entries
 
 
-# ── クレジットカード / 交通系IC（T1 スタブ）─────────────────────
+# ── クレジットカード / 交通系IC（T4）───────────────────────────────
 #
-# 【重要】ここは T1「DocType と 5 レジストリの同時追加」段階の**仮実装**である。
-# 本実装は T4（プロンプト設計・builder 実装）で差し替える。
-# 詳細は docs/plans/2026-08-12-credit-card-doctype.md を参照。
+# プロンプトと builder の実体は `card_prompts` / `card_entries` に在る。
+# ここには**登録だけ**を置く —— このファイルは 2300 行超で CLAUDE.md の
+# 800 行上限を大きく超過しており、母 Plan §4 が「これ以上積まない」と決めている。
 #
-# スタブであっても登録だけは先に済ませる必要がある。_validate_doc_type_registries
-# は DocType.ALL を真値来源に import 時検査するため、DocType に定数を足した時点で
-# 5 表すべてを埋めないと import 自体が RuntimeError で落ちる（＝設計どおりの防呆）。
-#
-# スタブの安全性: builder は常に空リストを返す。空リストは「entries が 0 件」として
-# 扱われ、_yield_page_results は赤い認識不能占位行を yield する。
-# **無音でページが消えることはない**（IP-401 の不変式は保たれる）。
-_CC_PROMPT_STUB = """
-【未実装】クレジットカード利用明細書のプロンプトは T4 で実装します。
-このプロンプトが実際に Gemini へ送られることは想定していません。
-"""
-
-PROMPTS[DocType.CREDIT_CARD] = _CC_PROMPT_STUB
-PROMPTS[DocType.TRANSIT_IC] = _CC_PROMPT_STUB
-
-
-def _build_entries_from_credit_card(raw_data):
-    """クレジットカード明細から仕訳エントリを生成（T4 で実装）。
-
-    逐行記帳（1 明細 = 1 仕訳）・負数行の分離（credit_adjust は
-    「クレカ相殺」で記帳 / carry_over は記帳しない）・外貨は円換算額のみ、
-    といった要件は Plan の AD-5 / AD-10 / AD-11 にある。
-    """
-    return []
-
-
-def _build_entries_from_transit_ic(raw_data):
-    """交通系IC 利用履歴から仕訳エントリを生成（T4 で実装）。
-
-    「入金（チャージ）」行は費用ではないため記帳しない（TBD-2 既定）。
-    年が券面に無いため年の決定ロジックが要る（推定した場合は必ず異常マーク）。
-    """
-    return []
+# 両モジュールは venv 非依存（gspread / paddleocr / google api を引かない）で、
+# `test_dependency_weight` がそれを機械で見張る。
+PROMPTS[DocType.CREDIT_CARD] = card_prompts.CREDIT_CARD_PROMPT
+PROMPTS[DocType.TRANSIT_IC] = card_prompts.TRANSIT_IC_PROMPT
 
 
 # エントリビルダー登録テーブル
@@ -1708,9 +1681,16 @@ ENTRY_BUILDERS = {
     DocType.PURCHASE_INVOICE: _build_entries_from_purchase_invoice,
     DocType.SALES_INVOICE: _build_entries_from_sales_invoice,
     DocType.SALARY_SLIP: _build_entries_from_salary_slip,
-    DocType.CREDIT_CARD: _build_entries_from_credit_card,
-    DocType.TRANSIT_IC: _build_entries_from_transit_ic,
+    DocType.CREDIT_CARD: card_entries.build_entries_from_credit_card,
+    DocType.TRANSIT_IC: card_entries.build_entries_from_transit_ic,
 }
+
+# 逐行記帳（1 明細 = 1 仕訳）を行う doc_type。`_build_doc_result` が
+# result dict に `line_mode` を立て、T6 の `sheets_output` がそれを見て
+# A/B/F/T/H 列を行級へ切り替える（AD-6 の明示ゲート）。
+# **既存 doc_type にはキー自体を書かない** —— `entries_data.get("line_mode")`
+# は None（falsy）になり、既存の row は 1 バイトも変わらない。
+LINE_MODE_DOC_TYPES = frozenset({DocType.CREDIT_CARD, DocType.TRANSIT_IC})
 
 
 def _validate_doc_type_registries(doc_types=None, registries=None):
@@ -1775,7 +1755,7 @@ def _build_doc_result(doc_type, raw_data, entries):
     if unrecognized:
         print("⚠️ 有効な仕訳エントリが見つかりません → 認識不能として記録")
 
-    return {
+    result = {
         "doc_type": doc_type,
         "date": raw_data.get("date"),
         "vendor": vendor,
@@ -1785,6 +1765,23 @@ def _build_doc_result(doc_type, raw_data, entries):
         "entries": entries,
         "_unrecognized": unrecognized,
     }
+
+    if doc_type not in LINE_MODE_DOC_TYPES:
+        return result
+
+    # ── 逐行記帳 doc_type だけの追加情報（AD-T4-6 / AD-T4-7）──
+    # 既存 doc_type には**キー自体を足さない**（上で return 済み）。
+    # 「1 明細 = 1 独立取引」であって複合仕訳ではないことを T6 へ伝える旗。
+    result["line_mode"] = True
+    # 記帳しなかった行（前回分口座振替・チャージ）の件数と金額。
+    # doc 級 memo と専用キーの**両方**に入れる —— T6 で T列が行級化すると
+    # doc 級 memo は読まれなくなるので、移行の谷間で情報が消えないようにする。
+    summary = card_entries.summarize_nonbookable(raw_data, doc_type)
+    if summary:
+        result["_nonbookable_summary"] = summary
+        if not unrecognized:
+            result["memo"] = " ".join(x for x in (result["memo"], summary) if x)
+    return result
 
 
 def _normalize_receipt_results(

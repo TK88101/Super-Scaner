@@ -145,21 +145,42 @@ class UnwiredItemsTest(unittest.TestCase):
     ここの一覧と Plan §9.5 の注記を更新させるための番人である。
     """
 
-    UNWIRED = ("CREDIT_ADJUST_CREDIT_ACCOUNT", "CC_WINDOW_SIZE", "CC_MAX_WINDOWS",
+    # T4 で `CREDIT_ADJUST_CREDIT_ACCOUNT` が結線されたのでこの一覧から外した
+    # （`card_entries` が読み、`test_card_entries` が変異で効き目を確認済み）。
+    # `CC_TAX_TYPE_RENDERING` は**意図的に残す** —— builder は canonical の
+    # 税区分を出し、省略名への変換は T6 の出力層で行う（AD-11）。
+    UNWIRED = ("CC_WINDOW_SIZE", "CC_MAX_WINDOWS",
                "GEMINI_MAX_OUTPUT_TOKENS_BULK", "CC_TAX_TYPE_RENDERING")
 
-    def test_unwired_items_are_still_unread_by_the_three_modules(self):
+    # 結線されうる実装モジュール。T6 で `sheets_output.py` を足すこと
+    WATCHED = ("page_family.py", "card_reconciliation.py",
+               "invoice_classification.py", "page_dedup.py",
+               "card_entries.py", "card_prompts.py")
+
+    def _watched_sources(self):
         import pathlib
 
-        sources = "\n".join(
+        return "\n".join(
             pathlib.Path(os.path.dirname(__file__), name).read_text(encoding="utf-8")
-            for name in ("page_family.py", "card_reconciliation.py",
-                         "invoice_classification.py", "page_dedup.py"))
-        newly_wired = [n for n in self.UNWIRED if "from config import %s" % n in sources]
+            for name in self.WATCHED)
+
+    def test_unwired_items_are_still_unread_by_the_implementation(self):
+        sources = self._watched_sources()
+        # `from config import X` だけでなく `config.X` も見る —— 後者の書き方で
+        # 結線されると番人がすり抜け、実装と一覧の食い違いが無音で固定される
+        newly_wired = [n for n in self.UNWIRED
+                       if ("from config import %s" % n in sources
+                           or "config.%s" % n in sources)]
         self.assertEqual(
             newly_wired, [],
             "結線された項目がある。この一覧と Plan §9.5 の「読み取り点が未実装」"
             "注記を更新すること: %s" % newly_wired)
+
+    def test_the_watchdog_can_actually_see_a_wired_item(self):
+        """番人が本当に噛むこと（一覧を空にしただけで緑になる番人を作らない）。"""
+        # Assert: T4 で実際に結線された項目は、番人の視野に入っている
+        self.assertIn("from config import CREDIT_ADJUST_CREDIT_ACCOUNT",
+                      self._watched_sources())
 
     def test_bulk_token_limit_is_zero_until_measured(self):
         """0 = 既存値を流用。実測（check_models.py）前に数値を入れない。"""

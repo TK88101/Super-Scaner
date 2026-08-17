@@ -164,7 +164,7 @@ SCAN_INTERVAL = 3
 # 借方 未払金 ／ 貸方 雑収入 で計上し、カード未払金を直接減らす（Plan AD-5）。
 # 『クレカ相殺』は MF 全 112 社中 7 社にしか無く、しかも貸借対照表側の
 # 一時科目だったため採らない（附録 D）。`雑収入` は抽査 14/14 社に存在。
-# ※ 読み取り点が未実装（T4 の entry builder で使う）
+# 読み取り点: card_entries._build（T4 で結線済み）
 CREDIT_ADJUST_CREDIT_ACCOUNT = "雑収入"
 
 # nimoca「入金（チャージ）」行を記帳対象に含めるか（Plan TBD-2）。

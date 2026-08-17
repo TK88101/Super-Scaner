@@ -37,10 +37,16 @@ _MUST_STAY_LIGHT = (
     "test_page_dedup",
     "test_card_reconciliation",
     "test_invoice_classification",
+    "test_card_entries",
+    "test_card_prompts",
     "page_family",
     "page_dedup",
     "card_reconciliation",
     "invoice_classification",
+    # T4 の 2 本。`ocr_engine` は登録するだけで、実体はこちらに在る
+    # （母 Plan §4「ocr_engine にこれ以上積まない」）
+    "card_entries",
+    "card_prompts",
 )
 
 

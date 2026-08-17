@@ -80,9 +80,16 @@ def _build_description(doc_type, vendor_name, item_description):
     vendor が空の場合は strip で先頭空白を付けない。同 tab 内の振込控え
     （bank_transfer）行も tab 内格式統一のため同形式を適用する。
     その他の doc_type は既存の「店名 - 内容」形式を維持する。
+
+    逐行記帳の doc_type（T4）だけは builder が完成形を作るのでそのまま返す
+    —— 「取引先」が行ごとの加盟店であって doc 級ではないため、doc 級 vendor を
+    前置すると全行に無関係な社名（カード会社名）が付くか、空 vendor で
+    「 - 電車 西鉄福岡〜薬院」になる（Plan AD-T4-4）。
     """
     if doc_type == DocType.RECEIPT:
         return f"{vendor_name} {item_description}".strip()
+    if doc_type in (DocType.CREDIT_CARD, DocType.TRANSIT_IC):
+        return item_description
     return f"{vendor_name} - {item_description}"
 
 
