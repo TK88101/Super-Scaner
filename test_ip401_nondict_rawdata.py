@@ -426,6 +426,149 @@ class TailFalsyRawDataTest(unittest.TestCase):
         self.assertEqual(len(out[0]["result"]["entries"]), 1)
 
 
+def _run_paged_pdf_truncated(routes, declared_total, doc_type=DocType.RECEIPT,
+                             start_page=1):
+    """producer が `declared_total` を宣言しつつ `len(routes)` 頁で尽きる状況。
+
+    `_split_pdf_pages` の中途失敗（k 頁目まで成功して k+1 頁目で `PdfReadError`）
+    を模す。producer は例外を自分で握って静かに `return` するので、消費側から
+    見えるのは「宣言より少ない頁数でジェネレータが尽きた」ことだけである
+    —— 実装がその状況をどう扱うかがここで固定される。
+    """
+    pages = [{"page_num": i, "total_pages": declared_total,
+              "data": f"%PDF-p{i}".encode(), "filename": f"p{i}.pdf"}
+             for i in range(1, len(routes) + 1)]
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(b"%PDF-1.4 dummy")
+        path = tmp.name
+    try:
+        with mock.patch.object(ocr_engine, "_split_pdf_pages",
+                               return_value=iter(pages)), \
+             mock.patch.object(ocr_engine, "_route_ocr_strategy",
+                               side_effect=page_ocrs_from_tuples(
+                                   routes, doc_type)), \
+             mock.patch.object(ocr_engine, "_call_gemini_bytes",
+                               return_value=None):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                out = list(ocr_engine.process_pipeline(
+                    path, doc_type=doc_type, ocr_strategy="C",
+                    start_page=start_page))
+        return out, buf.getvalue()
+    finally:
+        os.unlink(path)
+
+
+class TruncatedSplitTest(unittest.TestCase):
+    """`_split_pdf_pages` が中途で尽きた頁が無音で消えないこと。
+
+    従来はこの頁が逐頁ループに**一度も入らない**ため per-page try の埒外で、
+    占位も作られず `seen_pages` にも載らなかった。前 k 頁が成功していると
+    `count > 0` かつ `error_pages == 0` になるので main は Success 判定 →
+    **歸檔**し、欠落頁の仕訳はどこにも入らず自動再試行も無い（留痕は監査
+    タブの「欠落」1 行だけで、顧客が見る MF タブ側は無傷だった）。
+
+    Plan: `docs/plans/2026-08-17-split-pdf-midway-failure.md`
+    """
+
+    def test_truncated_split_yields_placeholder_for_missing_pages(self):
+        # Arrange: 3 頁と宣言しつつ p1 だけ産出して尽きる
+        routes = [(_normal_gemini(), NORMAL_OCR, 0.95)]
+
+        # Act
+        out, _ = _run_paged_pdf_truncated(routes, declared_total=3)
+
+        # Assert: 3 頁すべてが出力に現れる
+        self.assertEqual({p["page_num"] for p in out}, {1, 2, 3})
+        by_page = {p["page_num"]: p["result"] for p in out}
+        self.assertEqual(len(by_page[1]["entries"]), 1)
+        for miss in (2, 3):
+            with self.subTest(page=miss):
+                self.assertTrue(by_page[miss].get("_page_error"))
+
+    def test_truncated_split_placeholder_names_the_cause(self):
+        """汎用の「ページ処理エラー」で埋もれさせない。
+
+        顧客が集計行を見たとき「再アップロードで直るのか、原票が壊れて
+        いるのか」を判断できる必要がある。
+        """
+        # Arrange
+        routes = [(_normal_gemini(), NORMAL_OCR, 0.95)]
+
+        # Act
+        out, _ = _run_paged_pdf_truncated(routes, declared_total=2)
+
+        # Assert
+        by_page = {p["page_num"]: p["result"] for p in out}
+        self.assertIn("PDF分割が中断", by_page[2]["memo"])
+
+    def test_truncated_split_does_not_warn_twice(self):
+        """占位を出した頁はもう「無音欠落」ではないので警告は出さない。
+
+        カバレッジ哨戒は「一度も出力されなかった頁」への最終防衛なので、
+        占位を出した頁まで警告すると哨戒が狼少年になる。
+        """
+        # Arrange
+        routes = [(_normal_gemini(), NORMAL_OCR, 0.95)]
+
+        # Act
+        _, log = _run_paged_pdf_truncated(routes, declared_total=3)
+
+        # Assert
+        self.assertNotIn("ページカバレッジ警告", log)
+
+    def test_entered_but_silent_page_is_not_placeholdered_after_entered_pages(
+            self):
+        """§8-中7 の既存裁定を新機構が侵していないこと（H3 の番人）。
+
+        「循環に入ったが何も出さなかった」頁は**警告のみ**という裁定は
+        `test_ip401_regression.test_coverage_warning_fires_when_a_page_yields_nothing`
+        が固定している。`entered_pages` を導入した後もその頁が占位化
+        されないことを、こちら側からも確かめる（既存テストの写しではなく、
+        新機構が既存裁定を侵していないことの検査）。
+        """
+        # Arrange: p1 は循環に入るが _yield_page_results が空を返す
+        real = ocr_engine._yield_page_results
+        calls = {"n": 0}
+
+        def silent_first(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return iter([])
+            return real(*args, **kwargs)
+
+        routes = [(_normal_gemini(), NORMAL_OCR, 0.95),
+                  (_normal_gemini(), NORMAL_OCR, 0.95)]
+
+        # Act
+        with mock.patch.object(ocr_engine, "_yield_page_results",
+                               side_effect=silent_first):
+            out, log = _run_paged_pdf_truncated(routes, declared_total=2)
+
+        # Assert: p1 は占位化されず、従来どおり警告だけが出る
+        self.assertEqual({p["page_num"] for p in out}, {2})
+        self.assertIn("ページカバレッジ警告", log)
+
+    def test_start_page_skip_is_not_reported_as_missing(self):
+        """`--start-page N` で意図的に飛ばした頁を欠落と誤報しない。
+
+        `entered_pages` の記録位置が `if idx < start_page: continue` の
+        **後**であることに依存する。前に置くと、飛ばした頁が「入った」
+        ことになって欠落判定から漏れる——逆に言えば、記録位置を前に
+        動かすとこの test は落ちる。
+        """
+        # Arrange: 2 頁とも産出されるが start_page=2 で p1 を飛ばす
+        routes = [(_normal_gemini(), NORMAL_OCR, 0.95),
+                  (_normal_gemini(), NORMAL_OCR, 0.95)]
+
+        # Act
+        out, _ = _run_paged_pdf_truncated(routes, declared_total=2,
+                                          start_page=2)
+
+        # Assert: p1 の占位は作られない
+        self.assertEqual({p["page_num"] for p in out}, {2})
+
+
 class _RecordingWriter:
     """append_entries の呼び出しを記録する sheets_writer 代役。
 
