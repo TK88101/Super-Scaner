@@ -647,3 +647,506 @@ B/C を独立に先行させることも可能で、その場合の判断材料�
   B の作業に含めるのが自然
 - 壊れ dict（`page_info` のキー欠落）で残頁が消える経路（§3.1 の限界節）。
   頁番号が読めない状態で意味のある占位は作れないため、限界として明記済み
+
+---
+
+## 13. §12.1 実施計画（2026-08-17 実施 session。3 件まとめて 1 commit）
+
+§12.1 の①②③を実装するための**実施級**の計画。§12.1 は「何を・なぜ」まで
+確定しているので、ここでは「どのコードが・どの終局語義で・どのテストで
+守られるか」を確定する。§12.2 の B/C は**本 commit に含めない**（趙拍板）。
+Codex 評審（§13.8）を経た確定版。
+
+### 13.0 着手前に実測した前提
+
+| # | 事実 | 根拠（本 session のコマンド出力） |
+|---|---|---|
+| H-1 | pypdf 4.3.1 の `reader.pages` は `_VirtualList`。`r.pages[2]` を先に取ってから `r.pages[0]` を取れる（ランダムアクセス可） | `venv311/bin/python` で 3 頁 PDF を生成して実測。§12.1 の主張を独立に再確認した |
+| H-2 | `process_pipeline` は関数全体を `try` で包み、最外 `except Exception: print → return` する | `ocr_engine.py:2482-2484` |
+| H-3 | ゆえに **producer の例外を消費側が捕まえないと、最外 except に吞まれて 0 件 yield** になる。main は `count==0` → 「解析に失敗しました」→ Failed → ファイル保持 → 3 秒後に再走査（Sheets に痕跡ゼロ） | `main.py:712-722` |
+| H-4 | `_split_pdf_pages` の本番呼出点は `ocr_engine.py:2219` の 1 箇所のみ | `grep -rn "_split_pdf_pages" --include=*.py`（他は全てテストの mock 先） |
+| H-5 | `main.py:505` は `process_pipeline(file_path, doc_type=doc_type)` で `start_page` を渡さない。渡すのは `local_test.py:93` のみ | 同 grep |
+| H-6 | 尾段（単頁/画像経路）は `_route_ocr_strategy(file_data, mime_type, doc_type, ocr_strategy)` を**必ず**通る（逐頁側は `prefix=` 付きで呼ぶ） | `ocr_engine.py:2420` vs `:2273` |
+| H-7 | 全頁エラー（`count == error_pages`）のとき main は **Sheets に 1 行も書かない**。partial_error のときだけ MF 集計行を書く | `main.py:644-674` |
+| H-8 | `test_ip401_nondict_rawdata.py` は既に **889 行**（全局規約の上限 800 行を超過） | `wc -l` |
+
+H-3 は②の設計を拘束する: **専用例外は「投げっぱなし」では機能しない**。
+必ず消費側の catch と対で入れる（片方だけ入れると、現状より悪い
+「Sheets に痕跡ゼロで永久滞留」になる）。
+
+### 13.1 変更するもの（`ocr_engine.py` の 3 箇所 ＋ 文言 1 箇所）
+
+#### C1. 専用例外クラスの新設
+
+```python
+class PdfSplitError(Exception):
+    """PDF を頁単位に分割できない（**初回 yield 前**の失敗に限る）。
+
+    契約（消費側 `process_pipeline` がこれに依存している）:
+      ・この例外は `_split_pdf_pages` が **1 頁も yield していない**時点でしか
+        投げてはならない。頁単位の中途失敗は握って `continue` すること。
+      ・理由: 消費側は `next(page_gen, None)` だけを try で囲む。1 頁でも
+        yield した後に例外が出ると `for page_info in chain(...)` の外へ抜け、
+        最外 except に吞まれて**残頁も補填占位も消える**（H-2/H-3）。
+    """
+```
+
+本 repo に既存の自前例外クラスは無い（生産コードで `grep "^class .*Error"`
+が 0 件）。新設が最小手段である。
+
+#### C2. `_split_pdf_pages` の改造（§12.1①②）
+
+```python
+def _split_pdf_pages(file_path):
+    """PDF を 1ページずつ yield するジェネレータ（メモリ節約）。
+
+    Raises:
+        PdfSplitError: pypdf 未導入 / PDF を開けない / 頁数を数えられない /
+            多頁と分かっているのに 1 頁も取り出せなかった。いずれも
+            **まだ 1 頁も yield していない**時点の失敗。呼出側は尾段
+            （ファイル全体を 1 回の Gemini 呼出へ送る経路）へ落とさず、
+            `_page_error` を出して終えること。
+    """
+    if PdfReader is None or PdfWriter is None:
+        raise PdfSplitError("pypdf未導入のためPDFを頁分割できません")
+
+    try:
+        reader = PdfReader(file_path)
+        total_pages = len(reader.pages)
+    except Exception as e:
+        raise PdfSplitError(f"PDF読取失敗: {e}") from e
+
+    if total_pages <= 1:
+        return                      # 正常な単頁 PDF → 尾段へ（従来どおり）
+
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    produced = 0
+    for i in range(1, total_pages + 1):
+        try:
+            page = reader.pages[i - 1]      # _VirtualList はランダムアクセス可
+            writer = PdfWriter()
+            writer.add_page(page)
+            buf = io.BytesIO()
+            writer.write(buf)
+            data = buf.getvalue()
+        except Exception as e:
+            print(f"⚠️ p{i} のPDF分割に失敗（この頁を飛ばして継続）: {e}")
+            continue
+        produced += 1
+        yield {
+            "page_num": i,
+            "total_pages": total_pages,
+            "data": data,
+            "filename": f"{base_name}_p{i}.pdf",
+        }
+
+    if produced == 0:
+        # 多頁と分かっているのに 1 頁も出せなかった。ここで黙って終わると
+        # 消費側の `first_page` が None になり**尾段へ落ちる** —— ②が塞ぐと
+        # 決めた「ファイル全体を 1 回の Gemini 呼出へ送る」事故再現経路
+        # そのもの。まだ 1 頁も yield していないので C1 の契約に反しない。
+        raise PdfSplitError("全頁のPDF分割に失敗しました")
+```
+
+**`yield` を `try` の外に置く理由**は逐頁ループの `_yield_page_results` と
+同じ（`ocr_engine.py:2325` のコメント）: 消費側から `throw`/`close` された
+例外を producer が誤って握り潰さないため。
+
+**最後の `produced == 0` は Codex 評審 P1 で追加**。当初案はこの経路を
+「§13.7 の残件」にしていたが、②が塞ぐと決めた出口と同種であり、
+新しい通信路も要らず（同じ `PdfSplitError`）、初回 yield 前という
+C1 の契約も自動的に満たすため、同 commit の責任範囲だと認めた。
+
+#### C3. 消費側 `next()` の防護（`ocr_engine.py:2219-2221`）
+
+**※ この節は simcodex Round 1/2 の裁決を反映した確定版**（当初案は占位を
+1 件だけ出していた。経緯と理由は §13.9）。
+
+```python
+            page_gen = _split_pdf_pages(file_path)
+            try:
+                first_page = next(page_gen, None)
+            except PdfSplitError as split_err:
+                # 尾段へ落とさない: 多頁か単頁かを判定できないまま**ファイル
+                # 全体**を 1 回の Gemini 呼出へ送ることになり、逐頁分岐冒頭の
+                # コメントが根絶したはずの MAX_TOKENS 事故の再現経路になる。
+                print(f"❌ PDF分割不可のため解析を中止: {split_err}")
+                memo = f"PDF分割不可: {str(split_err)[:120]}"
+                declared = split_err.total_pages or 1
+                for miss in range(1, declared + 1):
+                    yield _page_error_payload(memo, miss, declared, None)
+                return
+```
+
+`[:120]` は既存 3 経路（`str(page_err)[:120]`）と同じ截断幅に揃える。
+memo は失敗頁の説明として運用者が読むので、pypdf の例外文字列がそのまま
+長々と流れるのを防ぐ。
+
+**占位を「判明した全頁ぶん」出す理由**（§13.9 の 2 件の指摘に対応）:
+`total_pages` を名乗りながら占位を 1 件しか出さないと、`main` の
+カバレッジ突合が p2..pN を「欠落」と見なして監査タブへ書く。この経路は
+全頁失敗＝**ファイル保持**なので 3 秒ごとに再走査され、欠落行が毎周増殖する
+（CLAUDE.md「全ページ失敗 → Failed、保留ファイル（Sheets 占位行を書かない）」
+に反する）。全頁ぶん出せば `seen_page_nums` が埋まって突合は沈黙し、
+進捗タブの `seen/total` も「1/1」に化けない。
+
+`PdfSplitError` は `total_pages` 属性を持つ（既定 `None`）。値が入るのは
+「多頁と分かっているのに 1 頁も出せなかった」ときだけで、pypdf 未導入・
+読取失敗ではそもそも頁数が不可知なので `None` のまま `or 1` で 1 に落ちる。
+
+#### C4. 補填占位の memo 文言（§12.1①の指示）
+
+`"PDF分割が中断（この頁を取得できませんでした）"`
+→ `"PDFページ分割失敗（この頁を取得できませんでした）"`
+
+①の後は「p3 だけ壊れ、p4 以降は正常」が起こりうるので、「中断」は事実と
+食い違う。対応する print も同じ語に揃える。**この文字列は補填分岐にしか
+無い**（旧 `print("⚠️ PDFページ分割失敗: ...")` は C2 で消える）ので、
+テストが経路を特定する目印としての性質は保たれる。
+
+#### C5. `main.py` は**注釈 1 行のみ**、`sheets_output.py` / `local_test.py` は無変更
+
+③はテストだけで達成する（`main.py` の挙動は変えない）。ただし `main.py:525`
+の注釈が producer の memo 文言を引用しているので、C4 の文言変更に合わせて
+1 行だけ追随させた（実行文は 1 行も変えていない）。放置すると注釈が存在
+しない文字列を指す。当初は「`main.py` に 1 行も触れない」と書いていたが、
+それは注釈の正確さを犠牲にする条件だったので改めた（simcodex R3 の指摘）。
+
+### 13.2 終局語義の表（本 commit の意味論の全体）
+
+| 状況 | producer | 消費側 | count/error | main の終局 | 原票 | Sheets |
+|---|---|---|---|---|---|---|
+| pypdf 未導入 | `PdfSplitError` | `_page_error` p1/1 | 1/1 | Failed | **保持** | **1 行も書かれない**(H-7) |
+| `PdfReader()` / `len()` 失敗 | `PdfSplitError` | 同上 | 1/1 | Failed | **保持** | 同上 |
+| 多頁だが全頁の書出に失敗 | `PdfSplitError`（C2 末尾。`total_pages=N` を載せる） | `_page_error` を **p1..pN の N 件** | N/N | Failed | **保持** | 同上 |
+| 正常な単頁 PDF | 0 件 return | 尾段へ | — | 従来どおり | 従来どおり | 従来どおり |
+| 中途で一部の頁だけ失敗 | その頁を skip して継続 | `never_entered` 補填占位 | n/k | partial_error | **歸檔** | MF 集計行に頁番号＋memo |
+
+**「占位」の語の正確な意味**（Codex 評審 P2 の指摘で明確化）: `_page_error`
+payload は**顧客可視の行ではない**。`main.process_file` はこれを Sheets に
+書かず、`count`/`error_pages`/progress を駆動するだけである。MF 集計行が
+出るのは partial_error のときだけ（H-7）。上表 1〜3 行目の終局は
+「Sheets 無痕 ＋ 原票は Drive に残り 3 秒ポーリングで再試行され続ける」。
+
+これは IP-401 の「頁が無音で消える」とは**別種**である: 原票は歸檔されず
+Drive に残るので、データはまだ失われていない（記帳待ちのまま滞留する）。
+消えるのは「歸檔されたのに帳簿に無い」場合であり、本表にその行は無い。
+
+**唯一の実質的回帰**: 「pypdf では開けないが Gemini なら読めた PDF」が
+成功 → 滞留に変わる。§12.1② はこれを承知のうえで「多頁か単頁か判定
+できない状態で全 PDF を Gemini 全体呼出へ落とすのは A と同じ事故再現経路
+であり、しかも系統的」として尾段禁止を選んだ（趙拍板＋Codex 合意）。
+滞留中に **Gemini は呼ばれない**（`PdfReader` 失敗が先）ので課金は無い。
+
+### 13.3 タスク清単（TDD。各項に DoD）
+
+**テストの置き場所**（Codex 評審 P3 を採用）: 新規 `test_pdf_split_contract.py`
+を作り、producer/消費側境界の契約テストをそこへ集める。既存
+`SplitProducerContractTest` は producer 契約そのものなので**移設**する。
+理由は関心の分離だけでなく、`test_ip401_nondict_rawdata.py` が既に 889 行で
+全局規約の 800 行上限を超えていること（H-8）。`TruncatedSplitTest`（消費側
+補填の語義）は移設せず、C4 の文言追随だけ行う。
+
+#### T1: RED —— ①頁単位隔離（`test_pdf_split_contract.py`）
+
+1. `test_broken_page_is_skipped_and_later_pages_survive` — 3 頁の PDF で
+   p2 だけ壊れる → 産出は `[1, 3]`（**現状は `[1]`**）、`total_pages` は 3。
+   **失敗の注入点を subTest で 3 種**回す（Codex 評審 P2）:
+   `reader.pages[i-1]` のアクセス / `writer.add_page` / `writer.write`。
+   1 点だけだと「try を write の手前で閉じる」変異が生き残る
+2. `test_last_page_failure_ends_quietly_without_raising` — 既存
+   `test_producer_swallows_midway_failure_and_stops_quietly` の移設・改訂。
+   例外が外へ出ないことは維持し、期待産出を旧挙動の `[1]` から改める
+   （**意図した挙動変更**であってテストを実装に合わせて緩めたのではない、
+   と名前と docstring から読めるようにする）。壊す頁は**最終頁**にする
+   —— 中間頁の生存は 1 の subTest が見ているので、こちらは 1 が見ていない
+   末尾の境界へ寄せる（§13.9。当初は 1 と同一パラメータで重複していた）。
+   この 1 本が「中途で `PdfSplitError` を投げる」変異（C1 契約違反）と
+   「`produced == 0` を `produced < total_pages` に緩める」変異も殺す
+3. `test_skipped_page_gets_a_placeholder_from_the_consumer` — 実物 producer
+   ＋実物 `process_pipeline` を通し、p2 が `_page_error` 占位として現れ
+   memo に「PDFページ分割失敗」を含む（①と既存 `entered_pages` 補填の
+   **結合**を 1 本で押さえる。どちらかを mock すると証明できない）
+
+**DoD**: 1・2・3 が実装前に FAIL。
+
+#### T2: RED —— ②0 件出口の区別（同ファイル）
+
+尾段に入っていないことの assert は `_route_ocr_strategy.assert_not_called()`
+を**主**とする（Codex 評審 P2）。尾段は必ずここを通る（H-6）ので、
+「Gemini は呼ばれなかったが尾段には入っていた」変異まで殺せる。
+`_call_gemini` / `_call_gemini_bytes` の未呼出も併せて見る（課金の観点）。
+
+共通の assert は `_assert_tail_not_entered(out, mocks, total_pages=N)` に
+まとめ、**占位が「判明した頁数ぶん」出ていること**（`page_num` が
+`1..N` で `total_pages` が全件 N）も併せて見る（§13.9 の裁決）。
+
+4. `test_missing_pypdf_does_not_enter_tail` — `PdfReader=None`＋`PdfWriter=None`
+   → `_route_ocr_strategy` 未呼出 ＋ `_page_error` が 1 件（頁数不可知）
+5. `test_unreadable_pdf_does_not_enter_tail` — `PdfReader()` / `len()` が
+   例外 → 同上（subTest で 2 種）
+6. `test_all_pages_broken_does_not_enter_tail` — 3 頁と読めるが全頁の
+   書出が失敗 → 尾段へ落ちず、**占位が 3 件**（C2 末尾の `produced == 0` と
+   `total_pages` の引継ぎ。Codex 評審 P1 ＋ §13.9）
+7. `test_single_page_pdf_still_falls_through_to_tail` — `len(reader.pages)==1`
+   → 尾段が動く（**変更しない出口**の錨。既存の単頁 PDF テスト
+   （`test_ocr_engine_invoice` の `_run_single_page_pipeline` 系）は
+   `_split_pdf_pages` を mock しているので、実物の `<= 1` 分岐は
+   今まで無検査だった）
+8. `test_split_error_placeholder_names_the_cause` — 占位 memo が
+   「PDF分割不可」を含み、**原因文字列が引き継がれる**
+   （`pypdf未導入` / `PDF読取失敗` / `全頁のPDF分割に失敗` の 3 種を
+   subTest で。固定文言に潰す変異を殺す）
+
+**DoD**: 4・5・6・8 が実装前に FAIL、7 が実装前に PASS（既存挙動の錨）。
+
+#### T3: GREEN —— 実装（C1〜C4）
+
+**DoD**: T1・T2 全緑 ／ 変更は `ocr_engine.py` の 3 箇所（例外クラス・
+`_split_pdf_pages`・消費側 `next()` 周辺）＋ memo 文言 1 箇所 ／
+`main.py`・`sheets_output.py`・`local_test.py` は無改変。
+
+#### T4: 既存テストの追随（意図した変更ぶんだけ）
+
+- `TruncatedSplitTest` の `assertIn("PDF分割が中断", ...)`（2 箇所）と
+  同ファイル `:847` 付近の docstring → 「PDFページ分割失敗」へ
+- `SplitProducerContractTest` を `test_pdf_split_contract.py` へ移設
+- `grep -rn "PDF分割が中断" --include="*.py" .` が 0 件
+
+**DoD**: 上記以外の既存テストは**無修正**で緑。
+
+#### T5: ③番人テスト（`test_main_process_file.py`）
+
+`_run_process_file` は `process_pipeline` を `with` 内で patch するので、
+戻った後に `main.process_pipeline.call_args` は取れない（patch が外れて
+実物に戻っている）。既存 20 箇所の呼出を壊さずに mock を取り出すため、
+**任意引数 `capture=None`（dict）** を足す:
+
+```python
+def _run_process_file(pages, writer=None, progress=None,
+                      resolver_side_effect=None, capture=None):
+    ...
+    with mock.patch.object(main, "process_pipeline",
+                           return_value=iter(pages)) as pipeline, ...:
+        if capture is not None:
+            capture["pipeline"] = pipeline
+```
+
+テスト本体:
+
+```python
+    def test_main_does_not_pass_start_page_to_the_pipeline(self):
+        capture = {}
+        _run_process_file([_page(_valid_result(), 1, 1)], capture=capture)
+        _, kwargs = capture["pipeline"].call_args
+        self.assertNotIn("start_page", kwargs, ...)
+```
+
+失敗メッセージには「`start_page` を渡すなら `main.py:623` の
+`range(1, last_total_pages + 1)` を同時に直すこと」を書く（番人が鳴った
+とき、番人を消すのではなく本体を直すよう誘導する）。
+
+**DoD**: 実装前に PASS（現状の前提が成立していることの確認）、
+`main.py:505` に `start_page=1` を足す変異で FAIL。
+既存 `test_main_process_file` は無修正で緑。
+
+#### T6: 回帰と変異検証
+
+**DoD**: 全量緑 ＋ 下表の変異が**全件**赤くなる。
+
+| 変異 | 落ちるべきテスト |
+|---|---|
+| ①の `continue` → `return`（旧挙動へ回帰） | T1-1, T1-2, T1-3 |
+| ①の `try` を for の外へ戻す | T1-1, T1-2, T1-3 |
+| ①の try を `write` の手前で閉じる（部分隔離） | T1-1 の `write` subTest |
+| 中途失敗時に `PdfSplitError` を raise する（C1 契約違反） | T1-2 |
+| C1 の `raise` → 元の `print` ＋ `return`（pypdf 未導入） | T2-4, T2-8 |
+| `PdfReader` 失敗の `raise` → 元の `print` ＋ `return` | T2-5, T2-8 |
+| C2 末尾の `produced == 0` ブロックを削除 | T2-6 |
+| `if total_pages <= 1: return` → `raise PdfSplitError` | T2-7 |
+| C3 の `except PdfSplitError` ブロックごと削除 | T2-4, T2-5, T2-6（最外 except に吞まれ 0 件 yield） |
+| C3 の `yield` を消して `return` だけにする | T2-4, T2-5, T2-6, T2-8 |
+| C3 の memo から `str(split_err)` を落として固定文言にする | T2-8 |
+| C4 の memo 文言を元へ戻す | T1-3 と追随済みの `TruncatedSplitTest` |
+| `main.py:505` に `start_page=1` を追加 | T5 |
+
+### 13.4 受入基準（脚本判定）
+
+```bash
+cd "/Users/ibridgezhao/Documents/Super Scaner"
+venv311/bin/python -m unittest discover -p "test_*.py"        # → OK, Ran >= 799
+venv311/bin/python -m unittest test_ip401_regression -v       # → OK（無修正）
+venv311/bin/python -m unittest test_pipeline_consumers -v     # → OK（無修正）
+venv311/bin/python -m unittest test_pdf_split_contract -v     # → OK（新規）
+grep -rn "PDF分割が中断" --include="*.py" .                    # → 0 件
+```
+
+人手判定:
+- `git diff --stat` が `ocr_engine.py` / `main.py`(注釈 1 行) /
+  `test_pdf_split_contract.py`(新規) / `test_ip401_nondict_rawdata.py` /
+  `test_main_process_file.py` / 本 Plan に収まる
+- `main.py` は注釈 1 行のみ（C4 の文言追随。実行文は無変更）、
+  `sheets_output.py` / `local_test.py` には 1 行も触れていない
+
+### 13.5 影響面
+
+| 対象 | 影響 |
+|---|---|
+| `ocr_engine._split_pdf_pages` | 例外契約が変わる（無言 return → `PdfSplitError`）。**本番呼出点は 1 箇所**（H-4）で同 commit 内に対処 |
+| 壊れた頁を含む多頁 PDF | 失う頁が「i 以降の全部」→「頁 i だけ」 |
+| pypdf 未導入 / 開けない PDF / 全頁書出失敗 | 全体 Gemini 呼出 → `_page_error` ＋ 保持（**Gemini 課金なし**、Sheets 無痕、原票は Drive に残る） |
+| 正常な PDF（単頁・多頁とも） | **完全に無変化** |
+| `local_test.py` | 無改変。`process_pipeline` 越しに同じ改善を受ける |
+| `benchmark_ocr.py` | 無改変だが、**pypdf 未導入・読取失敗時は尾段ベンチが走らなくなる**（`_page_error` 1 件で終わる）。ベンチ結果の解釈が変わるので注記が要る（Codex 評審 P2） |
+| メモリ | 無変化（`data = buf.getvalue()` は従来 `yield` 中に生きていた同じ 1 本の bytes） |
+| 既存テスト | `TruncatedSplitTest` の文言 2 箇所 ＋ `ProcessFileTerminalStateTest` の docstring 1 箇所 ＋ `SplitProducerContractTest` の移設・期待値変更（意図した挙動変更）以外は無修正 |
+
+### 13.6 風険と回退
+
+| 風険 | 対処 |
+|---|---|
+| 破損 PDF が保持され 3 秒ポーリングで滞留し続ける（Sheets 無痕） | 課金は無い（Gemini 未呼出）。**現状も同じ終局**（尾段の Gemini が失敗すれば `_page_error` 1 件 → Failed → 保持）なので悪化ではない。可視化の改善は §13.7 へ |
+| 出力順が `1,2,4,...,20,3` になりうる | §12.1 で許容裁定済み（`_page_error` は Sheets 本体へ書かれず集計行へ回る） |
+| 回退 | 単一 commit なので `git revert` で全体を戻せる。部分回退（①だけ残す等）は C2/C3 が対で意味を成すため不可 |
+
+### 13.7 本 commit 後に残るもの
+
+- **全頁エラー時の可視化**（Codex 評審 P2 由来）: `count == error_pages` の
+  とき main は Sheets に 1 行も書かず、通知文も
+  「API障害または認証エラーの可能性」の固定文言で `failed_page_notes` を
+  使わない。PDF分割不可の原因は控制台 print にしか出ない。`main.py` の
+  変更を伴うので本 commit（§12.1 の 3 件）の範囲外。P2 として登録
+- §12.2 の B（§11.1 共有 generator 化）と C（§11.2 空出力の構造的兜底）
+- §12.3 の 2 件（`_pdf_pages` の重複コピー、壊れ dict 経路）
+
+### 13.8 Codex 評審の辯論記録（2026-08-17。§13 に対して）
+
+Codex 指摘 9 件。**全面採用 4 件 / 部分採用 4 件 / 駁回 1 件**。
+（当初「8 件・採用 6/部分 1/駁回 1」と書いていたが、P 番号を数え直すと
+P1-1, P1-2, P2-1〜P2-4, P3-1〜P3-3 の 9 件。simcodex R3 の指摘で訂正。）
+
+**全面採用（4 件）**
+
+| # | 指摘 | 反映先 |
+|---|---|---|
+| P1-1 | 多頁 PDF の全頁書出失敗が尾段へ落ちる。②が塞ぐと決めた出口と同種であり残件化は誤り | C2 末尾の `produced == 0` ＋ T2-6。なお「①が新しく作る経路」との理由付けは不正確（旧実装でも p1 が壊れれば同じ経路に落ちた）。①は**この経路を狭めた**が塞いではいない。結論は変わらないので採用 |
+| P2-2 | 頁単位隔離テストが `add_page` 失敗に偏り、`write` を try 外へ出す変異が残る | T1-1 を 3 注入点の subTest 化 ＋ 変異表に 1 行 |
+| P2-3 | Gemini 未呼出だけでは「尾段に入っていない」を証明できない | `_route_ocr_strategy.assert_not_called()` を主 assert に。H-6 で経路を確認済み |
+| P3-3 | memo の原因引継ぎを潰す変異が表に無い | 変異表に「C3 memo から `str(split_err)` を落とす」＋ T2-8 を 3 原因の subTest 化 |
+
+**部分採用（4 件）**
+
+| # | 採用した部分 | 採らなかった部分と理由 |
+|---|---|---|
+| P1-2 | C1 の docstring に「loop 内で raise してはならない」を契約として明記。変異表に「中途で `PdfSplitError`」を追加 | 専用テストの新設は不要。T1-2（`list(_split_pdf_pages(...))` が例外を出さない）が同じ変異を殺す。テストを増やすより既存の 1 本が何を守っているかを明記する方が良い |
+| P2-1 | 「占位」の語が顧客可視の行と誤読される点を §13.2 に明記（H-7 を事実表へ追加） | 「main の全頁エラー通知に `failed_page_notes` を反映するテスト」は `main.py` の変更を伴い §12.1 の 3 件の範囲外。§13.7 に P2 として登録 |
+| P2-4 | §13.5 の `benchmark_ocr.py` 行を「尾段ベンチが走らなくなる」へ具体化 | benchmark 側のテスト新設は駁回。`benchmark_ocr.py` は開発ツールで、pypdf 未導入は `requirements.txt` に固定されている以上の常態ではない |
+| P3-2 | 新規 `test_pdf_split_contract.py` を作り `SplitProducerContractTest` を移設 | `TruncatedSplitTest` は移設しない（消費側補填の語義であり producer 契約ではない。移設すると C4 の文言追随以外の差分が増え、レビューで「意図した変更」と「巻き添え」の区別が付かなくなる） |
+
+**駁回（1 件）**
+
+- **P3-1（T5 の `capture` 引数は過度。番人テストだけ単独 patch せよ）**
+  `_run_process_file` は `mock.patch.object(...)` を `as` で受けずに使うので、
+  with を抜けた後は mock への参照が残らず `call_args` を読む手段が無い
+  （**複審での訂正**: 参照さえ保持すれば with の外でも読める。当初の理由文
+  「到達不能」は不正確だった）。`capture` はその参照を呼出側へ渡す最小手段
+  である。代替案はいずれも
+  `send_notification` / `PageUrlResolver` / `redirect_stdout` の三重 patch を
+  **もう 1 部複製する**ことを意味し、この setup こそが漂移の温床
+  （`ocr_test_helpers.pdf_pages` の docstring が同じ理由で共有化を選んでいる。
+  simcodex R1 でも `_run_paged_pdf_truncated` の重複を解消したばかり）。
+  3 行の任意引数 1 つと、20 行の setup 複製を比べて前者を採る。
+
+### 13.9 simcodex の辯論記録（2026-08-17。実装後）
+
+Round 1（simplify 4 観点 ＋ `codex review --uncommitted`）と Round 2 を回した。
+**Round 2 の codex は指摘ゼロ**（自ら実物を走らせて `[(1,3),(3,3)]` を確認）。
+
+#### Round 1（採用 5 / 見送り 0）
+
+| 観点 | 指摘 | 裁決 |
+|---|---|---|
+| reuse | なし（複用点 5 箇所は正しく既存物を使っている） | — |
+| efficiency | なし。pypdf 4.3.1 の `_VirtualList` は初回アクセスで `_flatten()` し以後 O(1) なので、**ランダムアクセスは順次走査と同コスト**（H-1 をソースで裏取り）。旧コードが 2 回呼んでいた `len(reader.pages)` が 1 回に減る副次的改善も確認 | 事実として記録 |
+| simplification | ①失効した行番号参照 ②T1-2 が T1-1 の subTest と同一パラメータ ③`capture` の docstring が patch の数を誤記 ④`PdfSplitError` の契約が 2 箇所に重複 | ①③④採用。②は**削除ではなく差別化**（最終頁を壊す形に変え、`produced == 0` 変異も殺せるようにした）——削ると simcodex R1 で置いた producer 契約の番人が消える |
+| altitude | `PdfSplitError` が `total_pages` を捨てている。20 頁の PDF が全滅しても進捗タブ（`page_progress.py:311` の `seen/total`）に「1/1」と出て単頁失敗と区別が付かない | 採用。例外に `total_pages` 属性を追加 |
+
+#### Round 1 の codex review（P2 1 件・採用）
+
+> 占位を 1 件だけ出して `total_pages` に N を名乗ると、`main` のカバレッジ
+> 突合が p2..pN を欠落と見なして監査タブへ書く。この経路は全頁失敗＝
+> ファイル保持なので、**再試行のたびに監査行が増殖**する。
+
+**これは上の altitude 採用が生んだ回帰**（当方が連鎖を読み切れていなかった）。
+codex の 2 案（(a) 判明した全頁ぶん占位を出す / (b) この終局だけ突合を抑止）
+のうち **(a) を採用**。(b) は `main` に特例を足すことになり、しかも
+`main` は本 commit の範囲外。(a) は既存の `never_entered` 補填と同じ形なので
+機構が 1 つ増えない。事実確認: 進捗タブは檔ごとに 1 行を `update` する方式
+（`page_progress.py:206` で append、`:345` で update）＋節流なので、
+占位が N 件でも Sheets 書込は増えない。
+
+#### Round 2（採用 3 / 却下 1・実験で決着）
+
+| 観点 | 指摘 | 裁決 |
+|---|---|---|
+| reuse | 新設した `AllPagesErrorLeavesNoSheetRowsTest` は既存 2 テストと重複 | **採用**（下記の実験で確認）。クラスを削り、純増の assert（`audit_calls == []`）を既存 `test_page_error_still_counted_and_skipped` へ畳んだ |
+| efficiency | なし。500 頁が全滅しても Sheets 書込は約 3 回（節流）で、全頁失敗分岐は `failed_page_nums` を文字列化しない（するのは partial_error 分岐） | 事実として記録 |
+| simplification | ①`:2213-2217` の行番号が漂移して無関係な箇所を指す（2 箇所）②消費側 except の注釈が `PdfSplitError` の docstring と同じ理由を 3 度目に展開 | 両方採用。行番号は話文参照へ、理由は指針 1 行へ圧縮 |
+| altitude | Plan §13.1/§13.3 が**却下された旧案（占位 1 件）のまま**で、実装と食い違う | 採用。本節と §13.1/§13.3 を更新 |
+
+**reuse と altitude が割れた点を実験で決着させた**: altitude は新テストを
+「層間契約テストとして正しい層」と評価し、reuse は「既存 2 本の焼き直し」と
+評価した。`main.py` のカバレッジ突合から `- seen_page_nums` を落とす変異
+（M17）を注入したところ、**既存 9 本が落ちた**（新テストは 10 本目）。
+すなわち新テストは唯一の番人ではなく、削っても検出力は落ちない。
+一方 M16（占位を 1 件に潰す）を殺すのは producer 側の
+`test_all_pages_broken_does_not_enter_tail` だけであり、そちらは残す。
+
+#### 変異検証（最終形。**17 件すべて赤**）
+
+§13.3 T6 の 13 件に、simcodex の裁決で 4 件を追加した:
+
+| 変異 | 落ちたテスト |
+|---|---|
+| M14 `produced == 0` → `produced < total_pages` | `test_last_page_failure_ends_quietly_without_raising` 他 2 |
+| M15 `declared = split_err.total_pages or 1` → `= 1` | `test_all_pages_broken_does_not_enter_tail` |
+| M16 占位を 1 件だけにする | 同上 |
+| M17 `main` の突合から `- seen_page_nums` を落とす | `test_page_error_still_counted_and_skipped` 他 9 |
+
+#### 本 commit の範囲外として記録した既存問題
+
+ファイル保持中は 3 秒ごとの再試行が毎回 `progress.file_started` を呼ぶため、
+進捗タブに 1 行ずつ追加され続ける（B7 心跳機構の既存挙動で、頁数とは無関係。
+1 頁失敗でも 500 頁失敗でも同じ速度で増える）。本 commit が作った経路では
+ないが、`PdfSplitError` の終局が「保持」である以上この滞留に晒される。
+§13.7 の残件に併せて記録する。
+
+#### Round 3（採用 3 / 駁回 2。codex は 2 ラウンド連続で指摘ゼロ）
+
+| 観点 | 指摘 | 裁決 |
+|---|---|---|
+| altitude | ①§13.2 の語義表だけ旧案（占位 1 件）のまま ②C5/§13.4 が「`main.py` 無変更」と書いているが実際は注釈 1 行を変えた ③**C3 が `start_page` を無視するのは本 commit が新たに開いた経路なのに、Plan にも Codex 記録にも無く、テストも 0 件** | 3 件とも採用。③には `test_split_error_placeholders_ignore_start_page` を追加し、変異 M18（C3 の範囲を `range(start_page, ...)` にする）で牙を確認した |
+| reuse | 孤児なし・重複造轮なし（実測 90 tests 緑）。C3 と `never_entered` の 2 つの占位ループが形状として重複 | 前者は事実として記録。後者は Round 2 で裁決済み（合併しない）＋指摘者自身が「非必須」としているので駁回 |
+| simplification | コードの指摘は 0。文書の不整合 6 件（§13.8 の件数が本文・小見出し・表の行数で三者不一致 ／ §13.5 が `ProcessFileTerminalStateTest` の docstring 追随を落としている ／ §13.4 の `git diff --stat` 列挙に `main.py` が無い ／ `page_progress.py:345` の引用 ／ `test_ocr_engine_invoice.py:158` が mock 行でなく docstring 行を指す ／ テストファイル 2 本が 800 行上限を超えたまま） | 5 件採用、1 件駁回（`page_progress.py:345` は `self._ws.update(` の行そのもので**引用は正しい**。指摘者は `_update_row` の定義/呼出行と取り違えている） |
+| efficiency | 新テストが実ファイルを 13 回作るが、実際に中身を読むのは 1 テストだけ。12 回は文字列パスで足りる | **駁回**。節約できるのはマイクロ秒（指摘者自身の評価）で、代わりに「どのテストの path は実在しなければならないか」を都度判断する前提を持ち込む。将来どれかが実 `open()` に触れた瞬間に不可解な失敗になる。全量 808 tests が 3 秒で回る現状ではトレードが合わない |
+
+**③が本ラウンドの収穫**: 実装時に「start_page は使わない」と注釈だけ書いて
+決めていた。逐頁ループ側の補填は `range(start_page, total+1)` を使うので
+**非対称**であり、その非対称に根拠（`start_page > declared` だと 0 件 yield に
+なって IP-401 の不変式を破る）があることも、テストで固定されていることも、
+どこにも無かった。simcodex R1 が「前提そのものが無検査」を見つけたのと
+同型の欠落である。
+
+**変異検証の最終形は 18 件**（§13.9 の 17 件 ＋ M18）。全件が赤になることを
+確認済み。
+
+#### Round 3 で顕在化した、本 commit の範囲外の残件
+
+- **テストファイルの行数**（simcodex R3）: `test_main_process_file.py` は
+  本 commit 前から 804 行で上限超過しており、③の番人と `capture` で
+  **850 行**になった（純増 46）。`test_ip401_nondict_rawdata.py` は
+  `SplitProducerContractTest` を移設して 889 → **828 行**まで下げたが、
+  まだ上限内ではない。H-8 は「800 行超過」を移設の根拠の 1 つに挙げたので、
+  同じ論理はこの 2 本にも及ぶ。分割は本 commit の範囲（`_split_pdf_pages`
+  周辺）を超えるため、§12.2 の B（共有 generator 化）でテスト側を
+  触るときに併せて片付けるのが自然

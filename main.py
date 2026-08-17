@@ -522,7 +522,7 @@ def _process_file_impl(service, sheets_writer, file_path, uploader_name,
         if result.get("_page_error"):
             error_pages += 1
             failed_page_nums.append(page_num)
-            # producer は memo に具体的な原因を書いている（「PDF分割が中断」
+            # producer は memo に具体的な原因を書いている（「PDFページ分割失敗」
             # 「AI応答のJSON解析失敗」「整形処理エラー: XxxError」等）のに、
             # ここで捨てると顧客が見る集計行は頁番号だけになり、
             # 「再アップロードで直るのか、原票が壊れているのか」を判断できない。

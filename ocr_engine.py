@@ -412,34 +412,89 @@ def _call_gemini(file_path, prompt):
     return _call_gemini_bytes(file_data, mime_type, prompt)
 
 
+class PdfSplitError(Exception):
+    """PDF を頁単位に分割できない（**初回 yield 前**の失敗に限る）。
+
+    契約（消費側 `process_pipeline` がこれに依存している）:
+      ・この例外は `_split_pdf_pages` が **1 頁も yield していない**時点で
+        しか投げてはならない。頁単位の中途失敗は握って `continue` する。
+      ・理由: 消費側は `next(page_gen, None)` だけを try で囲む。1 頁でも
+        yield した後に例外が出ると `for page_info in chain(...)` の外へ
+        抜け、`process_pipeline` の最外 except に吞まれて**残頁も補填占位も
+        消える**（Plan §13.0 H-2/H-3）。
+
+    Attributes:
+        total_pages: 判明していれば宣言頁数。**全頁書出失敗のときだけ**埋まる
+            （pypdf 未導入・読取失敗ではそもそも数えられないので None）。
+            消費側が占位の `total_pages` に使う —— ここを落とすと 20 頁の
+            PDF が全滅しても進捗タブに「1/1」と出て、単頁文書の失敗と
+            区別が付かなくなる（`page_progress.py:311` の `seen/total` 表示）。
+    """
+
+    def __init__(self, message, total_pages=None):
+        super().__init__(message)
+        self.total_pages = total_pages
+
+
 def _split_pdf_pages(file_path):
-    """PDF を 1ページずつ yield するジェネレータ（メモリ節約）"""
+    """PDF を 1ページずつ yield するジェネレータ（メモリ節約）。
+
+    頁 i の取り出しに失敗しても**その頁だけ飛ばして継続**する（IP-401
+    §12.1①）。以前は `try` が for ループ全体を包んでいたため、20 頁の
+    3 頁目が壊れると 3〜20 の 18 頁が丸ごと失われ、しかも消費側からは
+    「PDF が本当に 2 頁だった」と区別が付かなかった。
+
+    Raises:
+        PdfSplitError: pypdf 未導入 / PDF を開けない / 頁数を数えられない /
+            多頁と分かっているのに 1 頁も取り出せなかった。契約と理由は
+            `PdfSplitError` の docstring 参照（二重管理を避けるためここには
+            条件だけ並べる）。呼出側は尾段（ファイル全体を 1 回の Gemini
+            呼出へ送る経路）へ落とさず `_page_error` を出すこと（§12.1②）。
+    """
     if PdfReader is None or PdfWriter is None:
-        print("⚠️ pypdf未導入のため、PDF分割解析をスキップします")
-        return
+        raise PdfSplitError("pypdf未導入のためPDFを頁分割できません")
 
     try:
         reader = PdfReader(file_path)
-        if len(reader.pages) <= 1:
-            return
-
         total_pages = len(reader.pages)
-        base_name = os.path.splitext(os.path.basename(file_path))[0]
-        for i, page in enumerate(reader.pages, 1):
+    except Exception as e:
+        raise PdfSplitError(f"PDF読取失敗: {e}") from e
+
+    if total_pages <= 1:
+        return  # 正常な単頁 PDF。従来どおり尾段へ委ねる
+
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    produced = 0
+    for i in range(1, total_pages + 1):
+        try:
+            page = reader.pages[i - 1]  # _VirtualList はランダムアクセス可
             writer = PdfWriter()
             writer.add_page(page)
             buf = io.BytesIO()
             writer.write(buf)
-            yield {
-                "page_num": i,
-                "total_pages": total_pages,
-                "data": buf.getvalue(),
-                "filename": f"{base_name}_p{i}.pdf",
-            }
-            # buf は yield 後に GC 対象になる
-    except Exception as e:
-        print(f"⚠️ PDFページ分割失敗: {e}")
-        return
+            data = buf.getvalue()
+        except Exception as e:
+            print(f"⚠️ p{i} のPDF分割に失敗（この頁を飛ばして継続）: {e}")
+            continue
+        produced += 1
+        # yield は try の外に置く。消費側から throw/close された例外を
+        # producer が誤って握り潰さないため（逐頁ループの next() 境界と同じ理由）
+        yield {
+            "page_num": i,
+            "total_pages": total_pages,
+            "data": data,
+            "filename": f"{base_name}_p{i}.pdf",
+        }
+        # data / buf は次の周回で再束縛され GC 対象になる
+
+    if produced == 0:
+        # 多頁と分かっているのに 1 頁も出せなかった。黙って終わると消費側の
+        # `first_page` が None になり**尾段へ落ちる** —— 多頁だと分かって
+        # いながらファイル全体を 1 回の Gemini 呼出へ送る、②が塞ぐと決めた
+        # 事故再現経路そのもの。まだ 1 頁も yield していないので上の契約に
+        # 反しない。
+        raise PdfSplitError("全頁のPDF分割に失敗しました",
+                            total_pages=total_pages)
 
 
 # ============================================================
@@ -2217,7 +2272,35 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
         # 対症療法ではなく全文書タイプをこの逐頁分岐に統一して根絶する。
         if mime_type == "application/pdf":
             page_gen = _split_pdf_pages(file_path)
-            first_page = next(page_gen, None)
+            try:
+                first_page = next(page_gen, None)
+            except PdfSplitError as split_err:
+                # IP-401 §12.1②: 尾段へ落とさない。多頁か単頁かを判定
+                # できないまま**ファイル全体**を 1 回の Gemini 呼出へ送る
+                # ことになり、直前のコメント（「1冊まるごと1レスポンス」を
+                # 根絶した経緯）が塞いだはずの MAX_TOKENS 事故の再現経路
+                # そのものになる。しかも pypdf が壊れていれば全 PDF が
+                # 該当するので**系統的**に起きる。分類は `_page_error`
+                # （＝全頁失敗となりファイルは保持される。pypdf を入れ直せば
+                # 次の周回で救えるため）。
+                print(f"❌ PDF分割不可のため解析を中止: {split_err}")
+                # 判明した全頁ぶん占位を出す（`never_entered` の補填と同じ
+                # 形）。1 件に丸めない理由は 2 つ:
+                #   ・進捗タブが「1/1」に化ける（詳細は PdfSplitError の
+                #     `total_pages` の項）
+                #   ・total だけ N を名乗って占位を 1 件しか出さないと、main の
+                #     カバレッジ突合が p2..pN を「欠落」と見なして監査タブへ
+                #     書く。この経路は全頁失敗＝ファイル保持なので 3 秒ごとに
+                #     再走査され、**再試行のたびに欠落行が増殖**する
+                #     （CLAUDE.md「全頁失敗は Sheets に占位行を書かない」）
+                # start_page は使わない。これは頁単位の skip ではなく
+                # ファイル全体が分割できない状況であり、必ず 1 件以上を
+                # yield する保証（IP-401 の不変式）を優先する。
+                memo = f"PDF分割不可: {str(split_err)[:120]}"
+                declared = split_err.total_pages or 1
+                for miss in range(1, declared + 1):
+                    yield _page_error_payload(memo, miss, declared, None)
+                return
             if first_page is not None:
                 total = first_page["total_pages"]
                 print(f"📄 大型PDF対応: {total}ページを分割解析します")
@@ -2352,10 +2435,11 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                         yielded += 1
                     gc.collect()
 
-                # IP-401 §11.0: producer が静かに尽きた頁を占位で可視化する。
-                # `_split_pdf_pages` は例外を自分で握って return するので、
-                # 消費側からは「宣言より少ない頁数で尽きた」としか見えない
-                # （中途失敗と「本当に k 頁だった」を区別できない）。これらの
+                # IP-401 §11.0: producer が産出しなかった頁を占位で可視化する。
+                # `_split_pdf_pages` は頁単位の失敗を自分で握って `continue`
+                # するので（§12.1①）、消費側からは「宣言より少ない頁数しか
+                # 来なかった」としか見えない（どの頁が飛んだかは分かるが、
+                # 飛んだ理由は producer 側の print にしか無い）。これらの
                 # 頁は逐頁ループに一度も入らないため per-page try が届かず、
                 # 前 k 頁が成功していると main は error_pages==0 で Success →
                 # **歸檔** —— 欠落頁の仕訳はどこにも入らず再試行もされない。
@@ -2369,10 +2453,10 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                     set(range(start_page, total + 1)) - entered_pages)
                 for miss in never_entered:
                     failed_pages += 1
-                    print(f"[p{miss}] ❌ PDF分割が中断: この頁を取得できません"
-                          f"でした（占位行を記録します）")
+                    print(f"[p{miss}] ❌ PDFページ分割失敗: この頁を取得でき"
+                          f"ませんでした（占位行を記録します）")
                     yield _mark(_page_error_payload(
-                        "PDF分割が中断（この頁を取得できませんでした）",
+                        "PDFページ分割失敗（この頁を取得できませんでした）",
                         miss, total, None))
 
                 # ページカバレッジ突合（IP-401 §8-中7）
@@ -2399,13 +2483,16 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
         # ── 単ページ PDF / 画像ファイル: 従来通り処理 ──
         # 複数ページ PDF は上の逐頁分岐で必ず処理・return 済み。ここに到達するのは
         # 画像ファイル、または _split_pdf_pages が何も返さない単ページ PDF のみ。
+        # §12.1②以降、PDF がここへ来るのは `len(reader.pages) <= 1` の**正常な
+        # 単頁**だけである（pypdf 未導入・読取失敗・全頁書出失敗は
+        # `PdfSplitError` で上の分岐が占位を出して return 済み）。
         raw_data = None
         ocr_text = ""
 
         # IP-401: 逐頁ループの同区間（ファイル読取 ＋ _route_ocr_strategy ＋
         # Vision 兜底）は守られているのに、尾段だけ裸だった。
         # ・`open()` —— 逐頁側は `_split_pdf_pages` が**自前の try** で包んで
-        #   優雅に降格する（`ocr_engine.py:421-442`）。尾段の裸 open は
+        #   `PdfSplitError` へ変換し、消費側が占位に落とす。尾段の裸 open は
         #   無人運用の Windows ミニ PC で現実に起きうる（ウイルス対策の
         #   リアルタイム走査による一時ロック）
         # ・`_call_gemini` —— `_generate_content_with_retry` の

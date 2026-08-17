@@ -82,18 +82,29 @@ def _excluded_result(reason="envelope", ocr_text_len=55):
 
 
 def _run_process_file(pages, writer=None, progress=None,
-                      resolver_side_effect=None):
+                      resolver_side_effect=None, capture=None):
     """process_pipeline を差替えて process_file を1回走らせる。
 
     progress は B7 T3 で追加された任意引数。未指定(None)のときは既存呼出と
     完全に同じ挙動になる（main.process_file 内で NULL_REPORTER に落ちる）。
     resolver_side_effect を渡すと resolver.resolve が例外を投げる（未預期
     例外経路のテスト用。例外はそのまま呼び出し元へ伝播する）。
+
+    capture に dict を渡すと `capture["pipeline"]` へ process_pipeline の
+    mock を置く。patch を `as` で受けずに使っているため with を抜けた後は
+    mock への参照がどこにも残らず `call_args` を読めない —— 呼出引数を
+    検査するテスト（IP-401 §12.1③ の番人）にはこの参照が要る。この関数の
+    with ブロック全体（process_pipeline / send_notification /
+    PageUrlResolver の patch と stdout 抑止）を複製する方が漂移源になるので、
+    任意引数 1 つで済ませる。
     """
     writer = writer if writer is not None else _RecordingWriter()
-    with mock.patch.object(main, "process_pipeline", return_value=iter(pages)), \
+    with mock.patch.object(main, "process_pipeline",
+                           return_value=iter(pages)) as pipeline, \
          mock.patch.object(main, "send_notification"), \
          mock.patch.object(main, "PageUrlResolver") as resolver_cls:
+        if capture is not None:
+            capture["pipeline"] = pipeline
         if resolver_side_effect is not None:
             resolver_cls.return_value.resolve.side_effect = resolver_side_effect
         else:
@@ -162,6 +173,10 @@ class ExcludedPageRoutingTest(unittest.TestCase):
         # Assert
         self.assertFalse(ok)
         self.assertEqual(writer.calls, [])
+        # 監査タブも無痕であること。この経路はファイルを**保持**して 3 秒ごとに
+        # 再走査されるので、1 周につき 1 行でも書くと行が無限増殖する
+        # （CLAUDE.md「全ページ失敗 → Failed、保留ファイル」がまさにこの理由）。
+        self.assertEqual(writer.audit_calls, [])
 
 
 class AuditTabRoutingTest(unittest.TestCase):
@@ -798,6 +813,37 @@ class BackoffFailureMessageTimezoneTest(unittest.TestCase):
             main._format_jst_timestamp(dt.timestamp()),
             "2026/01/05 03:04:05",
         )
+
+
+class PipelineCallContractTest(unittest.TestCase):
+    """main は常に PDF 全体を処理する（IP-401 §12.1③ の番人）。
+
+    `main.py` のページカバレッジ突合は `range(1, last_total_pages + 1)` で
+    「1 頁目から全部あるはず」を前提にしている。この前提は
+    「main は `process_pipeline` に `start_page` を渡さない」という、
+    **どこにも強制されていない**取り決めだけで支えられている
+    （`start_page` を渡すのは開発ツールの `local_test.py --start-page N`）。
+
+    将来バッチ再開のような機能で main まで `start_page` が通ると、
+    突合は `start_page` 未満の全頁を「欠落」と誤報し、監査タブが
+    偽の欠落行で埋まる。前提が破れた瞬間に赤くなる番人をここに置く。
+    """
+
+    def test_main_does_not_pass_start_page_to_the_pipeline(self):
+        # Arrange
+        capture = {}
+
+        # Act
+        _run_process_file([_page(_valid_result(), 1, 1)], capture=capture)
+
+        # Assert
+        _, kwargs = capture["pipeline"].call_args
+        self.assertNotIn(
+            "start_page", kwargs,
+            "main が start_page を渡すようになった。この番人を消す前に "
+            "main.py のページカバレッジ突合 range(1, last_total_pages + 1) を "
+            "range(start_page, ...) へ直すこと（さもないと start_page 未満の "
+            "全頁が『欠落』として監査タブに誤報される）")
 
 
 if __name__ == "__main__":
