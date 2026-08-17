@@ -46,8 +46,12 @@ def page_ocrs_from_tuples(route_tuples, doc_type=DocType.RECEIPT):
     return [page_ocr_from_tuple(t, doc_type) for t in route_tuples]
 
 
-def pdf_pages(n):
+def pdf_pages(n, total_pages=None):
     """`_split_pdf_pages` の戻り値を模した n ページ分のリスト。
+
+    `total_pages` を明示すると「宣言した総頁数」と「実際に産出する頁数」を
+    食い違わせられる（producer が中途で尽きた状況の再現）。既定は `n` なので
+    既存の呼出は無変更で動く。
 
     ページ dict の形（`page_num` / `total_pages` / `data` / `filename`）は
     `process_pipeline` の逐頁ループが直接読む契約なので、コピーが増えると
@@ -57,5 +61,7 @@ def pdf_pages(n):
     IP-401 の原始事故の回帰テストで「無修正で緑であること」自体が受入基準に
     なっているため、この整理では触っていない（統合は別タスク）。
     """
-    return [{"page_num": i, "total_pages": n, "data": f"%PDF-p{i}".encode(),
+    declared = n if total_pages is None else total_pages
+    return [{"page_num": i, "total_pages": declared,
+             "data": f"%PDF-p{i}".encode(),
              "filename": f"p{i}.pdf"} for i in range(1, n + 1)]

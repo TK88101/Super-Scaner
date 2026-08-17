@@ -2378,10 +2378,10 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                 # ページカバレッジ突合（IP-401 §8-中7）
                 # 個別の欠落経路を塞いだ後の最終哨戒。将来また別経路で無音
                 # 欠落が生まれたときに、顧客が枚数を数えるより先に気づく。
-                # 上の補填で占位を出した頁は _mark 経由で seen_pages に入る
-                # ので、ここに残るのは entered_pages - seen_pages ——
-                # すなわち §8-中7 が「警告のみ」と裁定したまさにその集合だけ。
-                missing = sorted(set(range(start_page, total + 1)) - seen_pages)
+                # ここが見るのは「進入したのに何も出さなかった頁」——
+                # §8-中7 が「警告のみ」と裁定したまさにその集合。
+                # 進入しなかった頁は上で占位を出して片付いている。
+                missing = sorted(entered_pages - seen_pages)
                 if missing:
                     print(f"⚠️ ページカバレッジ警告: {len(missing)}/{total}頁が"
                           f"一度も出力されませんでした {missing} "

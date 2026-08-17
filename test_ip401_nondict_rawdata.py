@@ -108,8 +108,17 @@ def _run_single_page(raw_data, ocr_text="", doc_type=DocType.RECEIPT,
         os.unlink(path)
 
 
-def _run_paged_pdf(routes, doc_type=DocType.RECEIPT):
+def _run_paged_pdf(routes, doc_type=DocType.RECEIPT, declared_total=None,
+                   start_page=1):
     """逐頁 PDF 経路を通す（`test_ip401_regression._run_pipeline` と同形）。
+
+    Args:
+        declared_total: producer が申告する総頁数。`len(routes)` と食い違わせ
+            ると「中途で尽きた」状況になる（`_split_pdf_pages` は例外を自分で
+            握って静かに return するので、消費側から見えるのは産出数が申告より
+            少ないことだけ）。既定 None なら `len(routes)`。
+        start_page: `process_pipeline` へ渡す開始頁（`local_test.py
+            --start-page N` 相当）。
 
     同形の runner が既に 2 つある（`test_ip401_regression._run_pipeline` と
     `test_ocr_engine_invoice._run_single_page_pipeline`）。共通化しないのは
@@ -119,7 +128,7 @@ def _run_paged_pdf(routes, doc_type=DocType.RECEIPT):
     要る）で、束ねるには 3 つの既存テストの改造が要り、本件の範囲を超えるため。
     ページ dict の生成だけは共有した（`ocr_test_helpers.pdf_pages`）。
     """
-    pages = pdf_pages(len(routes))
+    pages = pdf_pages(len(routes), total_pages=declared_total)
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(b"%PDF-1.4 dummy")
         path = tmp.name
@@ -134,7 +143,8 @@ def _run_paged_pdf(routes, doc_type=DocType.RECEIPT):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 out = list(ocr_engine.process_pipeline(
-                    path, doc_type=doc_type, ocr_strategy="C"))
+                    path, doc_type=doc_type, ocr_strategy="C",
+                    start_page=start_page))
         return out, buf.getvalue()
     finally:
         os.unlink(path)
@@ -426,37 +436,65 @@ class TailFalsyRawDataTest(unittest.TestCase):
         self.assertEqual(len(out[0]["result"]["entries"]), 1)
 
 
-def _run_paged_pdf_truncated(routes, declared_total, doc_type=DocType.RECEIPT,
-                             start_page=1):
-    """producer が `declared_total` を宣言しつつ `len(routes)` 頁で尽きる状況。
+class SplitProducerContractTest(unittest.TestCase):
+    """本件の修正が乗っている**前提**そのものを固定する。
 
-    `_split_pdf_pages` の中途失敗（k 頁目まで成功して k+1 頁目で `PdfReadError`）
-    を模す。producer は例外を自分で握って静かに `return` するので、消費側から
-    見えるのは「宣言より少ない頁数でジェネレータが尽きた」ことだけである
-    —— 実装がその状況をどう扱うかがここで固定される。
+    `TruncatedSplitTest` は `_split_pdf_pages` を丸ごと mock して「宣言より
+    少なく産出して尽きる」状況を注入する。それは消費側から見える姿として
+    正しいが、**producer が本当にそう振る舞うか**は 1 行も検査していない
+    （suite 全体を見ても `_split_pdf_pages` 本体を駆動するテストは無く、
+    常に mock 先だった）。
+
+    前提が崩れる形は具体的である: 誰かが `except Exception` を `raise` に
+    変えると、例外は消費側の `for` 文（per-page try の**外**）へ飛んで
+    最外 except に落ち、補填ロジックには一度も到達しない —— 補填は静かに
+    無力化されるのに、mock ベースのテストは全部緑のままになる。
+
+    ここでは実物を走らせて「中途で失敗しても例外を外へ出さず、それまでの
+    頁だけを産出して終わる」ことを押さえる。
     """
-    pages = [{"page_num": i, "total_pages": declared_total,
-              "data": f"%PDF-p{i}".encode(), "filename": f"p{i}.pdf"}
-             for i in range(1, len(routes) + 1)]
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(b"%PDF-1.4 dummy")
-        path = tmp.name
-    try:
-        with mock.patch.object(ocr_engine, "_split_pdf_pages",
-                               return_value=iter(pages)), \
-             mock.patch.object(ocr_engine, "_route_ocr_strategy",
-                               side_effect=page_ocrs_from_tuples(
-                                   routes, doc_type)), \
-             mock.patch.object(ocr_engine, "_call_gemini_bytes",
-                               return_value=None):
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                out = list(ocr_engine.process_pipeline(
-                    path, doc_type=doc_type, ocr_strategy="C",
-                    start_page=start_page))
-        return out, buf.getvalue()
-    finally:
-        os.unlink(path)
+
+    def test_producer_swallows_midway_failure_and_stops_quietly(self):
+        # Arrange: 3 頁の PDF を装い、2 頁目の書き出しで壊れる
+        class _FakePage:
+            pass
+
+        class _FakeReader:
+            def __init__(self, path):
+                self.pages = [_FakePage(), _FakePage(), _FakePage()]
+
+        calls = {"n": 0}
+
+        class _FakeWriter:
+            def __init__(self):
+                calls["n"] += 1
+                self._boom = calls["n"] == 2
+
+            def add_page(self, page):
+                if self._boom:
+                    raise RuntimeError("corrupt page object")
+
+            def write(self, buf):
+                buf.write(b"%PDF-fake")
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(b"%PDF-1.4 dummy")
+            path = tmp.name
+        try:
+            with mock.patch.object(ocr_engine, "PdfReader", _FakeReader), \
+                 mock.patch.object(ocr_engine, "PdfWriter", _FakeWriter):
+                with redirect_stdout(io.StringIO()):
+                    # Act: 例外が外へ出るならここで送出される
+                    produced = list(ocr_engine._split_pdf_pages(path))
+        finally:
+            os.unlink(path)
+
+        # Assert: 1 頁だけ産出して静かに終わる（例外は外へ出ない）
+        self.assertEqual([p["page_num"] for p in produced], [1])
+        # 宣言した総頁数は壊れる前に確定しているので 3 のまま —— これが
+        # 消費側で「宣言 3 / 実産出 1」の食い違いとして観測でき、補填が
+        # 働く根拠になる。
+        self.assertEqual(produced[0]["total_pages"], 3)
 
 
 class TruncatedSplitTest(unittest.TestCase):
@@ -472,11 +510,19 @@ class TruncatedSplitTest(unittest.TestCase):
     """
 
     def test_truncated_split_yields_placeholder_for_missing_pages(self):
+        """欠落頁が占位として現れ、しかも**この経路由来**だと分かること。
+
+        memo まで見る理由: `_page_error` だけだと、他の 3 経路
+        （ページ処理エラー / AI応答のJSON解析失敗 / 整形処理エラー）が
+        出した占位でも通ってしまい、補填が効いているのか別経路が
+        たまたま拾ったのかを区別できない。「PDF分割が中断」は補填分岐に
+        しか無い文字列なので、これで経路を特定する。
+        """
         # Arrange: 3 頁と宣言しつつ p1 だけ産出して尽きる
         routes = [(_normal_gemini(), NORMAL_OCR, 0.95)]
 
         # Act
-        out, _ = _run_paged_pdf_truncated(routes, declared_total=3)
+        out, _ = _run_paged_pdf(routes, declared_total=3)
 
         # Assert: 3 頁すべてが出力に現れる
         self.assertEqual({p["page_num"] for p in out}, {1, 2, 3})
@@ -485,36 +531,31 @@ class TruncatedSplitTest(unittest.TestCase):
         for miss in (2, 3):
             with self.subTest(page=miss):
                 self.assertTrue(by_page[miss].get("_page_error"))
-
-    def test_truncated_split_placeholder_names_the_cause(self):
-        """汎用の「ページ処理エラー」で埋もれさせない。
-
-        顧客が集計行を見たとき「再アップロードで直るのか、原票が壊れて
-        いるのか」を判断できる必要がある。
-        """
-        # Arrange
-        routes = [(_normal_gemini(), NORMAL_OCR, 0.95)]
-
-        # Act
-        out, _ = _run_paged_pdf_truncated(routes, declared_total=2)
-
-        # Assert
-        by_page = {p["page_num"]: p["result"] for p in out}
-        self.assertIn("PDF分割が中断", by_page[2]["memo"])
+                # 汎用文言で埋もれさせない。顧客が集計行を見たとき
+                # 「再アップロードで直るのか、原票が壊れているのか」を
+                # 判断できる必要がある。
+                self.assertIn("PDF分割が中断", by_page[miss]["memo"])
 
     def test_truncated_split_does_not_warn_twice(self):
         """占位を出した頁はもう「無音欠落」ではないので警告は出さない。
 
         カバレッジ哨戒は「一度も出力されなかった頁」への最終防衛なので、
         占位を出した頁まで警告すると哨戒が狼少年になる。
+
+        警告文字列の**不在**だけを見ると、警告ブロックごと消す変異でも
+        緑のまま通ってしまう（不在は「機構が正しく黙った」とも
+        「機構が死んだ」とも解釈できる）。そこで同じ test の中に
+        「補填自体は動いている」正の対照を置く。
         """
         # Arrange
         routes = [(_normal_gemini(), NORMAL_OCR, 0.95)]
 
         # Act
-        _, log = _run_paged_pdf_truncated(routes, declared_total=3)
+        out, log = _run_paged_pdf(routes, declared_total=3)
 
-        # Assert
+        # Assert: 正の対照 —— 補填は動いている
+        self.assertEqual({p["page_num"] for p in out}, {1, 2, 3})
+        # そのうえで、片付いた頁について警告は鳴らない
         self.assertNotIn("ページカバレッジ警告", log)
 
     def test_entered_but_silent_page_is_not_placeholdered_after_entered_pages(
@@ -543,11 +584,14 @@ class TruncatedSplitTest(unittest.TestCase):
         # Act
         with mock.patch.object(ocr_engine, "_yield_page_results",
                                side_effect=silent_first):
-            out, log = _run_paged_pdf_truncated(routes, declared_total=2)
+            out, log = _run_paged_pdf(routes, declared_total=2)
 
-        # Assert: p1 は占位化されず、従来どおり警告だけが出る
+        # Assert: p1 は占位化されず、従来どおり警告だけが出る。
+        # 警告は「鳴った」だけでなく**どの頁について鳴ったか**まで見る
+        # （`if missing:` を `if True:` にする変異が素通りするため）。
         self.assertEqual({p["page_num"] for p in out}, {2})
         self.assertIn("ページカバレッジ警告", log)
+        self.assertIn("[1]", log)
 
     def test_start_page_skip_is_not_reported_as_missing(self):
         """`--start-page N` で意図的に飛ばした頁を欠落と誤報しない。
@@ -566,11 +610,17 @@ class TruncatedSplitTest(unittest.TestCase):
                   (_normal_gemini(), NORMAL_OCR, 0.95)]
 
         # Act
-        out, _ = _run_paged_pdf_truncated(routes, declared_total=2,
-                                          start_page=2)
+        out, _ = _run_paged_pdf(routes, declared_total=2, start_page=2)
 
         # Assert: p1 の占位は作られない
         self.assertEqual({p["page_num"] for p in out}, {2})
+        # 頁番号の集合だけでは足りない —— `idx < start_page` を
+        # `idx <= start_page` にする変異では p2 自身がスキップされ、
+        # 補填で占位に化ける。頁番号は {2} のままなので集合比較は素通りし、
+        # 実データが失われたことに気づけない。中身まで見る。
+        result = out[0]["result"]
+        self.assertFalse(result.get("_page_error"))
+        self.assertEqual(len(result["entries"]), 1)
 
 
 class _RecordingWriter:
@@ -753,7 +803,7 @@ class ProcessFileTerminalStateTest(unittest.TestCase):
         再試行するとその頁が重複計上される。顧客への通知は集計行が担う。
         """
         # Arrange: 尾段ではなく逐頁経路の実出力を使う（producer が尽きた形）
-        pages, _ = _run_paged_pdf_truncated(
+        pages, _ = _run_paged_pdf(
             [(_normal_gemini(), NORMAL_OCR, 0.95)], declared_total=3)
         progress = mock.MagicMock()
 
@@ -765,22 +815,31 @@ class ProcessFileTerminalStateTest(unittest.TestCase):
         self.assertEqual(len(writer.calls), 2)
         summary = writer.calls[1]["memo"]
         self.assertIn("ページ処理エラー", summary)
-        self.assertIn("p2", summary)
-        self.assertIn("p3", summary)
+        # 頁の羅列は**そのままの形**で見る。`assertIn("p2")` を個別に
+        # 並べると、補填範囲を `total+2` に広げて幻の p4 を作る変異が
+        # 素通りする（p2/p3 は在るので個別 assertIn は全部通り、
+        # writer.calls も集計行 1 行のまま変わらない）。
+        self.assertIn("[p2,p3]", summary)
         progress.file_finished.assert_called_once_with(STATUS_PARTIAL_ERROR)
 
     def test_truncated_split_emits_failed_outcome_per_missing_page(self):
         # Arrange
-        pages, _ = _run_paged_pdf_truncated(
+        pages, _ = _run_paged_pdf(
             [(_normal_gemini(), NORMAL_OCR, 0.95)], declared_total=3)
         progress = mock.MagicMock()
 
         # Act
         _run_process_file(pages, progress=progress)
 
-        # Assert: 成功 1 件 ＋ 欠落 2 件
-        outcomes = [c.args[2] for c in progress.page_done.call_args_list]
-        self.assertEqual(outcomes.count(OUTCOME_FAILED), 2)
+        # Assert: どの頁が失敗扱いかまで見る。件数だけを数えると、補填の
+        # 頁番号を 1 ずらす変異（欠落 {2,3} が {3,4} になる）で件数が
+        # 変わらず素通りし、実在しない頁を捏造しつつ p2 を落としたことに
+        # 気づけない。
+        by_page = {c.args[0]: c.args[2]
+                   for c in progress.page_done.call_args_list}
+        self.assertEqual(by_page[2], OUTCOME_FAILED)
+        self.assertEqual(by_page[3], OUTCOME_FAILED)
+        self.assertNotEqual(by_page[1], OUTCOME_FAILED)
 
     def test_page_error_memo_reaches_the_summary_row(self):
         """`_page_error` 頁の memo が集計行に届く（G11 の是正の番人）。
@@ -800,8 +859,12 @@ class ProcessFileTerminalStateTest(unittest.TestCase):
         # Act
         _, writer = _run_process_file(pages)
 
-        # Assert
-        self.assertIn("AI応答のJSON解析失敗", writer.calls[1]["memo"])
+        # Assert: memo が**どの頁のものとして**載ったかまで見る。
+        # 本文の存在だけを見ると、`failed_page_notes[page_num]` を
+        # `failed_page_notes[1]` のような固定キーにする変異が素通りする ——
+        # 文字列は集計行に現れるが、顧客は壊れた頁を取り違える。それは
+        # まさに G11 が是正しようとした失敗そのものである。
+        self.assertIn("p2: AI応答のJSON解析失敗", writer.calls[1]["memo"])
 
     def test_tail_falsy_is_retained_not_archived(self):
         """falsy / None は従来どおり保持・再試行（§3.4 行 4）。
