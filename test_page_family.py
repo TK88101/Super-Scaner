@@ -72,21 +72,15 @@ def _rows(n, amount=630, start=1):
     )
 
 
-def _ic_rows(n, amount=260):
-    """nimoca の明細行（F-7: 月日 / 種別 / 施設 / 利用額）。
-
-    **カンマの付かない 3 桁金額**（150〜1,300 円）が主であることが要点。
-    金額トークンをカンマ有りに限定すると、nimoca 頁の has_detail_rows が
-    False になり「除外に対する拒否権」（AD-0 優先序 3）が効かなくなる。
-    """
-    return " ".join(
-        "%d月%d日 電車 西鉄天神 ～ 薬院 %d" % ((i % 2) + 5, (i % 27) + 1, amount + i * 3)
-        for i in range(n)
-    )
-
-
-_AMEX_HEAD = "アメリカン・エキスプレス ご利用代金明細書 T8700150009366 ****-******-26003 1/6 ページ"
-_NIMOCA_HEAD = "nimoca 利用履歴の確認 月日 種別 施設1 ～ 施設2 利用額 カードポイント センターポイント"
+# 標本の正本は ocr_test_fixtures（複製すると正本の修正が伝播しない）。
+# ocr_test_helpers ではない —— あちらは ocr_engine を引くので、
+# 標本をあちらに置くとこのファイルが venv 必須になる（test_dependency_weight）。
+# 局所名は従来どおりに束ね直し、以下 35 箇所の参照はそのまま使う。
+from ocr_test_fixtures import (  # noqa: E402
+    AMEX_HEAD as _AMEX_HEAD,
+    NIMOCA_HEAD as _NIMOCA_HEAD,
+    ic_rows as _ic_rows,
+)
 
 
 # 事実台帳 32 頁のうち、族が確定している 28 頁。

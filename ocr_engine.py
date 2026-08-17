@@ -6,6 +6,7 @@ import gc
 import time
 import unicodedata
 import http.client
+from dataclasses import dataclass
 import google.generativeai as genai
 from google.api_core import exceptions as google_exceptions
 try:
@@ -15,6 +16,10 @@ except ImportError:
 from dotenv import load_dotenv
 from doc_types import (DocType, DOC_TYPE_CONFIG, DOC_TYPE_TAB_SUFFIX,
                        ENV_FOLDER_MAP)
+# 純関数モジュール（gspread / paddleocr 非依存）。依存は単方向で、
+# page_family 側は ocr_engine を import しない（定数は複製し、乖離は
+# test_page_family の突合テストが検出する）。
+import page_family
 from receipt_aggregation import (
     KEIYUZEI_DEBIT_ACCOUNT,
     TOTAL_MISMATCH_TOLERANCE_YEN,
@@ -1755,6 +1760,12 @@ def _build_doc_result(doc_type, raw_data, entries):
     count==error_pages で Failed 判定 → ファイル保持 → 明細を持たない書類
     （封筒・挨拶状等）が毎回再試行される無限ループに入る。占位行を1行だけ
     書いてアーカイブし、U列の赤タグで人手確認を促す。
+
+    刻む `result["doc_type"]` は **この頁を解析した種別**（T3 以降。混載
+    フォルダでは folder doc_type と異なりうる）。**タブ選択に使ってはいけない**
+    —— タブは 1 ファイル 1 つに保つため `main` が渡す folder doc_type で
+    決まる（AD-T3-1）。現在この键の読み手は居らず、
+    `test_ocr_engine_mixed_folder` が意味と不使用の両方を固定している。
     """
     vendor = raw_data.get("vendor", "")
     if doc_type == DocType.SALARY_SLIP:
@@ -1851,20 +1862,100 @@ def _normalize_receipt_results(
 # メインパイプライン
 # ============================================================
 
+@dataclass(frozen=True)
+class PageOcr:
+    """1 頁の OCR ＋ prompt 解決の結果。`_route_ocr_strategy` の唯一の戻り値型。
+
+    後方互換の tuple unpack は**意図的に用意していない**。3-tuple のまま
+    受けられる余地を残すと、直し漏れが実行時に静かに通ってしまう
+    （T3 Plan の明文）。`TypeError` で必ず露見する形にしてある。
+
+    `frozen=True` は AD-T3-2 の不変式を型で守るため —— 呼出側が
+    「あとから prompt を差し替える」書き方を構造的にできなくする。
+    """
+
+    raw_data: object                 # Gemini の生 JSON（失敗時 None）
+    ocr_text: str                    # PaddleOCR テキスト（失敗時 ""）
+    ocr_confidence: float | None     # PaddleOCR テキスト経由のときだけ数値
+    actual_doc_type: str             # **prompt と builder** の引き当てキー
+    prompt: str                      # 解決済み prompt（常に非空）
+    page_class: object               # page_family.PageClass（T9 が消費）
+    family_signal: str | None        # 監査シグナル（T9 が消費）
+
+
+def _resolve_page_prompt(folder_doc_type, ocr_text):
+    """この 1 頁に使う prompt を決める（T3-b）。
+
+    クレカと nimoca は同じ Drive フォルダに混載される（趙裁定 5）ため、
+    prompt はフォルダでは決まらず**頁ごとに**決まる。
+
+    Returns:
+        (actual_doc_type, prompt, page_class, family_signal)
+
+        `actual_doc_type` は **PROMPTS と ENTRY_BUILDERS の両方**を引くキー。
+        タブ名・取引No 採番・分割 PDF の保存先には使わない（AD-T3-1。
+        それらは 1 ファイル 1 タブを保つため folder doc_type に従う）。
+
+    Raises:
+        ValueError: folder_doc_type の prompt すら引けないとき。`None` を
+            返さないのは、呼出側の None チェック漏れが別の場所で
+            `AttributeError` を出して原因追跡を困難にするため（AD-T3-2）。
+    """
+    folder_prompt = PROMPTS.get(folder_doc_type)
+    if not folder_prompt:
+        raise ValueError(
+            "PROMPTS に登録の無い doc_type です: %r" % (folder_doc_type,))
+
+    page_class = page_family.classify_page(ocr_text)
+    actual, signal = page_family.select_prompt_doc_type(
+        folder_doc_type, page_class)
+
+    if actual == folder_doc_type:
+        return folder_doc_type, folder_prompt, page_class, signal
+
+    # 分流先が決まったが prompt が未登録 —— actual と prompt を**セットで**
+    # folder へ戻す。片方だけ戻すと「prompt は A・builder は B」という
+    # 異種混成になり、Gemini の出力構造を別の型の builder が読むことになる。
+    actual_prompt = PROMPTS.get(actual)
+    if not actual_prompt:
+        fallback = "prompt_fallback:%s" % actual
+        print(f"⚠️ {actual} の prompt が未登録 → {folder_doc_type} で処理します")
+        return (folder_doc_type, folder_prompt, page_class,
+                "%s;%s" % (signal, fallback) if signal else fallback)
+
+    return actual, actual_prompt, page_class, signal
+
+
 def _route_ocr_strategy(
     data_bytes: bytes,
     mime_type: str,
-    prompt: str,
+    doc_type: str,
     ocr_strategy: str,
     prefix: str = "",
-) -> tuple[object, str, float | None]:
-    """OCR 戦略に基づいてルーティング。(raw_data, ocr_text, ocr_confidence) を返す。
+) -> PageOcr:
+    """OCR 戦略に基づいてルーティングし、`PageOcr` を返す。
 
-    ocr_confidence は規則②（低置信整票送審）用の PaddleOCR 平均置信度。
+    第 3 引数は T3 で `prompt` から `doc_type`（＝フォルダが宣言した種別）へ
+    変わった。prompt は本関数が頁ごとに解決する —— 解決には PaddleOCR の
+    テキストが要るので、呼出側では決められない。
+
+    `ocr_confidence` は規則②（低置信整票送審）用の PaddleOCR 平均置信度。
     raw_data が PaddleOCR テキスト経由でない場合（Gemini-Vision 兜底・例外・
     テキスト無し）は None を返す（Vision 結果に低置信を誤って付けないため）。
+
+    **例外の捕捉範囲は T3 の前後で 1 ミリも変えていない**（AD-T3-4）。
+    現行の try は PaddleOCR だけでなく Gemini 呼出まで覆っており、
+    Gemini 側の例外も握って raw_data=None を返す。呼出側はそれを見て
+    Vision 兜底へ落ちる。ここを PaddleOCR だけに絞ると、兜底で救えるはずの
+    頁が「ページ処理エラー」の占位行に転落する（全 doc_type に効く回帰）。
+    `test_route_ocr_characterization.py` がこの一点を見張っている。
     """
     import config
+    # prompt の確定は try の**外**。PaddleOCR や Gemini が落ちても
+    # Vision 兜底が使える prompt が残っていなければならない（AD-T3-2）。
+    actual_doc_type, prompt, page_class, family_signal = _resolve_page_prompt(
+        doc_type, "")
+
     raw_data = None
     ocr_text = ""
     ocr_conf: float | None = None
@@ -1872,6 +1963,12 @@ def _route_ocr_strategy(
         ocr_text, paddle_conf = _ocr_with_paddleocr(data_bytes, mime_type)
         if ocr_text.strip():
             print(f"{prefix}📝 PaddleOCR完了 ({len(ocr_text)}文字, 置信度: {paddle_conf:.3f})")
+            # テキストが取れたので prompt の上書きを試みる。ここで例外が出ても
+            # 上の except が握り、prompt は folder のものが残る。
+            actual_doc_type, prompt, page_class, family_signal = (
+                _resolve_page_prompt(doc_type, ocr_text))
+            if actual_doc_type != doc_type:
+                print(f"{prefix}🔀 頁の種別を {doc_type} → {actual_doc_type} と判定")
             if ocr_strategy == "A":
                 raw_data = _call_gemini_text(ocr_text, prompt)
                 ocr_conf = paddle_conf
@@ -1888,7 +1985,15 @@ def _route_ocr_strategy(
                 ocr_conf = paddle_conf
     except Exception as ocr_err:
         print(f"{prefix}⚠️ PaddleOCR失敗: {ocr_err}")
-    return raw_data, ocr_text, ocr_conf
+    return PageOcr(
+        raw_data=raw_data,
+        ocr_text=ocr_text,
+        ocr_confidence=ocr_conf,
+        actual_doc_type=actual_doc_type,
+        prompt=prompt,
+        page_class=page_class,
+        family_signal=family_signal,
+    )
 
 
 def _blank_result(date="", vendor="", **markers):
@@ -1927,6 +2032,13 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
     既定の False のまま——尾段には元々この判定が無く、挙動を変えない。
 
     Args:
+        doc_type: **この頁を解析した種別**（T3 以降。`PageOcr.actual_doc_type`）。
+            フォルダが宣言した種別**ではない** —— 混載フォルダ（クレカ ＋ nimoca）
+            では頁ごとに違う値が来る。用途は prompt / builder の引き当てだけで、
+            タブ名・取引No 採番・分割 PDF の保存先には**使ってはいけない**
+            （それらは 1 ファイル 1 タブを保つため folder doc_type に従う。
+            AD-T3-1）。本関数が返す result dict の `"doc_type"` 键にもこの値が
+            入る（`_build_doc_result`）。
         envelope_filter: True なら RECEIPT の封筒/不要ページ判定を有効化する。
             PDF 逐頁ループ専用（§3.5）。
 
@@ -2060,8 +2172,11 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
     print(f"🧠 PaddleOCR + Gemini で{type_label}を分析中: {filename} (戦略: {ocr_strategy}) ...")
 
     try:
-        prompt = PROMPTS.get(doc_type)
-        if not prompt:
+        # T3: prompt はここでは解決しない（頁ごとに _route_ocr_strategy が
+        # 決める）。この検査は「未対応の doc_type を早期に弾く」という既存の
+        # 防御だけを残したもの。ここを通れば _resolve_page_prompt の
+        # ValueError（AD-T3-2）は本番経路では到達しない。
+        if not PROMPTS.get(doc_type):
             print(f"⚠️ 未対応の文書タイプ: {doc_type}")
             return
 
@@ -2113,13 +2228,19 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                         continue
 
                     try:
-                        page_raw_data, ocr_text, ocr_conf = _route_ocr_strategy(
-                            page_data, "application/pdf", prompt, ocr_strategy, prefix=prefix
+                        page_ocr = _route_ocr_strategy(
+                            page_data, "application/pdf", doc_type, ocr_strategy, prefix=prefix
                         )
+                        page_raw_data = page_ocr.raw_data
+                        ocr_text = page_ocr.ocr_text
+                        ocr_conf = page_ocr.ocr_confidence
 
                         if not page_raw_data:
                             print(f"{prefix}🔄 フォールバック: Gemini Vision で再試行")
-                            page_raw_data = _call_gemini_bytes(page_data, "application/pdf", prompt)
+                            # 兜底も頁ごとに解決した prompt を使う（AD-T3-2 により
+                            # PaddleOCR が失敗していても非空が保証されている）
+                            page_raw_data = _call_gemini_bytes(
+                                page_data, "application/pdf", page_ocr.prompt)
                             ocr_conf = None  # Vision 兜底は無信号（低置信を誤付しない）
                     except Exception as page_err:
                         failed_pages += 1
@@ -2161,9 +2282,12 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                     # next() を try で包み、例外は当該ページの占位行に閉じ込めて
                     # 次ページへ進む。yield 自体は try の外に置き、消費側から
                     # throw/close された例外を誤って握り潰さないようにする。
+                    # T3: 渡すのは folder ではなく **この頁を解析した種別**。
+                    # prompt が transit_ic で組まれた頁は builder も transit_ic
+                    # でなければ、Gemini の出力構造を別の型が読むことになる。
                     page_iter = _yield_page_results(
-                        doc_type, page_raw_data, ocr_text, ocr_conf, prefix=prefix,
-                        envelope_filter=True)
+                        page_ocr.actual_doc_type, page_raw_data, ocr_text,
+                        ocr_conf, prefix=prefix, envelope_filter=True)
                     while True:
                         try:
                             entry = next(page_iter)
@@ -2212,13 +2336,16 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
         with open(file_path, "rb") as f:
             file_data = f.read()
 
-        raw_data, ocr_text, ocr_conf = _route_ocr_strategy(file_data, mime_type, prompt, ocr_strategy)
+        page_ocr = _route_ocr_strategy(file_data, mime_type, doc_type, ocr_strategy)
+        raw_data = page_ocr.raw_data
+        ocr_text = page_ocr.ocr_text
+        ocr_conf = page_ocr.ocr_confidence
         del file_data
         gc.collect()
 
         if not raw_data:
             print("🔄 フォールバック: Gemini Vision で再試行")
-            raw_data = _call_gemini(file_path, prompt)
+            raw_data = _call_gemini(file_path, page_ocr.prompt)
             ocr_conf = None  # Vision 兜底は無信号（低置信を誤付しない）
 
         if not raw_data:
@@ -2228,7 +2355,8 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
         # OCR オーバーライド → doc_type別ルーティング → result dict 整形
         # は _yield_page_results に一本化済み（PDF 逐頁ループと共通ロジック）。
         # 封筒判定は元々この経路には無かったため呼ばない（挙動を変えない）。
-        for entry in _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf):
+        for entry in _yield_page_results(page_ocr.actual_doc_type, raw_data,
+                                         ocr_text, ocr_conf):
             yield {
                 "result": entry,
                 "page_num": 1,

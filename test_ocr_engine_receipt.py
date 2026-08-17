@@ -13,6 +13,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(__file__))
 
 import ocr_engine
+from doc_types import DocType
 
 
 def _doc(doc_category="receipt", vendor="テスト店", items=None,
@@ -581,19 +582,82 @@ class OcrConfidencePlumbingTest(unittest.TestCase):
         self.assertGreaterEqual(len(results), 1)
         self.assertEqual(results[0]["ocr_confidence"], 0.50)
 
-    def test_route_ocr_strategy_returns_three_tuple(self):
+    def test_route_ocr_strategy_returns_page_ocr(self):
         # Arrange: PaddleOCR を「テキスト無し」にして Gemini を呼ばずに返す
-        # （戻り値のアリティ＝3 のみを契約として確認）
+        # T3: 第 3 引数は prompt ではなく doc_type。戻り値は PageOcr で、
+        # tuple unpack できる後方互換は**意図的に用意していない**
+        # （直し漏れが静かに通るより TypeError で露見する方が安全）。
         with mock.patch.object(
                 ocr_engine, "_ocr_with_paddleocr", return_value=("", 0.0)):
             # Act
             out = ocr_engine._route_ocr_strategy(
-                b"x", "image/jpeg", "prompt", "C")
-        # Assert: (raw_data, ocr_text, ocr_conf) の3要素
-        self.assertEqual(len(out), 3)
-        raw_data, ocr_text, ocr_conf = out
-        self.assertIsNone(raw_data)
-        self.assertEqual(ocr_text, "")
+                b"x", "image/jpeg", DocType.RECEIPT, "C")
+
+        # Assert: PageOcr の 7 フィールドを契約として固定する
+        self.assertIsInstance(out, ocr_engine.PageOcr)
+        self.assertIsNone(out.raw_data)
+        self.assertEqual(out.ocr_text, "")
+        self.assertIsNone(out.ocr_confidence)
+        self.assertEqual(out.actual_doc_type, DocType.RECEIPT)
+        # AD-T3-2: PaddleOCR がテキストを返さなくても prompt は非空。
+        # ここが空だと Vision 兜底が空 prompt で Gemini を叩き、
+        # 「呼出は成功・中身はゴミ」という無音故障になる。
+        self.assertEqual(out.prompt, ocr_engine.PROMPTS[DocType.RECEIPT])
+        self.assertIsNotNone(out.page_class)
+        self.assertIsNone(out.family_signal)
+
+    def test_page_ocr_is_frozen(self):
+        # Arrange: 呼出側が「あとから prompt を差し替える」書き方を
+        # 構造的にできなくする（AD-T3-2 の不変式を型で守る）
+        with mock.patch.object(
+                ocr_engine, "_ocr_with_paddleocr", return_value=("", 0.0)):
+            out = ocr_engine._route_ocr_strategy(
+                b"x", "image/jpeg", DocType.RECEIPT, "C")
+
+        # Act / Assert
+        with self.assertRaises(Exception):
+            out.prompt = "差し替え"
+
+    def _route_with_conf(self, strategy, paddle_conf):
+        """PaddleOCR がテキストと指定置信度を返す状況で戦略を通す。"""
+        raw = {"documents": [{"vendor": "店", "items": []}]}
+        with mock.patch.object(ocr_engine, "_ocr_with_paddleocr",
+                               return_value=("領収書 合計 1,100円", paddle_conf)), \
+             mock.patch.object(ocr_engine, "_call_gemini_text",
+                               return_value=raw), \
+             mock.patch.object(ocr_engine, "_call_gemini_bytes",
+                               return_value=raw), \
+             mock.patch.object(ocr_engine, "_call_gemini_cross_validate",
+                               return_value=raw):
+            return ocr_engine._route_ocr_strategy(
+                b"x", "image/jpeg", DocType.RECEIPT, strategy)
+
+    def test_strategy_a_reports_paddle_confidence(self):
+        # Arrange / Act: 戦略 A は必ず PaddleOCR テキスト経由
+        out = self._route_with_conf("A", 0.88)
+        # Assert: テキスト経由なので置信度は有信号
+        self.assertEqual(out.ocr_confidence, 0.88)
+
+    def test_strategy_c_reports_paddle_confidence(self):
+        # Arrange / Act: 戦略 C（本番既定）は交差検証。テキストを使う
+        out = self._route_with_conf("C", 0.88)
+        # Assert
+        self.assertEqual(out.ocr_confidence, 0.88)
+
+    def test_strategy_b_above_threshold_reports_confidence(self):
+        # Arrange / Act: 閾値 0.7 以上はテキスト経路
+        out = self._route_with_conf("B", 0.95)
+        # Assert
+        self.assertEqual(out.ocr_confidence, 0.95)
+
+    def test_strategy_b_below_threshold_reports_no_confidence(self):
+        # Arrange / Act: 閾値未満は Vision 兜底へ落ちる
+        out = self._route_with_conf("B", 0.30)
+
+        # Assert: Vision 由来の結果に低置信を誤って付けない（無信号 None）。
+        # ここが数値になると、Vision が正しく読んだ票に黄タグが付く。
+        self.assertIsNone(out.ocr_confidence)
+        self.assertIsNotNone(out.raw_data)
 
     def test_ocr_with_paddleocr_contract_stays_two_tuple(self):
         # Arrange / Act: 取り違え防止。_ocr_with_paddleocr は 2 引数のまま

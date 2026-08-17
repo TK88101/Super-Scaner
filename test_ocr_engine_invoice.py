@@ -47,6 +47,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import ocr_engine
 from doc_types import DocType
+from ocr_test_helpers import page_ocr_from_tuple, page_ocrs_from_tuples
 from sheets_output import SheetsOutputWriter, TAG_COL_INDEX
 from tag_rules import UNRECOGNIZED_TAG
 # Session 16 重複覆蓋收斂: _empty_invoice_raw は本ファイルと
@@ -93,7 +94,8 @@ def _run_pipeline(gemini_raw, doc_type=DocType.PURCHASE_INVOICE):
         with mock.patch.object(ocr_engine, "_split_pdf_pages",
                                return_value=_two_pdf_pages()), \
              mock.patch.object(ocr_engine, "_route_ocr_strategy",
-                               side_effect=route), \
+                               side_effect=page_ocrs_from_tuples(
+                                   route, doc_type)), \
              mock.patch.object(ocr_engine, "_call_gemini_bytes",
                                return_value=None) as vision:
             with redirect_stdout(io.StringIO()):
@@ -163,7 +165,8 @@ def _run_single_page_pipeline(gemini_raw, suffix=".jpg",
         with mock.patch.object(ocr_engine, "_split_pdf_pages",
                                return_value=iter([])), \
              mock.patch.object(ocr_engine, "_route_ocr_strategy",
-                               return_value=(gemini_raw, "", 0.9)), \
+                               return_value=page_ocr_from_tuple(
+                                   (gemini_raw, "", 0.9), doc_type)), \
              mock.patch.object(ocr_engine, "_call_gemini", return_value=None):
             with redirect_stdout(io.StringIO()):
                 return list(ocr_engine.process_pipeline(

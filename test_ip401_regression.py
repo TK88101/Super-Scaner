@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import ocr_engine
 from doc_types import DocType
+from ocr_test_helpers import page_ocrs_from_tuples
 
 # Plan §1.2 の実測値。この票が無音で消えた。
 MAIZURU_OCR = (
@@ -64,7 +65,8 @@ def _run_pipeline(pages, routes):
         with mock.patch.object(ocr_engine, "_split_pdf_pages",
                                return_value=iter(pages)), \
              mock.patch.object(ocr_engine, "_route_ocr_strategy",
-                               side_effect=routes), \
+                               side_effect=page_ocrs_from_tuples(
+                                   routes, DocType.RECEIPT)), \
              mock.patch.object(ocr_engine, "_call_gemini_bytes",
                                return_value=None):
             buf = io.StringIO()

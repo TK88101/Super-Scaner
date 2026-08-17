@@ -43,6 +43,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import ocr_engine
 from doc_types import DocType
+from ocr_test_helpers import page_ocrs_from_tuples
 
 
 def _valid_invoice_raw(vendor="テスト商事", date="2026-07-09", amount=1000):
@@ -100,7 +101,8 @@ def _run_invoice_pipeline(route_side_effect, doc_type=DocType.PURCHASE_INVOICE):
         with mock.patch.object(ocr_engine, "_split_pdf_pages",
                                return_value=_two_pdf_pages()), \
              mock.patch.object(ocr_engine, "_route_ocr_strategy",
-                               side_effect=route_side_effect), \
+                               side_effect=page_ocrs_from_tuples(
+                                   route_side_effect, doc_type)), \
              mock.patch.object(ocr_engine, "_call_gemini_bytes",
                                return_value=None) as vision:
             with redirect_stdout(io.StringIO()):
