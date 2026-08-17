@@ -2042,6 +2042,32 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
     Yields:
         dict: result dict そのもの（page_num 等は含まない。呼び出し側が付与）
     """
+    # ── IP-401: raw_data の型ゲート ──
+    # Gemini が JSON 配列（あるいは文字列・数値）を返すと extract_json は
+    # それをそのまま返す（arr_match 分岐 / json.loads はスカラーも返す）。
+    # 以降の整形は全て dict 前提であり、_apply_ocr_overrides の raw_data.get()
+    # が AttributeError になる。尾段（単頁 PDF・画像）はこの例外を最外の
+    # except で握り潰して 0 件で終わっており、頁が無音で消えていた。
+    #
+    # 分類は _unrecognized（占位行を書いて歸檔）であって _page_error では
+    # ない。_page_error は「API 5xx・認証・ネットワーク」のような一時障害の
+    # ためのもので、Failed → ファイル保持 → 再試行になる。「AI は応答し、
+    # JSON も解析でき、型だけが契約違反」は再試行で自癒する保証が無く、
+    # そのまま永久ループに入る（_build_doc_result の docstring と同じ判断）。
+    #
+    # このゲートは社会保険料通知書の判定より**前**に置く。型は「見た」事実
+    # であり、社保判定はキーワードによる啓発法だからである（IP-401 T1 が
+    # 封筒判定を前置拒否権から事後説明器へ降格したのと同じ原理）。両経路とも
+    # 仕訳を 1 件も作らないので帳簿リスクは同一で、差は摘要の文言だけ。
+    # 加えて、ここで弾いておけば以降の全コードが dict を仮定してよくなる。
+    if not isinstance(raw_data, dict):
+        print(f"{prefix}⚠️ AI応答が dict ではありません"
+              f"（{type(raw_data).__name__}） → 認識不能として記録")
+        yield _blank_result(
+            _unrecognized=True,
+            memo=f"⚠ AI応答形式不正（{type(raw_data).__name__}）")
+        return
+
     _apply_ocr_overrides(raw_data, ocr_text, prefix)
 
     # ── IP-401 T6: 社会保険料通知書は仕訳を一切作らない（§3.8）──
@@ -2330,30 +2356,78 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
         # 画像ファイル、または _split_pdf_pages が何も返さない単ページ PDF のみ。
         raw_data = None
         ocr_text = ""
-        with open(file_path, "rb") as f:
-            file_data = f.read()
 
-        page_ocr = _route_ocr_strategy(file_data, mime_type, doc_type, ocr_strategy)
-        raw_data = page_ocr.raw_data
-        ocr_text = page_ocr.ocr_text
-        ocr_conf = page_ocr.ocr_confidence
-        del file_data
-        gc.collect()
+        # IP-401: 逐頁ループの同区間（ファイル読取 ＋ _route_ocr_strategy ＋
+        # Vision 兜底）は守られているのに、尾段だけ裸だった。
+        # ・`open()` —— 逐頁側は `_split_pdf_pages` が**自前の try** で包んで
+        #   優雅に降格する（`ocr_engine.py:421-442`）。尾段の裸 open は
+        #   無人運用の Windows ミニ PC で現実に起きうる（ウイルス対策の
+        #   リアルタイム走査による一時ロック）
+        # ・`_call_gemini` —— `_generate_content_with_retry` の
+        #   `raise last_err` を素通しするので、再試行を使い切ると例外が上がる
+        # どちらも最外 except まで飛べば **0 件 yield** で終わり、頁が無音で
+        # 消える（main のカバレッジ哨戒も last_total_pages=0 のため鳴らない）。
+        # 逐頁と同じ占位に閉じ込める。
+        try:
+            with open(file_path, "rb") as f:
+                file_data = f.read()
+
+            page_ocr = _route_ocr_strategy(
+                file_data, mime_type, doc_type, ocr_strategy)
+            raw_data = page_ocr.raw_data
+            ocr_text = page_ocr.ocr_text
+            ocr_conf = page_ocr.ocr_confidence
+            del file_data
+            gc.collect()
+
+            if not raw_data:
+                print("🔄 フォールバック: Gemini Vision で再試行")
+                raw_data = _call_gemini(file_path, page_ocr.prompt)
+                ocr_conf = None  # Vision 兜底は無信号（低置信を誤付しない）
+        except Exception as page_err:
+            print(f"❌ ページ処理エラーのためスキップ: "
+                  f"{type(page_err).__name__}: {str(page_err)[:120]}")
+            yield _page_error_payload(
+                f"ページ処理エラー: {type(page_err).__name__}", 1, 1, None)
+            return
 
         if not raw_data:
-            print("🔄 フォールバック: Gemini Vision で再試行")
-            raw_data = _call_gemini(file_path, page_ocr.prompt)
-            ocr_conf = None  # Vision 兜底は無信号（低置信を誤付しない）
-
-        if not raw_data:
+            # IP-401: 以前はここで return して 0 件で終わっていた。頁が無音で
+            # 消えるだけでなく、last_total_pages が 0 のまま残るので main 側の
+            # カバレッジ哨戒（range(1, 0+1) = 空）も鳴らなかった。
+            # 分類は逐頁ループの同じ状況と**逐字で同じ** _page_error にする
+            # ——「AI から使える応答が無い」は 5xx・タイムアウト・レート制限で
+            # 普通に起きる一時障害であり、保持して再試行する価値がある。
+            # 終態（ファイル保持）は従来と変わらない。
             print("⚠️ AIの応答がJSONではありませんでした")
+            yield _page_error_payload("AI応答のJSON解析失敗", 1, 1, None)
             return
 
         # OCR オーバーライド → doc_type別ルーティング → result dict 整形
         # は _yield_page_results に一本化済み（PDF 逐頁ループと共通ロジック）。
         # 封筒判定は元々この経路には無かったため呼ばない（挙動を変えない）。
-        for entry in _yield_page_results(page_ocr.actual_doc_type, raw_data,
-                                         ocr_text, ocr_conf):
+        #
+        # IP-401: ここは以前 `for entry in _yield_page_results(...)` の裸ループ
+        # で、整形段階の例外が最外の except まで飛んで頁が丸ごと消えていた。
+        # 逐頁ループ（上）と同形の next() 境界にして、例外を当該頁の占位行に
+        # 閉じ込める。yield 自体は try の外に置き、消費側から throw/close された
+        # 例外を誤って握り潰さないようにする（逐頁ループと同じ理由）。
+        # 現時点では全ての例外源が最初の next() までに完走するため「部分 yield
+        # 後の例外」は起きないが、builder が将来流式化すると成立し、そのときは
+        # count>0 → Success → 歸檔で**真の無音欠落**になる。
+        page_iter = _yield_page_results(page_ocr.actual_doc_type, raw_data,
+                                        ocr_text, ocr_conf)
+        while True:
+            try:
+                entry = next(page_iter)
+            except StopIteration:
+                break
+            except Exception as fmt_err:
+                print(f"❌ 整形処理エラー: "
+                      f"{type(fmt_err).__name__}: {str(fmt_err)[:120]}")
+                yield _page_error_payload(
+                    f"整形処理エラー: {type(fmt_err).__name__}", 1, 1, None)
+                break
             yield {
                 "result": entry,
                 "page_num": 1,

@@ -44,3 +44,18 @@ def page_ocr_from_tuple(route_tuple, doc_type=DocType.RECEIPT):
 def page_ocrs_from_tuples(route_tuples, doc_type=DocType.RECEIPT):
     """3-tuple のリストを `PageOcr` のリストへ（`side_effect` 用）。"""
     return [page_ocr_from_tuple(t, doc_type) for t in route_tuples]
+
+
+def pdf_pages(n):
+    """`_split_pdf_pages` の戻り値を模した n ページ分のリスト。
+
+    ページ dict の形（`page_num` / `total_pages` / `data` / `filename`）は
+    `process_pipeline` の逐頁ループが直接読む契約なので、コピーが増えると
+    「片方にキーを足して片方に足し忘れる」漂移が起きる。共有はここに置く。
+
+    `test_ip401_regression.py` にも同形のローカル定義が在るが、そちらは
+    IP-401 の原始事故の回帰テストで「無修正で緑であること」自体が受入基準に
+    なっているため、この整理では触っていない（統合は別タスク）。
+    """
+    return [{"page_num": i, "total_pages": n, "data": f"%PDF-p{i}".encode(),
+             "filename": f"p{i}.pdf"} for i in range(1, n + 1)]
