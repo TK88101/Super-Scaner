@@ -4,6 +4,13 @@ service_account.json
 SuperScaner.pem
 *.pem
 
+# golden/ = 2026-07-21 手工做的領収書税区分驗證輸出 (15 個 JSON)。
+# 內容為客戶真實票據的店名・登録番号・日期・金額 (20 份・17 店名・14 個 T 番號)。
+# 本 repo 是 PUBLIC，真實票據資料絕不進入 —— test_images/ 也用它自己的
+# .gitignore 全數排除，這裡是同一政策的延伸。
+# 檔案本身保留在本地 (無任何代碼讀取，僅供人工查核)。
+golden/
+
 # --- 系統垃圾與緩存 ---
 __pycache__/
 *.pyc
@@ -19,3 +26,5 @@ temp_downloads/
 MF_Import_Data.csv
 benchmark_results*.txt
 .playwright-mcp/
+# coverage.py 的計算暫存 (SQLite)。重跑即可再生成，不提交。
+.coverage
