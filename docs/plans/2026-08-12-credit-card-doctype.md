@@ -412,11 +412,11 @@ MF 本番の実測（附録 C）で判明した井戸会計事務所の記帳習
    している（venv 非依存を保つため）。乖離は `test_page_family` の突合テストが検出する。
 6. **config 項目は 13 項目すべて追加済み**（2026-08-14。趙拍板）。
    各モジュールは自前の既定値を持ち、`try: from config import X / except ImportError`
-   で override を読む。うち**読み取り点が在るのは 8 項目**で、残る 5 項目
-   （`CREDIT_ADJUST_CREDIT_ACCOUNT` / `CC_WINDOW_SIZE` / `CC_MAX_WINDOWS` /
-   `GEMINI_MAX_OUTPUT_TOKENS_BULK` / `CC_TAX_TYPE_RENDERING`）は T4・T5 の実装が
-   まだ無いため**書いても効かない**。`test_credit_card_config.UnwiredItemsTest` が
-   「いつの間にか結線された」ことを検知して、Plan と一覧の更新を促す。
+   で override を読む。**2026-08-18（T5 完了）時点では現存 11 項目中 10 項目が結線済み**
+   で、未結線は `CC_TAX_TYPE_RENDERING`（T6 の出力層）だけ。`CC_WINDOW_SIZE` /
+   `CC_MAX_WINDOWS` は窓分割の廃案に伴い config ごと削除した（§9.5 参照）。
+   `test_credit_card_config.UnwiredItemsTest` が「いつの間にか結線された」ことを、
+   `RetiredItemsTest` が「廃止項目が復活した」ことをそれぞれ検知する。
 7. **`invoice_classification.derive_line_kind` を新設**。Plan の prompt 契約
    （AD-4 の `sec` ＋ AD-5 の `kind`）には**実体軸 `line_kind` が無い**ため、
    T4 をそのまま実装すると nimoca の電車行も ETC 通行料も一律 `general` に落ち、
@@ -690,9 +690,9 @@ except ImportError:
 | `TRANSIT_IC_BOOK_CHARGE_ROWS` | `False` | nimoca「入金（チャージ）」を記帳するか | TBD-2 |
 | `CREDIT_CARD_DEDUP_MODE` | `"exclude"` | `off` / `mark` / `exclude`。重複頁の扱い | AD-1 / D3 |
 | `RECON_TOLERANCE_YEN` | `0` | 検算の許容差。E2E で実際の不一致率を測ってから再検討（R9） | AD-9 / D2 |
-| `CC_WINDOW_SIZE` | `40` | 出力切断時の窓分割の 1 窓あたり明細行数 | T5 |
-| `CC_MAX_WINDOWS` | `8` | 1 頁あたりの窓数上限（320 行まで） | T5 |
-| `GEMINI_MAX_OUTPUT_TOKENS_BULK` | `0`（＝既存値を流用） | 逐行記帳 doc_type 用の出力上限。**check_models.py で実測してから入れる**（記憶で 65536 等と書かない） | T5 / D4 |
+| ~~`CC_WINDOW_SIZE`~~ | — | **廃止**（窓分割リトライ廃案。T5 Plan §9.1） | — |
+| ~~`CC_MAX_WINDOWS`~~ | — | **廃止**（同上） | — |
+| `GEMINI_MAX_OUTPUT_TOKENS_BULK` | `65536` | 逐行記帳 doc_type 用の出力上限。硬上限を実測（`genai.list_models()`）し趙が拍板（2026-08-18）。0 は「既存値を流用」の意味を保持 | T5 完了 / D4 |
 | `CC_TAX_TYPE_RENDERING` | `{"課対仕入10%": "課仕 10%", "課対仕入8% (軽)": "課仕 8%(軽)"}` | 出力層のみの省略名変換。`receipt_aggregation.determine_tax_types()` はグローバルに変えない | AD-11 |
 | `SMALL_AMOUNT_TAXPAYER_CONFIRMED` | `False` | 少額特例の**事業者要件**（基準期間の課税売上高 1 億円以下等）を事務所が確認済みか。プログラムには判定不能なので、既定は未確認＝控除なしへ倒す。確認が取れたら True にするだけで R08 → R07 へ移る | AD-8 / T2 DoD |
 
@@ -702,16 +702,21 @@ NamedTuple のままで、config から動かせるのは既定値 1 個
 （`SMALL_AMOUNT_TAXPAYER_CONFIRMED`）だけである。`config.py` に `TAX_POLICY` を
 書いても **no-op** になるので、追加するのは上表の名前のとおりにすること。
 
-**足場の実数（2026-08-17 更新。T4 完了時点）**: 上表 13 項目のうち、実装側に
-`try/except ImportError` の読み取りが在るのは **9 項目**
+**足場の実数（2026-08-18 更新。T5 完了時点）**: 起案時 13 項目のうち **2 項目を廃止**
+（`CC_WINDOW_SIZE` / `CC_MAX_WINDOWS` —— 窓分割リトライの廃案。T5 Plan §9.1 のとおり
+「1 頁 300 行」がカード単位の読み違いで、上限 65536 なら実物で一度も発火しない）。
+
+現存 11 項目のうち、実装側に読み取りが在るのは **10 項目**
 （`RECON_TOLERANCE_YEN` / `TRANSIT_IC_BOOK_CHARGE_ROWS` / `CREDIT_CARD_DEDUP_MODE` /
 `INVOICE_COL_VALUES` / `INVOICE_COL_RENDERING` / `INVOICE_CONFIRM_THRESHOLD_YEN` /
-`INVOICE_CONFIRM_TAG` / `SMALL_AMOUNT_TAXPAYER_CONFIRMED` ＋
-**`CREDIT_ADJUST_CREDIT_ACCOUNT`（T4 で `card_entries` が結線）**）。
+`INVOICE_CONFIRM_TAG` / `SMALL_AMOUNT_TAXPAYER_CONFIRMED` /
+**`CREDIT_ADJUST_CREDIT_ACCOUNT`（T4 で `card_entries` が結線）** /
+**`GEMINI_MAX_OUTPUT_TOKENS_BULK`（T5 で `ocr_engine._line_generation_config`
+が結線。値も 0 → 65536 へ。趙拍板 2026-08-18）**）。
 
-残り 4 項目（`CC_WINDOW_SIZE` / `CC_MAX_WINDOWS` / `GEMINI_MAX_OUTPUT_TOKENS_BULK` /
-`CC_TAX_TYPE_RENDERING`）は T5・T6 で実装する側がまだ存在しないため読み取り点も無い。
+残るは `CC_TAX_TYPE_RENDERING` の 1 項目のみで、T6 の出力層で結線する。
 **config に書くだけでは効かない**ので、該当タスクの実装時に足場も一緒に入れること。
+廃止 2 項目は `test_credit_card_config.RetiredItemsTest` が再追加を検知する。
 
 > **`CC_TAX_TYPE_RENDERING` を T4 で結線しなかった理由**（Codex 評審で明確化）:
 > builder は canonical の税区分（`課対仕入10%`）を出し、省略名（`課仕 10%`）への
