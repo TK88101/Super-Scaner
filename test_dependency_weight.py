@@ -47,6 +47,14 @@ _MUST_STAY_LIGHT = (
     # （母 Plan §4「ocr_engine にこれ以上積まない」）
     "card_entries",
     "card_prompts",
+    # T5: サルベージ解析は stdlib のみ（母 Plan §4 の「ocr_engine に積まない」）。
+    "card_salvage",
+    "test_card_salvage",
+    # 標本と config 番人も直接登録する。これまでは「test_card_entries が
+    # import しているから」という**間接的**な保護しかなく、T5/T6 で
+    # import 元が変わった瞬間に無音で外れる形だった。
+    "ocr_test_fixtures",
+    "test_credit_card_config",
 )
 
 
@@ -159,6 +167,64 @@ class PureModulesStayVenvIndependentTest(unittest.TestCase):
         self.assertTrue(
             _HEAVY & set(reached),
             "番人が重依存を検出できていない（_HEAVY の綴りが実態とずれた？）")
+
+
+# 上の番人は「import 時に実行される import」だけを見る（`_imports_of` の
+# docstring のとおり意図的）。だが**標本モジュール**には、その死角が
+# そのまま事故になる性質がある —— 標本は必ず呼ばれるので、関数本体の
+# 遅延 import でも実行され、`python3 -m unittest test_card_salvage` は
+# ModuleNotFoundError で落ちるのに venv311 の全量テストは緑のままになる。
+# （MEMORY「全緑は『壊していない』の証明ではない」と同じ様式。）
+_PURE_DATA_MODULES = ("ocr_test_fixtures",)
+
+# 標本が**実際に**使っている stdlib だけを許す。将来の使用を見越して
+# 水増しすると番人が緩む方向にしか効かないので、要るときに 1 行足す。
+_STDLIB_ALLOWED = frozenset({"contextlib", "json", "os", "tempfile"})
+
+
+def _all_imports_including_function_bodies(path):
+    """関数本体・クラス本体まで含めた**全ての** import 名。"""
+    with open(path, encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=path)
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module.split(".")[0])
+    return names
+
+
+class PureDataModuleTest(unittest.TestCase):
+    """標本モジュールは**関数の中でも** stdlib しか import しないこと。"""
+
+    def test_fixture_modules_import_only_stdlib_even_lazily(self):
+        for module in _PURE_DATA_MODULES:
+            with self.subTest(module=module):
+                path = _local_module_path(module)
+                self.assertIsNotNone(path, "%s が見つからない" % module)
+                outside = _all_imports_including_function_bodies(path) - _STDLIB_ALLOWED
+                self.assertEqual(
+                    outside, set(),
+                    "%s が stdlib 以外を import している（関数本体の遅延 import "
+                    "も含む）。標本は必ず呼ばれるので、venv 無しの実行が落ちる: %s"
+                    % (module, sorted(outside)))
+
+    def test_the_deep_scan_sees_imports_inside_functions(self):
+        """番人自身が噛むこと（トップレベルしか見ていなければ空振りする）。"""
+        import tempfile as _tempfile
+
+        source = "def build():\n    import numpy\n    return numpy\n"
+        with _tempfile.NamedTemporaryFile("w", suffix=".py", delete=False,
+                                          encoding="utf-8") as tmp:
+            tmp.write(source)
+            path = tmp.name
+        try:
+            self.assertIn("numpy", _all_imports_including_function_bodies(path))
+            # 対比: 既存の番人はここを意図的に見ない
+            self.assertNotIn("numpy", _imports_of(path))
+        finally:
+            os.unlink(path)
 
 
 if __name__ == "__main__":
