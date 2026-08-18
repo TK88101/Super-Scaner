@@ -25,7 +25,8 @@ import invoice_classification as ic  # noqa: E402
 import page_family as pf  # noqa: E402
 from receipt_aggregation import determine_tax_types  # noqa: E402
 
-# Plan §9.5 の 13 項目。名前を変えるときはこの表と config の両方を直すこと。
+# Plan §9.5 の 13 項目のうち、**現存する** 11 項目。
+# 名前を変えるときはこの表と config の両方を直すこと。
 PLAN_SECTION_9_5 = (
     "CREDIT_ADJUST_CREDIT_ACCOUNT",
     "INVOICE_COL_VALUES",
@@ -35,23 +36,50 @@ PLAN_SECTION_9_5 = (
     "TRANSIT_IC_BOOK_CHARGE_ROWS",
     "CREDIT_CARD_DEDUP_MODE",
     "RECON_TOLERANCE_YEN",
-    "CC_WINDOW_SIZE",
-    "CC_MAX_WINDOWS",
     "GEMINI_MAX_OUTPUT_TOKENS_BULK",
     "CC_TAX_TYPE_RENDERING",
     "SMALL_AMOUNT_TAXPAYER_CONFIRMED",
 )
 
+# 一度は §9.5 に載ったが**廃止された**項目。単に上の表から消すと、過去設計との
+# 追跡が切れるうえ、将来うっかり再追加されても誰も気づかない。
+RETIRED_FROM_PLAN_SECTION_9_5 = (
+    # 窓分割リトライの廃案（T5 Plan §9.1）。「1 頁 300 行」がカード単位
+    # （4 頁合計）の読み違いで、上限 65536 なら実物で一度も発火しないと判明した。
+    "CC_WINDOW_SIZE",
+    "CC_MAX_WINDOWS",
+)
+
 
 class ConfigItemsExistTest(unittest.TestCase):
-    """Plan §9.5 の 13 項目が config に揃っていること。"""
+    """Plan §9.5 の項目（現存 11 ＋ 廃止 2 ＝ 起案時 13）が揃っていること。"""
 
-    def test_all_thirteen_items_are_present(self):
+    def test_all_current_items_are_present(self):
         missing = [name for name in PLAN_SECTION_9_5 if not hasattr(config, name)]
         self.assertEqual(missing, [], "config.py に未追加: %s" % missing)
 
-    def test_the_list_itself_has_thirteen_entries(self):
-        self.assertEqual(len(set(PLAN_SECTION_9_5)), 13)
+    def test_current_and_retired_add_up_to_the_original_thirteen(self):
+        both = set(PLAN_SECTION_9_5) | set(RETIRED_FROM_PLAN_SECTION_9_5)
+        self.assertEqual(len(both), 13)
+        self.assertEqual(
+            set(PLAN_SECTION_9_5) & set(RETIRED_FROM_PLAN_SECTION_9_5), set(),
+            "現存と廃止の両方に載っている項目がある")
+
+
+class RetiredItemsTest(unittest.TestCase):
+    """廃止した項目が**黙って復活しない**こと。
+
+    読み取り点ゼロの設定が config に残っていると「効いているつもり」の
+    誤解を生む。窓分割は設計ごと廃案なので、名前が戻ってきたら気づけるようにする。
+    """
+
+    def test_retired_items_are_gone_from_config(self):
+        revived = [name for name in RETIRED_FROM_PLAN_SECTION_9_5
+                   if hasattr(config, name)]
+        self.assertEqual(
+            revived, [],
+            "廃止済みの設定が復活している。窓分割は T5 Plan §9.1 で廃案: %s"
+            % revived)
 
 
 class WiringTest(unittest.TestCase):
@@ -147,15 +175,18 @@ class UnwiredItemsTest(unittest.TestCase):
 
     # T4 で `CREDIT_ADJUST_CREDIT_ACCOUNT` が結線されたのでこの一覧から外した
     # （`card_entries` が読み、`test_card_entries` が変異で効き目を確認済み）。
+    # T5 で `GEMINI_MAX_OUTPUT_TOKENS_BULK` が結線された（`ocr_engine` の
+    # `_line_generation_config` が読み、`test_ocr_engine_line_budget` が
+    # 「BULK=0 が予算 0 として SDK へ渡らない」ところまで固定している）。
+    # 窓 2 項は廃案で config ごと削除（`RetiredItemsTest`）。
     # `CC_TAX_TYPE_RENDERING` は**意図的に残す** —— builder は canonical の
     # 税区分を出し、省略名への変換は T6 の出力層で行う（AD-11）。
-    UNWIRED = ("CC_WINDOW_SIZE", "CC_MAX_WINDOWS",
-               "GEMINI_MAX_OUTPUT_TOKENS_BULK", "CC_TAX_TYPE_RENDERING")
+    UNWIRED = ("CC_TAX_TYPE_RENDERING",)
 
     # 結線されうる実装モジュール。T6 で `sheets_output.py` を足すこと
     WATCHED = ("page_family.py", "card_reconciliation.py",
                "invoice_classification.py", "page_dedup.py",
-               "card_entries.py", "card_prompts.py")
+               "card_entries.py", "card_prompts.py", "ocr_engine.py")
 
     def _watched_sources(self):
         import pathlib
@@ -182,9 +213,19 @@ class UnwiredItemsTest(unittest.TestCase):
         self.assertIn("from config import CREDIT_ADJUST_CREDIT_ACCOUNT",
                       self._watched_sources())
 
-    def test_bulk_token_limit_is_zero_until_measured(self):
-        """0 = 既存値を流用。実測（check_models.py）前に数値を入れない。"""
-        self.assertEqual(config.GEMINI_MAX_OUTPUT_TOKENS_BULK, 0)
+    def test_bulk_token_limit_is_the_measured_hard_ceiling(self):
+        """65536 = gemini-2.5-flash の出力硬上限（実測 ＋ 趙拍板 2026-08-18）。
+
+        起案時は「実測前に数値を入れない」ための 0 だった。実測
+        （`genai.list_models()` で硬上限 65536、`count_tokens` で 134 tok/行）
+        と趙の拍板で条件が満たされたので値を入れている。
+
+        **値効果（本当に SDK へ渡るか）はここでは見ない** ——
+        このファイルは config と純粋モジュールだけに依存する契約で、
+        `ocr_engine` を import した瞬間に venv311 必須へ劣化する。
+        値効果は `test_ocr_engine_line_budget` の担当。
+        """
+        self.assertEqual(config.GEMINI_MAX_OUTPUT_TOKENS_BULK, 65536)
 
 
 if __name__ == "__main__":

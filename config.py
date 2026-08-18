@@ -231,17 +231,28 @@ RECON_TOLERANCE_YEN = 0
 # 段階的に弱められる逃げ道として用意している。
 CREDIT_CARD_DEDUP_MODE = "exclude"
 
-# --- 出力切断時の窓分割リトライ（Plan T5）---
-# ETC は 1 頁 60〜100 行（F-8）あり、Gemini の出力が途中で切れうる。
-# ※ 以下 3 項目は読み取り点が未実装（T5 で実装する）
-CC_WINDOW_SIZE = 40      # 1 窓あたりの明細行数
-CC_MAX_WINDOWS = 8       # 1 頁あたりの窓数上限（320 行まで）
+# --- 出力切断への備え（Plan T5）---
+# ETC は 1 頁 60〜100 行あり、逐行記帳では Gemini の出力が途中で切れうる。
+#
+# 逐行記帳 doc_type（クレカ・交通系IC）専用の出力トークン上限。
+# **0 = 既存値（`ocr_engine.GEMINI_MAX_OUTPUT_TOKENS`）を流用**。
+#
+# 65536 は gemini-2.5-flash の出力硬上限（`genai.list_models()` で実測）。
+# thinking の動的上限 24,576 を引いても本文に 40,960 残り、実測 134 tok/行
+# （`model.count_tokens()`）から約 305 行/頁まで無分割で入る —— 実物の最悪頁
+# 100 行に対して 3 倍の余裕がある。上限は天井であって課金は実生成量なので、
+# 上げても費用は増えない（截断 → 再試行の空焼きが減るぶん、むしろ下がる）。
+#
+# ⚠ 0 に戻しても機能は退行しない: 32768 で切れた場合は `card_salvage` が
+# 完結行を救い、足りなければ提示行と監査行が残る。
+GEMINI_MAX_OUTPUT_TOKENS_BULK = 65536
 
-# 逐行記帳 doc_type 用の出力トークン上限。
-# **0 = 既存値（GEMINI_MAX_OUTPUT_TOKENS）を流用**。
-# ⚠ 実際の値を入れるときは `check_models.py` で**実測してから**にすること。
-#   記憶で 65536 等と書かない。thinking tokens と予算を共有する点にも注意。
-GEMINI_MAX_OUTPUT_TOKENS_BULK = 0
+# 窓分割リトライ（`CC_WINDOW_SIZE` / `CC_MAX_WINDOWS`）は**廃案**につき削除した。
+# 「1 頁 300 行」を根拠に設計していたが、その 300 行はカード単位（4 頁の合計）の
+# 読み違いで、頁単位の実測最悪は 100 行だった。上限を 65536 にすれば実物では
+# 一度も発火せず、発火しないコードは検証不能な死蔵経路になる。
+# 経緯は `docs/plans/2026-08-17-t5-window-retry.md` §9.1、
+# 再追加を検知する番人は `test_credit_card_config.RetiredItemsTest`。
 
 
 # === 出力プロファイル ===

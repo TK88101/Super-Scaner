@@ -17,35 +17,12 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(__file__))
 
 import ocr_engine
-
-
-class _FakeText:
-    """response.text を模す descriptor。設定により ValueError を送出する。"""
-
-    def __init__(self, value, raises=False):
-        self._value = value
-        self._raises = raises
-
-    def __get__(self, obj, objtype=None):
-        if self._raises:
-            raise ValueError("Invalid operation: response.text quick accessor "
-                             "requires the response to contain a valid Part")
-        return self._value
-
-
-def _make_response(text="", raises=False, finish_reason=1, usage=None):
-    """candidates[0].finish_reason と text プロパティを持つ偽 response を生成。
-
-    text を property にするため動的にクラスを作る。
-    """
-    candidates = [SimpleNamespace(finish_reason=finish_reason)]
-    attrs = {"text": _FakeText(text, raises=raises)}
-    cls = type("_FakeResponse", (), attrs)
-    resp = cls()
-    resp.candidates = candidates
-    if usage is not None:
-        resp.usage_metadata = usage
-    return resp
+# 偽 response の組み立ては `ocr_test_helpers` の共有版を使う。T5 で新しい
+# テストが同じ形を必要としたとき、SDK 0.8.5 の `.text` / `parts` 契約の
+# モデルがテスト資産に 2 つ並ぶことになった —— 片方だけ直せば「どちらが
+# 本物の契約か」が判別不能になるので、T5 の実装が着地した時点で畳んだ。
+# （実装中は本ファイルが**無修正で緑**であること自体が受入基準だった。）
+from ocr_test_helpers import gemini_response as _make_response
 
 
 class IsMaxTokensTruncatedTest(unittest.TestCase):

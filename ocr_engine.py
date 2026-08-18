@@ -21,6 +21,7 @@ from doc_types import (DocType, DOC_TYPE_CONFIG, DOC_TYPE_TAB_SUFFIX,
 # test_page_family の突合テストが検出する）。
 import card_entries
 import card_prompts
+import card_salvage
 import page_family
 from receipt_aggregation import (
     KEIYUZEI_DEBIT_ACCOUNT,
@@ -111,7 +112,13 @@ _GEMINI_RETRY_EXCEPTIONS = (
 _GEMINI_RETRY_DELAYS = [1, 4, 10, 30]
 
 
-def _generate_content_with_retry(contents):
+def _generate_content_with_retry(contents, generation_config=None):
+    """Gemini 呼出（一時障害は指数退避で再試行）。
+
+    `generation_config` は**呼出単位**で予算を変えるための省略可能引数
+    （T5 §3.1）。省略時は従来どおりモジュール既定をそのまま渡す ——
+    既存 doc_type の経路は 1 バイトも変わらない。
+    """
     last_err = None
     for attempt, delay in enumerate([0] + _GEMINI_RETRY_DELAYS):
         if delay:
@@ -120,7 +127,7 @@ def _generate_content_with_retry(contents):
         try:
             return model.generate_content(
                 contents,
-                generation_config=GEMINI_GENERATION_CONFIG,
+                generation_config=generation_config or GEMINI_GENERATION_CONFIG,
             )
         except _GEMINI_RETRY_EXCEPTIONS as e:
             last_err = e
@@ -139,6 +146,21 @@ GEMINI_GENERATION_CONFIG = {
     "response_mime_type": "application/json",
     "max_output_tokens": GEMINI_MAX_OUTPUT_TOKENS,
 }
+
+
+def _line_generation_config():
+    """逐行記帳 doc_type 用の generation_config。既定を使うなら None を返す。
+
+    `config.GEMINI_MAX_OUTPUT_TOKENS_BULK` の **0 は「既存値を流用」** の意味
+    であって予算 0 ではない。`max_output_tokens = 0` を SDK へ渡すと全応答が
+    即座に截断する —— 毎頁が截断して提示行だらけになる最悪の回帰なので、
+    0 が SDK へ届く経路そのものを作らない（None → 呼出側が既定を使う）。
+    """
+    import config
+    bulk = getattr(config, "GEMINI_MAX_OUTPUT_TOKENS_BULK", 0)
+    if not bulk or bulk == GEMINI_MAX_OUTPUT_TOKENS:
+        return None
+    return {**GEMINI_GENERATION_CONFIG, "max_output_tokens": bulk}
 
 
 # ============================================================
@@ -348,8 +370,19 @@ def _format_token_usage(response):
     return f"思考≈{total - prompt - candidates}tok/全体{total}tok"
 
 
-def _parse_gemini_response(response):
-    """Gemini 応答から JSON を抽出（失敗時は警告ログを出して None を返す）"""
+def _parse_gemini_response(response, salvage=False):
+    """Gemini 応答から JSON を抽出（失敗時は警告ログを出して None を返す）
+
+    `salvage=True`（逐行記帳 doc_type のみ）のときは、MAX_TOKENS で切れた
+    応答から**完結した部分だけ**を回収する（T5 §3.2/§3.3）。prompt schema は
+    `rows` が最後なので、切れた応答にも `rows_on_page` と完結した明細行が
+    N 個残っている —— `extract_json` の all-or-nothing がそれを捨てている。
+
+    1 行も救えなかった場合も **`{"rows": []}` という真値の dict** を返す。
+    None にすると呼出側の `if not raw_data:` が真になって Vision 兜底が走り、
+    同じ予算で同じ頁を焼き直して同じ截断に終わる（無限ループの燃料）。
+    截断は「頁が長い」という決定的性質であって一時障害ではない。
+    """
     try:
         text = (getattr(response, "text", "") or "").strip()
     except ValueError:
@@ -358,35 +391,68 @@ def _parse_gemini_response(response):
     parsed = extract_json(text)
     if parsed is None:
         finish_reason = _get_finish_reason(response)
-        detail = ""
-        if _is_max_tokens_truncated(response):
-            detail = f", {_format_token_usage(response)}"
+        truncated = _is_max_tokens_truncated(response)
+        detail = f", {_format_token_usage(response)}" if truncated else ""
         print(
             f"⚠️ Gemini応答のJSON解析失敗 "
             f"(finish_reason={finish_reason or 'unknown'}, len={len(text)}{detail})"
         )
+        if salvage and truncated:
+            recovered = card_salvage.salvage_truncated_json(text)
+            recovered = recovered if isinstance(recovered, dict) else {}
+            # `setdefault` では足りない: Gemini が `"rows": null` を**完結した値
+            # として**出していれば救出結果に null が残り、下の len() が
+            # TypeError になる。そうなると救えたはずの行欠け payload が消えて
+            # 兜底 → `_page_error` → 保持 → 再試行の環に戻ってしまう。
+            if not isinstance(recovered.get("rows"), list):
+                recovered["rows"] = []
+            recovered[card_salvage.SALVAGED_KEY] = True
+            print(f"🩹 截断応答から {len(recovered['rows'])} 行を回収しました"
+                  f"（券面申告: {recovered.get('rows_on_page', '?')} 行）")
+            return recovered
     return parsed
 
 
-def _call_gemini_text(ocr_text, prompt):
+def _call_gemini_parts(contents, line_mode=False):
+    """Gemini を呼んで JSON を返す、**唯一の**出入口。
+
+    `line_mode`（逐行記帳 doc_type の旗）は 2 つのことを同時に決める:
+    出力予算を BULK にすることと、截断応答をサルベージすることである。
+    **この 2 つは不可分**（予算だけ上げても救えない頁は救えないままだし、
+    サルベージだけ有効にすると本来切れない頁まで部分結果で記帳しかねない）。
+
+    その不可分性を各呼出変体に手で守らせると、4 つ目の変体を足した人が
+    片方だけ書いて緑になる —— CLAUDE.md が記録する ENTRY_BUILDERS 未登録
+    事故と同じ「登録漏れ」の構造で、露見の仕方まで同じ（截断頁が黙って
+    兜底 → `_page_error` → ファイル保持 → 3 秒ごとの永久再試行）。
+    だから対はここ 1 箇所にしか書かない。変体は contents を組むだけ。
+
+    BULK が 0／既定値のときは予算だけ既定へ縮退する（サルベージは有効なまま）。
+    """
+    response = _generate_content_with_retry(
+        contents,
+        generation_config=_line_generation_config() if line_mode else None)
+    return _parse_gemini_response(response, salvage=line_mode)
+
+
+def _call_gemini_text(ocr_text, prompt, line_mode=False):
     """OCR テキストを Gemini に送って構造化データを抽出"""
     full_prompt = f"{prompt}\n\n--- OCRテキスト ---\n{ocr_text}"
-    response = _generate_content_with_retry([full_prompt])
-    return _parse_gemini_response(response)
+    return _call_gemini_parts([full_prompt], line_mode)
 
 
-def _call_gemini_bytes(file_data, mime_type, prompt):
+def _call_gemini_bytes(file_data, mime_type, prompt, line_mode=False):
     """Gemini API を呼び出して JSON を返す (フォールバック用)"""
-    response = _generate_content_with_retry(
+    return _call_gemini_parts(
         [
             {"mime_type": mime_type, "data": file_data},
             prompt,
-        ]
-    )
-    return _parse_gemini_response(response)
+        ],
+        line_mode)
 
 
-def _call_gemini_cross_validate(ocr_text, file_data, mime_type, prompt):
+def _call_gemini_cross_validate(ocr_text, file_data, mime_type, prompt,
+                                line_mode=False):
     """Strategy C: OCR テキストと原画像の両方を Gemini に送信"""
     cross_prompt = (
         f"{prompt}\n\n"
@@ -396,20 +462,19 @@ def _call_gemini_cross_validate(ocr_text, file_data, mime_type, prompt):
         f"上記のOCRテキストは参考情報です。画像の内容を直接確認し、"
         f"OCRテキストに誤りがあれば画像を優先してください。"
     )
-    response = _generate_content_with_retry(
+    return _call_gemini_parts(
         [
             {"mime_type": mime_type, "data": file_data},
             cross_prompt,
-        ]
-    )
-    return _parse_gemini_response(response)
+        ],
+        line_mode)
 
 
-def _call_gemini(file_path, prompt):
+def _call_gemini(file_path, prompt, line_mode=False):
     with open(file_path, "rb") as f:
         file_data = f.read()
     mime_type = _get_mime_type(file_path)
-    return _call_gemini_bytes(file_data, mime_type, prompt)
+    return _call_gemini_bytes(file_data, mime_type, prompt, line_mode=line_mode)
 
 
 class PdfSplitError(Exception):
@@ -1748,6 +1813,17 @@ ENTRY_BUILDERS = {
 LINE_MODE_DOC_TYPES = frozenset({DocType.CREDIT_CARD, DocType.TRANSIT_IC})
 
 
+def _is_line_mode(doc_type):
+    """この doc_type は逐行記帳か（BULK 予算・截断サルベージ・行欠け検出の可否）。
+
+    集合の直接参照を散らさず 1 つの述語に寄せる。この判定が担うのは
+    「予算を変えるか」「救済するか」「行欠けを見るか」の 3 つで、将来
+    `RECON_POLICY` のような doc_type 別の方針表へ育つ余地がある。
+    そのとき散在していると、直し漏れた 1 箇所が静かな半開状態になる。
+    """
+    return doc_type in LINE_MODE_DOC_TYPES
+
+
 def _validate_doc_type_registries(doc_types=None, registries=None):
     """全 DocType が各登録表に漏れなく登録済みかを import 時に検査する。
 
@@ -1821,7 +1897,7 @@ def _build_doc_result(doc_type, raw_data, entries):
         "_unrecognized": unrecognized,
     }
 
-    if doc_type not in LINE_MODE_DOC_TYPES:
+    if not _is_line_mode(doc_type):
         return result
 
     # ── 逐行記帳 doc_type だけの追加情報（AD-T4-6 / AD-T4-7）──
@@ -1934,6 +2010,16 @@ class PageOcr:
     page_class: object               # page_family.PageClass（T9 が消費）
     family_signal: str | None        # 監査シグナル（T9 が消費）
 
+    @property
+    def line_mode(self) -> bool:
+        """この頁が逐行記帳か。**兜底の呼出側で導出し直さないため**の窓口。
+
+        `actual_doc_type` は本オブジェクトが確定させた事実なので、呼出点で
+        `page_ocr.actual_doc_type in LINE_MODE_DOC_TYPES` と書き直すのは
+        同じ導出の再実装になる（frozen dataclass なので property は安全）。
+        """
+        return _is_line_mode(self.actual_doc_type)
+
 
 def _resolve_page_prompt(folder_doc_type, ocr_text):
     """この 1 頁に使う prompt を決める（T3-b）。
@@ -2021,19 +2107,27 @@ def _route_ocr_strategy(
                 _resolve_page_prompt(doc_type, ocr_text))
             if actual_doc_type != doc_type:
                 print(f"{prefix}🔀 頁の種別を {doc_type} → {actual_doc_type} と判定")
+            # T5: 旗は**この頁を解析する種別**で決める（folder ではない）。
+            # 混載フォルダでは頁ごとに変わる。
+            line_mode = _is_line_mode(actual_doc_type)
             if ocr_strategy == "A":
-                raw_data = _call_gemini_text(ocr_text, prompt)
+                raw_data = _call_gemini_text(ocr_text, prompt,
+                                             line_mode=line_mode)
                 ocr_conf = paddle_conf
             elif ocr_strategy == "B":
                 if paddle_conf >= config.OCR_CONFIDENCE_THRESHOLD:
-                    raw_data = _call_gemini_text(ocr_text, prompt)
+                    raw_data = _call_gemini_text(ocr_text, prompt,
+                                                 line_mode=line_mode)
                     ocr_conf = paddle_conf
                 else:
                     # Vision 兜底: raw_data は Vision 由来のため置信度は無信号(None)
                     print(f"{prefix}⚠️ 置信度低 ({paddle_conf:.3f} < {config.OCR_CONFIDENCE_THRESHOLD}) → Gemini Vision")
-                    raw_data = _call_gemini_bytes(data_bytes, mime_type, prompt)
+                    raw_data = _call_gemini_bytes(data_bytes, mime_type, prompt,
+                                                  line_mode=line_mode)
             elif ocr_strategy == "C":
-                raw_data = _call_gemini_cross_validate(ocr_text, data_bytes, mime_type, prompt)
+                raw_data = _call_gemini_cross_validate(
+                    ocr_text, data_bytes, mime_type, prompt,
+                    line_mode=line_mode)
                 ocr_conf = paddle_conf
     except Exception as ocr_err:
         print(f"{prefix}⚠️ PaddleOCR失敗: {ocr_err}")
@@ -2181,9 +2275,8 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
         # Gemini が本物の封筒に偽 entry を捏造する可能性への担保（§6）。
         # 記録はページ単位で 1 行にしたいので先頭 result にだけ付ける。
         if is_envelope:
-            yield {**page_results[0],
-                   "_audit_signal": "envelope_signal_with_entries",
-                   "_ocr_text_len": len(ocr_text or "")}
+            yield _with_audit_signal(page_results[0],
+                                     "envelope_signal_with_entries", ocr_text)
             yield from page_results[1:]
         else:
             yield from page_results
@@ -2197,7 +2290,65 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
         print(f"{prefix}⚠️ エントリビルダーが未登録: {doc_type}")
         return
 
-    yield _build_doc_result(doc_type, raw_data, builder(raw_data))
+    result = _build_doc_result(doc_type, raw_data, builder(raw_data))
+    if not _is_line_mode(doc_type):
+        yield result
+        return
+    yield from _yield_line_mode_results(result, raw_data, ocr_text, prefix)
+
+
+def _yield_line_mode_results(result, raw_data, ocr_text, prefix=""):
+    """逐行記帳 doc_type の result を、行欠けの痕跡込みで yield する（T5 §3.5）。
+
+    痕跡の落点は趙裁定 2026-08-17 のとおり **MF タブの金額 0 提示行 ＋
+    監査タブ 1 行**で、いずれも既存機構をそのまま使う:
+
+    - MF 提示行: `_unrecognized` の payload → `sheets_output` が摘要へ memo を
+      書き、タグを自動で赤系にする。金額 0 の entry は `append_entries` に
+      行単位で無音 skip されるので、**明細経路では提示行を書けない**
+    - 監査タブ: `_audit_signal` → `main` が verdict「分岐」で 1 行。新しい
+      verdict 定数は作らない（既存の「欠落」と紛らわしく、reason 列は
+      機械可読キーという既存規約でちょうど足りる）
+
+    **明細 result には 1 バイトも触らない**（AD-7: 検算・行欠けの赤は
+    カード単位 1 行であって、明細 62 行を赤く塗ることではない）。
+
+    ここが足すのは**注記**であって頁の去向ではない。記帳するか否かは
+    明細 result 自身が担っており、AD-0 / T9 の Disposition 軸には乗らない。
+    """
+    shortage, reason = card_salvage.page_marks(raw_data)
+    if shortage is None:
+        # 券面申告どおり取れている。reason が付くのは「救済は経たが行数は
+        # 充足」の場合だけで、そのときは監査タブにだけ痕跡を残す。
+        yield _with_audit_signal(result, reason, ocr_text) if reason else result
+        return
+
+    memo = card_salvage.shortage_memo(shortage)
+    print(f"{prefix}{memo}")
+    if not result.get("entries"):
+        # 1 行も記帳できなかった頁。提示行を別に出すと同じ頁に赤い占位行が
+        # 2 本並ぶので、既に占位である result 自身へ文言を載せる。
+        yield _with_audit_signal(result, reason, ocr_text, memo=memo)
+        return
+    yield result
+    # 提示行は明細の**後**。先に出すと取引No が「注記 → 明細」の順になる。
+    yield _blank_result(date=result.get("date", ""),
+                        vendor=result.get("vendor", ""),
+                        _unrecognized=True, memo=memo,
+                        _audit_signal=reason,
+                        _ocr_text_len=len(ocr_text or ""))
+
+
+def _with_audit_signal(result, reason, ocr_text, **overrides):
+    """result に監査タブ用の痕跡（`_audit_signal` ＋ `_ocr_text_len`）を載せる。
+
+    この 2 键は `main.process_file` が読む契約なので、綴りが 1 箇所でも
+    ずれると監査行が黙って出なくなる。`_blank_result` / `_page_error_payload`
+    と同じ理由で、形の出所を 1 つにまとめておく。
+    """
+    return {**result, **overrides,
+            "_audit_signal": reason,
+            "_ocr_text_len": len(ocr_text or "")}
 
 
 def _page_error_payload(memo, page_num, total_pages, page_bytes):
@@ -2363,9 +2514,13 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                         if not page_raw_data:
                             print(f"{prefix}🔄 フォールバック: Gemini Vision で再試行")
                             # 兜底も頁ごとに解決した prompt を使う（AD-T3-2 により
-                            # PaddleOCR が失敗していても非空が保証されている）
+                            # PaddleOCR が失敗していても非空が保証されている）。
+                            # T5: 截断で来た頁はここに落ちない（サルベージが真値の
+                            # dict を返すため）。ここに来るのは「AI が JSON を
+                            # 返さなかった」頁だけで、兜底の期待値が残っている。
                             page_raw_data = _call_gemini_bytes(
-                                page_data, "application/pdf", page_ocr.prompt)
+                                page_data, "application/pdf", page_ocr.prompt,
+                                line_mode=page_ocr.line_mode)
                             ocr_conf = None  # Vision 兜底は無信号（低置信を誤付しない）
                     except Exception as page_err:
                         failed_pages += 1
@@ -2514,7 +2669,12 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
 
             if not raw_data:
                 print("🔄 フォールバック: Gemini Vision で再試行")
-                raw_data = _call_gemini(file_path, page_ocr.prompt)
+                # T5: 尾段（単頁 PDF・画像）も逐頁ループと同じ扱いにする。
+                # ここを落とすと単頁クレカ PDF だけが截断→兜底→_page_error→
+                # ファイル保持→3 秒ごとの永久再試行に入る（IP-401 が潰した
+                # 「逐頁と尾段の非対称」の再発）。
+                raw_data = _call_gemini(file_path, page_ocr.prompt,
+                                        line_mode=page_ocr.line_mode)
                 ocr_conf = None  # Vision 兜底は無信号（低置信を誤付しない）
         except Exception as page_err:
             print(f"❌ ページ処理エラーのためスキップ: "

@@ -152,8 +152,11 @@ class JsonParseFailurePageVisibilityTest(unittest.TestCase):
         # Act
         _, vision = _run_receipt_pipeline(route)
 
-        # Assert: 失敗宣言の前に Vision 兜底を必ず試している
-        vision.assert_called_once_with(b"%PDF-p1", "application/pdf", mock.ANY)
+        # Assert: 失敗宣言の前に Vision 兜底を必ず試している。
+        # `line_mode=False` は T5 で足した引数 —— 領収書経路が BULK 予算にも
+        # 截断サルベージにも触れないことを、ここで併せて固定する。
+        vision.assert_called_once_with(b"%PDF-p1", "application/pdf", mock.ANY,
+                                       line_mode=False)
 
 
 class PageFormattingExceptionIsolationTest(unittest.TestCase):

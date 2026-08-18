@@ -82,7 +82,8 @@ def _excluded_result(reason="envelope", ocr_text_len=55):
 
 
 def _run_process_file(pages, writer=None, progress=None,
-                      resolver_side_effect=None, capture=None):
+                      resolver_side_effect=None, capture=None,
+                      doc_type=DocType.RECEIPT):
     """process_pipeline を差替えて process_file を1回走らせる。
 
     progress は B7 T3 で追加された任意引数。未指定(None)のときは既存呼出と
@@ -116,7 +117,7 @@ def _run_process_file(pages, writer=None, progress=None,
                 file_path="/tmp/dummy.pdf",
                 uploader_name="テスト社員",
                 chat_id="",
-                doc_type=DocType.RECEIPT,
+                doc_type=doc_type,
                 progress=progress,
             )
     return ok, writer
@@ -460,6 +461,32 @@ class _ReturnControlledWriter(_RecordingWriter):
     def append_entries(self, employee_name, doc_type, entries_data, source_url):
         super().append_entries(employee_name, doc_type, entries_data, source_url)
         return self._entries_return
+
+
+class _AmountAwareWriter(_RecordingWriter):
+    """payload の中身から戻り値を決める代役（T5 の行欠け頁専用）。
+
+    1 物理頁から明細 result と提示行 result の 2 件が来るので、固定戻り値の
+    `_ReturnControlledWriter` では POSTED と PLACEHOLDER を撃ち分けられない。
+
+    判定式は本物（`sheets_output.py` の `append_entries` 冒頭、
+    `if not amount or int(amount) == 0: continue` ＋ 行が 1 つも残らなければ
+    `_write_unrecognized_row` → `APPEND_RESULT_PLACEHOLDER`）を**逐字で**写す。
+    `any(entry.get("amount"))` のような近似だと `amount="0"` や `0.4` で
+    本物と分岐が割れ、「行欠け頁が POSTED に化けない」ことを測るはずの物差しが
+    別の契約を測ることになる。本物の述語は `append_entries` の中段に埋まって
+    いて再利用できないため、写す以外に手が無い（共有は T6 で
+    `sheets_output.py` に触るときに解消する）。
+    """
+
+    def append_entries(self, employee_name, doc_type, entries_data, source_url):
+        super().append_entries(employee_name, doc_type, entries_data, source_url)
+        for entry in entries_data.get("entries") or []:
+            amount = entry.get("amount")
+            if not amount or int(amount) == 0:
+                continue
+            return APPEND_RESULT_POSTED
+        return APPEND_RESULT_PLACEHOLDER
 
 
 class _AlwaysFailingEntriesWriter(_RecordingWriter):
@@ -844,6 +871,76 @@ class PipelineCallContractTest(unittest.TestCase):
             "main.py のページカバレッジ突合 range(1, last_total_pages + 1) を "
             "range(start_page, ...) へ直すこと（さもないと start_page 未満の "
             "全頁が『欠落』として監査タブに誤報される）")
+
+
+class LineShortagePageSemanticsTest(unittest.TestCase):
+    """T5: 行欠け頁を process_file がどう扱うか（趙裁定 2026-08-17 の落点）。
+
+    producer は 1 物理頁から **明細 result ＋ 提示行 result の 2 件**を
+    yield する。既存の封筒分岐（複数 result）と同型の挙動だが、
+    「頁数と outcome 件数が一致しなくなる」という可観測なズレを伴うので、
+    偶然そうなっているのではなく**仕様である**ことをここで固定する。
+    """
+
+    @staticmethod
+    def _pages():
+        detail = {
+            "date": "2026/05/18", "vendor": "ENEOS", "invoice_num": "",
+            "memo": "", "entries": [{"debit_account": "旅費交通費",
+                                     "amount": 630}],
+            "line_mode": True,
+        }
+        notice = {
+            "date": "2026/05/18", "vendor": "ENEOS", "invoice_num": "",
+            "memo": "⚠ 明細行の取得漏れ: 券面100行中62行のみ取得"
+                    "（原票を確認してください）",
+            "entries": [], "_unrecognized": True,
+            "_audit_signal": "line_shortage:62/100", "_ocr_text_len": 42,
+        }
+        return [_page(detail, 1, 1), _page(notice, 1, 1)]
+
+    def test_page_is_archived_not_failed(self):
+        # 裁定 3: 行が欠けてもファイルを Failed にしない（保持→再試行しない）
+        ok, _ = _run_process_file(self._pages(), doc_type=DocType.CREDIT_CARD)
+        self.assertTrue(ok)
+
+    def test_one_physical_page_reports_posted_and_placeholder(self):
+        progress = _ProgressSpy()
+        _run_process_file(self._pages(), writer=_AmountAwareWriter(),
+                          progress=progress, doc_type=DocType.CREDIT_CARD)
+        outcomes = [call[2] for call in progress.page_done_calls]
+        self.assertEqual(outcomes, [page_progress.OUTCOME_POSTED,
+                                    page_progress.OUTCOME_PLACEHOLDER])
+        # 頁番号は両方 1（進捗側は set で重複排除する契約）
+        self.assertEqual({call[0] for call in progress.page_done_calls}, {1})
+
+    def test_detail_rows_and_notice_row_both_reach_the_mf_tab(self):
+        writer = _AmountAwareWriter()
+        _run_process_file(self._pages(), writer=writer,
+                          doc_type=DocType.CREDIT_CARD)
+        self.assertEqual(len(writer.calls), 2)
+        detail, notice = writer.calls
+        self.assertEqual(len(detail["entries"]), 1)
+        self.assertNotIn("_unrecognized", detail)
+        # 提示行は entries 空 → sheets_output が摘要へ memo を書き赤系タグを付ける
+        self.assertTrue(notice["_unrecognized"])
+        self.assertIn("100行中62行", notice["memo"])
+
+    def test_audit_row_is_written_once_with_the_machine_readable_reason(self):
+        writer = _AmountAwareWriter()
+        _run_process_file(self._pages(), writer=writer,
+                          doc_type=DocType.CREDIT_CARD)
+        self.assertEqual(len(writer.audit_calls), 1)
+        audit = writer.audit_calls[0]
+        self.assertEqual(audit["reason"], "line_shortage:62/100")
+        self.assertEqual(audit["page_num"], 1)
+
+    def test_ledger_is_written_before_the_audit_tab(self):
+        # 帳簿を人質に取らせない（監査書込が落ちても記帳は済んでいる）
+        writer = _AmountAwareWriter()
+        _run_process_file(self._pages(), writer=writer,
+                          doc_type=DocType.CREDIT_CARD)
+        self.assertEqual(writer.events, ["entries", "entries", "audit"])
 
 
 if __name__ == "__main__":
