@@ -1064,15 +1064,50 @@ def _should_override_date(gemini_date, ocr_date):
     return True
 
 
-def _apply_ocr_overrides(raw_data, ocr_text, prefix=""):
+# OCR 主導の日付・T番号上書きを**当ててはいけない** doc_type（AD-3。T7）。
+#
+# この上書きは領収書の券面を前提にしている。カード明細に当てると:
+# - **日付**: `_extract_date_from_ocr` の `_skip_keywords` に「カード」「ポイント」が
+#   入っており、カード明細ではほぼ全ての日付が skip → `fallback_pool[-1]`
+#   ＝「頁面で最後に読まれた日付」が採用される。逐行記帳では行ごとの利用日が正で、
+#   doc 級のその値は T6 が行級化した B列 の**回帰先**を汚す
+# - **T番号**: 券面の登録番号は**カード会社自身**のもの（F-11）。カード明細は
+#   適格請求書に該当せず（F-14）、行ごとの加盟店登録番号は構造上存在しない
+#
+# `card_prompts` の出力 JSON には doc 級 `date` / `invoice_num` が**そもそも無い**
+# のに、下の上書きはキーの有無を問わず代入する。プロンプト側の改名では防げない。
+#
+# **`LINE_MODE_DOC_TYPES` の別名にしない**。「逐行記帳である」と「券面の日付/
+# 登録番号が doc 級に存在しない」は**別の軸**である（T6 が抑制表について下したのと
+# 同じ裁決）。追随漏れは `test_ocr_engine_ocr_override_exempt` の台帳が塞ぐ。
+_OCR_OVERRIDE_EXEMPT_DOC_TYPES = frozenset({
+    DocType.CREDIT_CARD,
+    DocType.TRANSIT_IC,
+})
+
+
+def _apply_ocr_overrides(doc_type, raw_data, ocr_text, prefix=""):
     """OCR テキストから抽出した日付・T番号で Gemini の結果を上書きする。
 
     Gemini は日付の年号解釈を間違えやすい（26年→2014年等）が、
     PaddleOCR のテキストから正規表現で抽出すれば確実。
     ただし Gemini が有効な日付を持つ場合、OCR が宣伝日付を誤抽出した可能性があるため
     年が大きく異なる場合は上書きしない。
+
+    Args:
+        doc_type: **この頁を解析した種別**（`PageOcr.actual_doc_type`）。
+            上書きの可否は「その頁の券面がどういう書類か」で決まるので
+            folder doc_type ではなく actual が正しい。
+            **既定値を付けてはいけない** —— 書き忘れた新しい呼出側が黙って
+            上書き経路へ落ちる footgun になる（`SignatureTest` が固定）。
     """
     if not raw_data:
+        return
+
+    # 豁免判定は空判定の**後**に置く。先に置くと豁免 doc_type のときだけ
+    # truthy な非 dict が素通りし、非豁免経路（`raw_data.get()` が
+    # AttributeError）と扱いが非対称になる（実害は無いが理由も無い）。
+    if doc_type in _OCR_OVERRIDE_EXEMPT_DOC_TYPES:
         return
 
     ocr_date_raw = _extract_date_from_ocr(ocr_text) if ocr_text else None
@@ -2226,7 +2261,7 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
             memo=f"⚠ AI応答形式不正（{type(raw_data).__name__}）")
         return
 
-    _apply_ocr_overrides(raw_data, ocr_text, prefix)
+    _apply_ocr_overrides(doc_type, raw_data, ocr_text, prefix)
 
     # ── IP-401 T6: 社会保険料通知書は仕訳を一切作らない（§3.8）──
     # 封筒判定と違い entries の有無を見ない。Gemini はこの券面から堂々と
@@ -2341,6 +2376,12 @@ def _yield_line_mode_results(result, raw_data, ocr_text, prefix=""):
         return
     yield result
     # 提示行は明細の**後**。先に出すと取引No が「注記 → 明細」の順になる。
+    # `.get(..., "")` の既定値は T7 の豁免以降**効かない**（result["date"] は
+    # キーが在って値が None）。それでも `or ""` にしてはいけない ——
+    # `test_ocr_engine_line_shortage` が「提示行の日付 ≡ 明細 result の日付」
+    # という同一性を固定しており、片方だけ "" へ寄せると契約が割れる。
+    # 下流（sheets_output の B列 / `_write_unrecognized_row`）は両方とも
+    # `or ""` で吸うので、見える挙動は同じ。
     yield _blank_result(date=result.get("date", ""),
                         vendor=result.get("vendor", ""),
                         _unrecognized=True, memo=memo,

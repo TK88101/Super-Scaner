@@ -14,7 +14,7 @@ import io
 import os
 import sys
 import unittest
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout
 from datetime import datetime as _datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -955,11 +955,17 @@ class CreditOnlyAccountExemptionTest(unittest.TestCase):
             self.assertEqual(self._debit("未払金"), config.UNKNOWN_ACCOUNT)
 
 
-def _anomaly_calls(doc_type, payload):
+@contextmanager
+def _spying_on_anomalies():
     """`detect_anomalies` を**実物のまま**呼びつつ引数と戻り値を積む。
 
     mock で戻り値を差し替えると「行級 parent を渡している」ことしか測れず、
     抑制表が実際に効いているかが見えない。実物を通す。
+
+    `_anomaly_calls` は「flags だけ見たい」用の薄い包み。書かれた行も同時に
+    見たいテストは本 contextmanager を直接使い、中で `_capture` を呼ぶ
+    —— spy を各テストで手写しすると、`detect_anomalies` の署名や
+    `_capture` の戻り値が変わったとき直す箇所が N 個になる。
     """
     calls = []
     real = anomaly_detector.detect_anomalies
@@ -970,6 +976,12 @@ def _anomaly_calls(doc_type, payload):
         return flags
 
     with patch.object(anomaly_detector, "detect_anomalies", side_effect=_spy):
+        yield calls
+
+
+def _anomaly_calls(doc_type, payload):
+    """`_capture` を流し `[(parent, flag 型集合), ...]` を返す。"""
+    with _spying_on_anomalies() as calls:
         _capture(doc_type, payload)
     return calls
 
@@ -1058,6 +1070,61 @@ class RowLevelAnomalyTest(unittest.TestCase):
         calls = _anomaly_calls(DocType.RECEIPT, legacy)
         self.assertEqual((calls[0][0]["date"], calls[0][0]["vendor"]),
                          ("2026/08/01", "doc級の店"))
+
+
+
+class OcrOverrideExemptionReachesTheSheetTest(unittest.TestCase):
+    """T7: 豁免後の `date=None` が B列 空欄 ＋ `missing_date` の赤になること。
+
+    Plan: `docs/plans/2026-08-18-t7-ocr-override-exemption.md` §5 T7-4。
+
+    **後半が本質**。T7 の価値は「空欄になる」ことではなく「**人手確認へ回る**」
+    ことである。豁免前は `_apply_ocr_overrides` が doc 級 date に
+    「頁面で最後に読まれた日付」を書き込み、行の日付が空の entry はそこへ回帰する。
+    すると `anomaly_detector` の `missing_date` は `date_val` が truthy なので
+    **立たない** —— 誤った日付が赤タグ無しで帳簿に載る。豁免後は空欄になり、
+    赤（severity=high, col=1）が立って人が見る。
+
+    B列 `""` だけを断言すると、この「無音の誤り → 可視の空欄」という
+    転換そのものを測っていないことになる。
+    """
+
+    @staticmethod
+    def _rows_and_flags(entries_data):
+        """`append_entries` を流し `(書かれた行, [flag 型集合, ...])` を返す。
+
+        spy は `_spying_on_anomalies`（本ファイル共用）。手写しすると
+        `detect_anomalies` の署名が変わったとき直す箇所が増える。
+        """
+        with _spying_on_anomalies() as calls:
+            _, written, _, _ = _capture(DocType.CREDIT_CARD, entries_data)
+        return written, [types for _, types in calls]
+
+    def test_a_row_without_a_date_stays_empty_and_raises_missing_date(self):
+        # 豁免後の形: doc 級 date は None（キーが生えない）、行の日付も空
+        # （nimoca の月日が読めなかった行）。
+        payload = _card_payload([_card_entry(1200, "", "西鉄バス", "")])
+
+        written, flag_types = self._rows_and_flags(payload)
+
+        self.assertEqual(written[0][COL_DATE], "")
+        self.assertIn("missing_date", flag_types[0])
+        self.assertEqual(written[0][COL_TAG], UNRECOGNIZED_TAG)   # 赤系
+
+    def test_a_polluted_doc_level_date_would_silently_fill_the_row(self):
+        """対照: 豁免しないとどうなるか（T7 が防いでいるものの形）。
+
+        `_apply_ocr_overrides` が doc 級へ書き込む値を手で置いた payload。
+        B列 が埋まり、`missing_date` が**立たない** —— 帳簿には
+        「頁面で最後に読まれた日付」が赤タグ無しで載る。
+        """
+        payload = {**_card_payload([_card_entry(1200, "", "西鉄バス", "")]),
+                   "date": "2026/03/31"}
+
+        written, flag_types = self._rows_and_flags(payload)
+
+        self.assertEqual(written[0][COL_DATE], "2026/03/31")
+        self.assertNotIn("missing_date", flag_types[0])
 
 
 if __name__ == "__main__":
