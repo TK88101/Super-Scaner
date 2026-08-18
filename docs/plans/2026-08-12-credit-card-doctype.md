@@ -573,6 +573,20 @@ JCB の 3 行（9,238 / 3,494 / 1,578 円）が円貨額で記帳され、
 
 **DoD**: 新 doc_type で日付・T番号が上書きされない。既存 doc_type は不変。
 
+> **完了（2026-08-18）**。専用 Plan: `docs/plans/2026-08-18-t7-ocr-override-exemption.md`
+> —— 設計・Codex 2 ラウンドの辯論・実施記録・`/simcodex` 3 ラウンドの裁決が
+> 全部そこに在る。**再開時はまず §10 と §11 を読む**。
+>
+> 実装は `ocr_engine.py` の 3 箇所だけ（定数 `_OCR_OVERRIDE_EXEMPT_DOC_TYPES`、
+> `_apply_ocr_overrides` の署名＋ゲート、呼出 1 行）。`sheets_output` /
+> `card_entries` / `doc_types` / `main` は**無改造**。
+> 全量 1004 tests 緑。変異 6 種を全殺。対照群 2 ファイルは byte 無変更。
+>
+> **DoD を上回った点**: 豁免の是非を doc_type 追加時に明記させる台帳番人と、
+> 「上書きが走れば必ず値が載る」という**前提そのもの**を検査する
+> `_ProbeGuardedTest` を足した。後者は T番号側の断言が抽出器の成功に
+> 暗黙依存していた穴（実施後評審 P1-1）を塞ぐ。
+
 ### T8. 異常検知の行級化
 
 `detect_deduction_risks`（doc 級で 1 件に集約）、`_suppress_invoice_flags` 経路。
@@ -664,7 +678,7 @@ E2E 後に MF タブ・監査タブを CSV dump し、スクリプトで検証�
 | ファイル | 変更 | 既存への危険度 |
 |---|---|---|
 | `doc_types.py` | 定数・3 テーブル追加 | 低（追加のみ） |
-| `ocr_engine.py` | PROMPTS/ENTRY_BUILDERS、`_apply_ocr_overrides` 豁免（T7 未実施）、`_yield_page_results` 分岐、`_route_ocr_strategy` 署名変更、~~窓分割~~ → **截断サルベージの結線**（T5 で廃案・実体は `card_salvage.py`）、pipeline 接線 | **高**（署名変更が 7 箇所へ波及） |
+| `ocr_engine.py` | PROMPTS/ENTRY_BUILDERS、`_apply_ocr_overrides` 豁免（T7 完了）、`_yield_page_results` 分岐、`_route_ocr_strategy` 署名変更、~~窓分割~~ → **截断サルベージの結線**（T5 で廃案・実体は `card_salvage.py`）、pipeline 接線 | **高**（署名変更が 7 箇所へ波及） |
 | `sheets_output.py` | `line_mode` ゲート、取引No キャッシュ修正、`append_reconciliation_row` | **高**（本番の記帳経路） |
 | `anomaly_detector.py` | `_suppress_invoice_flags`、`detect_deduction_risks` | 中 |
 | `main.py` | 書込前ゲート、元帳結算 | 中 |
@@ -686,6 +700,11 @@ E2E 後に MF タブ・監査タブを CSV dump し、スクリプトで検証�
 > `docs/plans/2026-08-17-t4-card-prompts-builders.md` §0。
 >
 > 逆に言えば、**コードが main に入るだけなら安全**（ID が無い限り到達不能）。
+>
+> **2026-08-18 時点: T4 ＋ T6 ＋ T7 は 3 つとも完了・push 済 —— 条件は揃った。**
+> 解禁そのもの（1 と 3 の実施）は**趙の拍板**であり、コード側から行わない。
+> miniPC 側の `.env` にその 2 キーが無いことは、pull 後に趙が目視確認する
+> （こちらからは見えない）。
 
 ---
 
