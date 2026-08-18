@@ -98,6 +98,20 @@ class SchemaInvariantTest(unittest.TestCase):
                       cp.CREDIT_CARD_PROMPT)
         self.assertIn("rows に入れないでください", cp.TRANSIT_IC_PROMPT)
 
+    def test_rows_on_page_is_defined_as_the_row_count_not_the_ink_count(self):
+        """T5: 行欠け検出（`len(rows) < rows_on_page`）が成立する定義であること。
+
+        `rows_on_page` が「券面の印字行すべて」だと、rows が除外する合計行や
+        ポイント区画のぶん常に不足側へ振れ、健全な頁で提示行が出続ける。
+        逆に「取得できた数」へ寄せると検出が循環して意味を失うので、
+        **物理アンカー句も残っていること**を両方固定する。
+        """
+        for label, prompt in (("credit_card", cp.CREDIT_CARD_PROMPT),
+                              ("transit_ic", cp.TRANSIT_IC_PROMPT)):
+            with self.subTest(prompt=label):
+                self.assertIn("rows に入れるべき行の数", prompt)
+                self.assertIn("取得できた数ではなく券面に見えている数", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
