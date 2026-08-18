@@ -493,7 +493,7 @@ JCB の 3 行（9,238 / 3,494 / 1,578 円）が円貨額で記帳され、
 > —— **L列の結線 / `未払金` の `CREDIT_ONLY_ACCOUNTS` 豁免 / 占位行を書く /
 > 省略名変換** の 4 つで、どれも欠くと逐行記帳が帳簿上で壊れる。
 
-### T5. 出力切断の窓分割リトライ ＋ 行欠け検出
+### T5. 出力切断の窓分割リトライ ＋ 行欠け検出【窓分割は廃案 → 下記】
 
 プロンプトに `rows_on_page`（この頁の印字明細行数）を出力させ、
 取得行数と突合する。不足または `finish_reason == MAX_TOKENS` なら
@@ -503,6 +503,37 @@ JCB の 3 行（9,238 / 3,494 / 1,578 円）が円貨額で記帳され、
 **DoD**: ETC 100 行フィクスチャで切断をシミュレートし、
 (a) 窓分割で全行が揃うこと、(b) それでも欠けたら赤系マークが立ち
 **黙って少ない行数で成功にしない**こと、(c) 窓数上限で無限ループしないこと。
+
+> **実施 Plan は `docs/plans/2026-08-17-t5-window-retry.md`**（2026-08-18 完了。
+> Codex 対抗評審 3 往復 ＋ 4 視角 cleanup panel 2 ラウンド）。
+> **上の本文は起案時の記録**であって現行設計ではない —— 窓分割は**設計ごと廃案**。
+>
+> **廃案の理由**: この節が前提にした「1 頁 300 行」は、事実台帳
+> `2026-08-12-credit-card-sample-facts.md:107` の
+> 「1 頁 60〜100 行 → **計** 250〜300 行」を**カード単位（4 頁の合計）から
+> 頁単位へ読み違えた**もの。頁単位の実測最悪は 100 行で、`prompt` は
+> 「1 ページ分」（`card_prompts.py:140`）＝ 1 呼出 1 頁である。
+> 出力上限を硬上限 65,536 にすれば約 305 行/頁まで無分割で入る（実測 134 tok/行）
+> ので、**実物では窓分割が一度も発火しない**。発火しないコードは検証不能な
+> 死蔵経路になるため作らない。評審はさらに 9 件の設計欠陥を挙げた（同 Plan §9.2）
+> —— 最も重いのは `line_no` がマージキーとして成立しないこと（Gemini が
+> 「1 から」振る通番なので、窓 2 が新規 40 行に 1〜40 を振り直せば先勝ちマージが
+> 全部捨てる）。
+>
+> **代わりに実装したもの**（`card_salvage.py` 新設 ＋ `ocr_engine` 結線）:
+> ① `GEMINI_MAX_OUTPUT_TOKENS_BULK = 65536` を `line_mode` doc_type にだけ結線、
+> ② 截断応答から**完結した行だけ**を回収するサルベージ解析（schema は `rows` が
+> 最後なので、切れた応答にも `rows_on_page` と完結行が N 個残っている。Gemini を
+> 1 度も追加で叩かない）、③ 行欠け検出と痕跡（MF 金額 0 提示行 ＋ 監査タブ 1 行）。
+>
+> **DoD の達成形**: (a) は「窓分割で揃える」ではなく**そもそも切れない**（3 倍の
+> 余裕）＋ 切れても完結行を救う、で達成。(b)(c) は字義どおり達成 —— (c) の
+> 無限ループ対策は窓数上限ではなく「截断は決定的失敗なので `_page_error` ではなく
+> `_unrecognized` に倒して歸檔する」形（`_page_error` だとファイル保持 → 3 秒ごとの
+> 永久再試行になる）。
+>
+> `sheets_output.py` / `main.py` / `card_entries.py` は**無改造**。
+> 実施記録・残件は同 Plan §11。
 
 ### T6. `sheets_output` の `line_mode` ゲート（AD-6）
 
@@ -592,7 +623,7 @@ E2E 後に MF タブ・監査タブを CSV dump し、スクリプトで検証�
 | ファイル | 変更 | 既存への危険度 |
 |---|---|---|
 | `doc_types.py` | 定数・3 テーブル追加 | 低（追加のみ） |
-| `ocr_engine.py` | PROMPTS/ENTRY_BUILDERS、`_apply_ocr_overrides` 豁免、`_yield_page_results` 分岐、`_route_ocr_strategy` 署名変更、窓分割、pipeline 接線 | **高**（署名変更が 7 箇所へ波及） |
+| `ocr_engine.py` | PROMPTS/ENTRY_BUILDERS、`_apply_ocr_overrides` 豁免（T7 未実施）、`_yield_page_results` 分岐、`_route_ocr_strategy` 署名変更、~~窓分割~~ → **截断サルベージの結線**（T5 で廃案・実体は `card_salvage.py`）、pipeline 接線 | **高**（署名変更が 7 箇所へ波及） |
 | `sheets_output.py` | `line_mode` ゲート、取引No キャッシュ修正、`append_reconciliation_row` | **高**（本番の記帳経路） |
 | `anomaly_detector.py` | `_suppress_invoice_flags`、`detect_deduction_risks` | 中 |
 | `main.py` | 書込前ゲート、元帳結算 | 中 |
