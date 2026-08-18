@@ -17,6 +17,7 @@
 テストとして拾わせないため。
 """
 import contextlib
+import json
 import os
 import tempfile
 
@@ -62,6 +63,10 @@ def ic_rows(n, amount=260):
 # 「明細相加 = 印字合計」が成立することを確認済みの数字である。
 
 
+# ETC 明細行の note（券面の逐語）。AMEX_A_P1_RAW と etc_rows_raw が共有する。
+_ETC_NOTE = "ETC NO : XX-XXXX-XXXX-XXX0-6684-X 入：野芥西 出：野芥西"
+
+
 def _cc_row(line_no, date, merchant, amount, **extra):
     """クレカ明細 1 行。省略したフィールドは prompt の既定形に合わせる。"""
     row = {
@@ -94,7 +99,7 @@ AMEX_A_P1_RAW = {
     "rows_on_page": 4, "total_amount": 17295,
     "rows": [
         _cc_row(i + 1, "2026/04/%02d" % (10 + i), "福北高速 ＥＴＣ後納分", 630,
-                note="ETC NO : XX-XXXX-XXXX-XXX0-6684-X 入：野芥西 出：野芥西")
+                note=_ETC_NOTE)
         for i in range(4)
     ],
 }
@@ -243,6 +248,82 @@ AMEX_B_RETURN_RAW = {
     "rows": [_cc_row(1, "2026/05/16", "サンプル物産 返品", "−1,200", sec=1)],
     "rows_on_page": 1,
 }
+
+
+# T5: 截断サルベージ用の大型標本。**関数**にしてあるのは、100 行を
+# module-level 定数にすると venv 非依存経路（`python3 -m unittest test_page_family`）
+# の import ごとに 100 dict を組み立てることになるため。
+#
+# 本関数は**純データ関数**（引数 → dict。副作用・遅延 import なし）に限定する。
+# `test_dependency_weight` の番人は関数本体の import を意図的に見ない（呼ばれる
+# まで実行されないため）ので、ここだけは規約で縛るしかない。
+
+
+def etc_rows_raw(n, section_at=50, fx_at=(7, 63)):
+    """ETC 明細 n 行の raw_data。**区画切替と外貨行を必ず含む**。
+
+    全行同質だと「サルベージが sec を落とす」「外貨を円貨に昇格させる」種の
+    変異が生き残る（T5 Plan §4 T5-1、AD-10）。
+
+    Args:
+        n: 明細行数（`rows_on_page` と `printed_totals[].count` も n になる）
+        section_at: この `line_no` 以降が第 2 区画（`sec=1`）
+        fx_at: 外貨行にする `line_no` の集合
+
+    キーの並びは prompt schema と同じく **`rows` が最後**（T5 Plan V1）。
+    サルベージは「截断しても先頭側の top 級が残る」ことに依存するので、
+    この順序自体が標本の検証対象である。
+    """
+    fx_set = set(fx_at)
+    rows = []
+    for i in range(n):
+        line_no = i + 1
+        sec = 1 if line_no >= section_at else 0
+        date = "2026/04/%02d" % ((i % 28) + 1)
+        if line_no in fx_set:
+            # 外貨行の正本は JCB_FX_RAW（円貨・外貨・レートの組が黄金値）
+            rows.append({**JCB_FX_RAW["rows"][0],
+                         "line_no": line_no, "date": date, "sec": sec})
+        else:
+            rows.append(_cc_row(line_no, date, "福北高速 ＥＴＣ後納分", 630,
+                                sec=sec, note=_ETC_NOTE))
+    total = sum(r["amount"] for r in rows)
+    return {
+        # card の正本は ENEOS_P2_RAW。頁番号と券種だけを ETC 用に差し替える
+        "card": {**ENEOS_P2_RAW["card"],
+                 "statement_page": "2/5",
+                 "card_name": "ＥＮＥＯＳ ＢＵＳＩＮＥＳＳ ＥＴＣカード",
+                 "account_hint": "高速代として"},
+        "sections": [
+            {"index": 0, "label": "今月ご利用額",
+             "subtotal": sum(r["amount"] for r in rows if r["sec"] == 0)},
+            {"index": 1, "label": "ＥＴＣご利用分",
+             "subtotal": sum(r["amount"] for r in rows if r["sec"] == 1)},
+        ],
+        "printed_totals": [{"label": "今月ご利用額合計", "amount": total,
+                            "count": n, "page": 2, "is_handwritten": False}],
+        "rows_on_page": n,
+        "total_amount": total,
+        "rows": rows,
+    }
+
+
+def etc_rows_truncated_text(rows_kept, total=100):
+    """`etc_rows_raw(total)` の JSON を rows_kept 行の直後で切ったテキスト。
+
+    「どこで切るか」は `_cc_row` のキー順と `json.dumps` の空白に逐字で
+    依存する。各テストが自前で `text.index('{"line_no": N')` を書くと、
+    標本の形が変わったとき片方だけ落ちる（あるいは意図と違う位置で切れても
+    誰も気づかない）ので、切り方の定義は標本と同じ場所に置く。
+    """
+    text = json.dumps(etc_rows_raw(total), ensure_ascii=False)
+    return text[:text.index('{"line_no": %d' % (rows_kept + 1))]
+
+
+def etc_rows_text_before_rows(total=100):
+    """`rows` 配列に一度も到達せずに切れたテキスト（top 級だけが残る形）。"""
+    text = json.dumps(etc_rows_raw(total), ensure_ascii=False)
+    return text[:text.index('"rows": [')]
 
 
 def _ic_row(line_no, month_day, category, amount, place_from="", place_to=""):
