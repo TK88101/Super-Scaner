@@ -207,8 +207,10 @@ class TabDoesNotSplitAcrossOneFileTest(unittest.TestCase):
 
     def test_result_doc_type_is_the_builder_doc_type(self):
         # Arrange: payload 内部の result["doc_type"] は builder 側の値になる。
-        # 無消費の键だが、T9 で main を触る人が「フォルダ種別」と誤読して
-        # タブ選択に使う事故を防ぐため、意味をここで固定しておく。
+        # T6 以降 sheets_output が異常検知の抑制でこの键を読むので（混載
+        # nimoca の橙を抑えるのに folder ではなく実種別が要る）、意味が
+        # ずれると抑制が無音で漏れる。「フォルダ種別」と誤読してタブ選択に
+        # 使う事故も併せて防ぐため、意味をここで固定しておく。
         with _mixed_folder_run() as (path, _cross):
             # Act
             pages = list(ocr_engine.process_pipeline(

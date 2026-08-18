@@ -26,7 +26,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 import main
 import ocr_engine
 import page_progress
-from sheets_output import APPEND_RESULT_PLACEHOLDER, APPEND_RESULT_POSTED
+from sheets_output import (APPEND_RESULT_PLACEHOLDER, APPEND_RESULT_POSTED,
+                           is_bookable_row)
 from doc_types import DocType
 
 
@@ -469,23 +470,23 @@ class _AmountAwareWriter(_RecordingWriter):
     1 物理頁から明細 result と提示行 result の 2 件が来るので、固定戻り値の
     `_ReturnControlledWriter` では POSTED と PLACEHOLDER を撃ち分けられない。
 
-    判定式は本物（`sheets_output.py` の `append_entries` 冒頭、
-    `if not amount or int(amount) == 0: continue` ＋ 行が 1 つも残らなければ
-    `_write_unrecognized_row` → `APPEND_RESULT_PLACEHOLDER`）を**逐字で**写す。
+    判定式は本物（`sheets_output.is_bookable_row` ＋ 行が 1 つも残らなければ
+    `_write_unrecognized_row` → `APPEND_RESULT_PLACEHOLDER`）を**共有**する。
     `any(entry.get("amount"))` のような近似だと `amount="0"` や `0.4` で
     本物と分岐が割れ、「行欠け頁が POSTED に化けない」ことを測るはずの物差しが
-    別の契約を測ることになる。本物の述語は `append_entries` の中段に埋まって
-    いて再利用できないため、写す以外に手が無い（共有は T6 で
-    `sheets_output.py` に触るときに解消する）。
+    別の契約を測ることになる。
+
+    T5 の時点では本物の述語が `append_entries` の中段に埋まっていて再利用でき
+    ず、逐字で写す以外に手が無かった（T5 Plan §11.4 の申し送り）。T6-1 で
+    純関数へ抽出したので、写しを捨てて本物を直接呼ぶ。
     """
 
     def append_entries(self, employee_name, doc_type, entries_data, source_url):
         super().append_entries(employee_name, doc_type, entries_data, source_url)
+        line_mode = bool(entries_data.get("line_mode"))
         for entry in entries_data.get("entries") or []:
-            amount = entry.get("amount")
-            if not amount or int(amount) == 0:
-                continue
-            return APPEND_RESULT_POSTED
+            if is_bookable_row(entry, line_mode=line_mode):
+                return APPEND_RESULT_POSTED
         return APPEND_RESULT_PLACEHOLDER
 
 

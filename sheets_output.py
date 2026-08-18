@@ -2,9 +2,10 @@
 import re
 import time
 import gspread
+import invoice_classification
 from gspread_formatting import CellFormat, Color, format_cell_range, format_cell_ranges, Border, Borders
 from datetime import datetime, timezone, timedelta
-from doc_types import DocType
+from doc_types import DOC_TYPE_CONFIG, DocType, LINE_MODE_DOC_TYPES
 from tag_rules import derive_row_tags, UNRECOGNIZED_TAG
 
 JST = timezone(timedelta(hours=9))
@@ -71,6 +72,53 @@ APPEND_RESULT_PLACEHOLDER = "placeholder"
 # 跨ぐと Google が新規行に直前行の書式を継承し、標色された最終行の色が空尾行へ
 # 伝染する。書き込み前に add_rows で空きバッファを確保し、自動拡容自体を起こさない。
 GRID_ROW_BUFFER = 200
+
+
+def is_bookable_row(entry, line_mode=False):
+    """この entry を MF の 1 行として書くか（append_entries の記帳可否判定）。
+
+    純関数として切り出してあるのは、`test_main_process_file._AmountAwareWriter`
+    がこの判定を**逐字で写して**持っていたため（T5 Plan §11.4）。写しは本物と
+    分岐が割れうる——`amount="0"` や `0.4` で挙動が分かれると、「行欠け頁が
+    POSTED に化けない」ことを測るはずの物差しが別の契約を測ることになる。
+
+    **非 line_mode は現行式と逐字等価**（`not amount or int(amount) == 0` の否定）。
+    短絡位置まで同じにしてあるので、非数値で `ValueError` が飛ぶ位置も変わらない。
+    ここに防御を足してはいけない: 既存 doc_type が汚いデータに当たったときの
+    挙動が変わり、しかも golden（きれいなデータ）では検出できない差分になる。
+
+    **line_mode は金額 0 の占位 entry も書く**（Plan AD-T4-8）。
+    `card_entries._placeholder` が作る外貨占位行・要確認行を無音で落とさないため。
+    ただし `amount` 欠損・`None` は通さない——後段の `int(amount)` が落ちるか、
+    producer の契約違反がそのまま帳簿になる。
+    """
+    if line_mode:
+        return entry.get("amount") is not None
+    amount = entry.get("amount")
+    return bool(amount) and int(amount) != 0
+
+
+def _resolve_invoice_cell(entry):
+    """H列（借方インボイス）の値。逐行記帳の entry 専用（AD-8）。
+
+    判定木は `invoice_classification` の 1 箇所だけに置く。ここで再判定すると
+    「摘要には控除不可と書いてあるが H列は適格」のような**自己矛盾した行**が
+    作れてしまう。producer（`card_entries._build`）が entry に載せた
+    `_deduction`（`DeductionVerdict`）をレンダリングするだけにする。
+
+    `_deduction` が無い / `None` は判定を通っていない行（占位行・ポイント
+    充当行）。空文字にする —— 判定していないことを「適格」とも「控除なし」
+    とも名乗らせない。
+
+    現行 `config.INVOICE_COL_RENDERING` は全値が空文字（事務所慣例の踏襲）
+    なので本関数は常時空文字を返す。**結線していなくても結果が同じ**なので、
+    テストは config を非空へ差し替える層と本関数を mock する層の二重で
+    縛ってある（`test_sheets_output_line_mode.InvoiceColumnResolverTest`）。
+    """
+    verdict = entry.get("_deduction")
+    if verdict is None:
+        return ""
+    return invoice_classification.render_invoice_column(verdict)
 
 
 def _build_description(doc_type, vendor_name, item_description):
@@ -208,8 +256,23 @@ class SheetsOutputWriter:
         except Exception as e:
             print(f"⚠️ 分割線書き込み失敗: {e}")
 
-        # 取引No を 1 にリセット
-        self._tab_next_txn[tab_name] = 1
+        # 取引No の扱いはファイル境界の語義で分かれる（Plan §3.4.1）。
+        #
+        # 既存 doc_type: 1 ファイル = 1 取引（複数行は複合仕訳）。ファイルごとに
+        #   1 から振り直すのがその語義の帰結。**1 文字も変えない**。
+        # 逐行記帳: 1 明細行 = 1 **独立**取引。1 に戻すと、次のカード明細ファイルの
+        #   100 行が前のファイルと同じ 1..100 を名乗る。独立取引の識別子がタブ内で
+        #   衝突してよい理由が無いので、キャッシュを捨てて次回実測させる
+        #   （既存表の A列 max+1 から続く）。
+        #
+        # 判定に使うのは **folder doc_type**（本メソッドの引数）。`append_entries`
+        # 側が actual doc_type を見るのとは逆だが、本メソッドは 1 頁目の OCR より
+        # 前に呼ばれるので actual はまだ存在しない。かつタブは folder doc_type で
+        # 決まる（AD-T3-1）ので、採番の単位もタブと同じ folder 側で揃うのが正しい。
+        if doc_type in LINE_MODE_DOC_TYPES:
+            self._tab_next_txn.pop(tab_name, None)
+        else:
+            self._tab_next_txn[tab_name] = 1
 
     def append_entries(self, employee_name, doc_type, entries_data, source_url=""):
         """
@@ -224,7 +287,8 @@ class SheetsOutputWriter:
         from doc_types import DOC_TYPE_TAB_SUFFIX
         from config import (ACCOUNT_MAP, UNKNOWN_ACCOUNT,
                             CREDIT_SUB_ACCOUNT_RECEIPT, CREDIT_ONLY_ACCOUNTS,
-                            DOC_LOW_CONFIDENCE_THRESHOLD)
+                            DOC_LOW_CONFIDENCE_THRESHOLD,
+                            CC_TAX_TYPE_RENDERING)
         from anomaly_detector import (detect_anomalies,
                                       detect_document_anomalies,
                                       detect_outlier_exempt_rows,
@@ -237,6 +301,23 @@ class SheetsOutputWriter:
 
         entries = entries_data.get("entries", [])
 
+        # ── 逐行記帳の明示ゲート（Plan AD-6）──
+        # producer（`ocr_engine._build_doc_result`）が新 doc_type にだけ立てる。
+        # 既存 doc_type はキー自体を持たないので None（falsy）になり、以降の
+        # 分岐に 1 つも入らない。「既存不変」を宣言ではなく構造で保証する。
+        line_mode = bool(entries_data.get("line_mode"))
+
+        # 逐行記帳の借方に立つのが正しい唯一の貸方専用科目（AD-5 / T4 §10-②）。
+        # ポイント充当行は「借方 未払金 / 貸方 雑収入」でカード未払金を直接
+        # 減らす。下の兜底（貸方専用科目が借方に出たら未確定勘定へ倒す）に
+        # 掛かると負債が減らないまま `未確定勘定` が積み上がる。
+        # 文字列は直書きせず `DOC_TYPE_CONFIG` から引く —— 貸方科目の裁定が
+        # 変わったとき、豁免だけが古い語を掴んで無音でずれるのを避ける。
+        # 既存 doc_type は `""` なので、どの科目とも一致せず兜底は不変。
+        exempt_credit_only = (
+            DOC_TYPE_CONFIG.get(doc_type, {}).get("default_credit", "")
+            if line_mode else "")
+
         uploader_name = entries_data.get('uploader', employee_name)
         invoice_num = _sanitize_invoice_num(entries_data.get('invoice_num', ''))
         vendor_name = entries_data.get('vendor', '')
@@ -247,9 +328,10 @@ class SheetsOutputWriter:
         anomaly_flags_list = []
 
         for entry in entries:
-            amount = entry.get("amount")
-            if not amount or int(amount) == 0:
+            # 記帳可否は純関数へ委譲（T5 §11.4: テスト側の手写しと共有するため）
+            if not is_bookable_row(entry, line_mode=line_mode):
                 continue
+            amount = entry.get("amount")
 
             # 科目マッピング（マップにない未知科目は「未確定勘定」）
             debit_account = entry.get("debit_account", "")
@@ -257,7 +339,9 @@ class SheetsOutputWriter:
             if not debit_account:
                 debit_account = UNKNOWN_ACCOUNT
             # 貸方専用科目が借方に出現した場合は未確定勘定に置換
-            if debit_account in CREDIT_ONLY_ACCOUNTS:
+            # （逐行記帳の `default_credit` 1 語だけ豁免。上の注記を参照）
+            if (debit_account in CREDIT_ONLY_ACCOUNTS
+                    and debit_account != exempt_credit_only):
                 debit_account = UNKNOWN_ACCOUNT
 
             credit_account = entry.get("credit_account", "")
@@ -267,19 +351,65 @@ class SheetsOutputWriter:
 
             now_jst = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
 
+            # ── 行級化（AD-6 の列対照表）──
+            # line_mode は「1 明細行 = 1 独立取引」。取引No は行ごとに連番、
+            # 取引日・取引先・仕訳メモは doc 級ではなく行から取る。
+            # len(rows) は「この entry の 0 始まり行番号」（まだ append 前）。
+            if line_mode:
+                row_txn_no = transaction_no + len(rows)
+                row_date = entry.get("date") or entries_data.get("date") or ""
+                row_vendor = entry.get("debit_vendor", "")
+                row_memo = entry.get("memo", "")
+            else:
+                row_txn_no = transaction_no
+                row_date = entries_data.get("date", "")
+                row_vendor = vendor_name
+                row_memo = memo
+
+            # G列は省略名で書く（AD-11 / T4 §10-④）。MF の列幅では canonical
+            # 名が読めないため。**表示だけ**の変換であって、下の
+            # `mapped_entry` は canonical のまま detector へ渡す —— 省略名を
+            # 判定側へ流すと `EXEMPT_TAX_TYPE` 等の精確等値が無音でずれる。
+            # `対象外` は変換表に載っていないので不変（表に足してはいけない）。
+            debit_tax_type = entry.get("debit_tax_type", "")
+            if line_mode:
+                debit_tax_type = CC_TAX_TYPE_RENDERING.get(debit_tax_type,
+                                                           debit_tax_type)
+
+            # H列は逐行記帳だけ経路が違う（AD-8）。既存 doc_type は doc 級
+            # T番号を継ぐが、カード明細でそれをやると 300 行すべてが
+            # カード会社の登録番号を「加盟店のもの」として騙る。
+            if line_mode:
+                debit_invoice = _resolve_invoice_cell(entry)
+            else:
+                debit_invoice = _sanitize_invoice_num(
+                    entry.get("debit_invoice", invoice_num))
+
+            # L列は逐行記帳だけ結線する（AD-11 / T4 §10-①）。カード債務の
+            # 相手はカード会社なので補助科目にカード名が要る。既存
+            # doc_type で呼ぶと receipt の L列が空欄から社長名へ、
+            # purchase_invoice が取引先名へ**黙って変わる** —— 顧客の既存
+            # 帳簿の見た目を変える改修は T6 の依頼ではない。
+            # 引数の folder doc_type を渡してよい: credit_card /
+            # transit_ic はどちらも「その他」分岐に落ちるので混載でも同値。
+            credit_sub_account = (
+                self._determine_credit_sub_account(doc_type, entry,
+                                                   vendor_name)
+                if line_mode else "")
+
             row = [
-                transaction_no,
-                entries_data.get("date", ""),
+                row_txn_no,
+                row_date,
                 debit_account,
                 "",                                             # 借方補助科目（空白）
                 "",                                             # 借方部門
-                vendor_name,
-                entry.get("debit_tax_type", ""),
-                _sanitize_invoice_num(entry.get("debit_invoice", invoice_num)),
+                row_vendor,
+                debit_tax_type,
+                debit_invoice,
                 int(amount),
                 entry.get("debit_tax_amount", ""),
                 credit_account,
-                "",                                             # 貸方補助科目（空白）
+                credit_sub_account,             # 貸方補助科目（既存は空白）
                 "",                                             # 貸方部門
                 entry.get("credit_vendor", ""),
                 entry.get("credit_tax_type", "対象外"),
@@ -287,7 +417,7 @@ class SheetsOutputWriter:
                 entry.get("credit_amount", int(amount)),
                 entry.get("credit_tax_amount", ""),
                 description,
-                memo,
+                row_memo,
                 "",                                             # タグ
                 "",                                             # MF仕訳タイプ
                 "",                                             # 決算整理仕訳
@@ -300,9 +430,17 @@ class SheetsOutputWriter:
             rows.append(row)
 
             # 異常検出（実際に書き込む値で判定）
-            actual_invoice = _sanitize_invoice_num(entry.get("debit_invoice", invoice_num))
             mapped_entry = {**entry, "debit_account": debit_account}
-            actual_parent = {**entries_data, "invoice_num": actual_invoice}
+            # 逐行記帳は parent も行級にする（AD-6 / Plan §3.8）。カード明細の
+            # raw_data には doc 級 date / vendor が存在しないので、doc 級のまま
+            # 渡すと**全行**に赤（B列）＋橙（F列）が付く。300 行の ETC 明細で
+            # 数百個のタグが立てば、AD-7 が守ろうとした色の信号価値が消える。
+            # `doc_type` キーは entries_data 由来のまま引き継ぐ（＝ actual
+            # doc_type）。検知器側の抑制表がこれで券種を見る（§3.2）。
+            row_level = ({"date": row_date, "vendor": row_vendor}
+                         if line_mode else {})
+            actual_parent = {**entries_data, "invoice_num": debit_invoice,
+                             **row_level}
             flags = detect_anomalies(mapped_entry, actual_parent)
             if flags:
                 anomaly_flags_list.append((len(rows) - 1, flags))
@@ -383,8 +521,10 @@ class SheetsOutputWriter:
         def _read_ensure_and_write(target_ws):
             actual_txn_no = self._get_next_txn_no(tab_name, target_ws)
             if actual_txn_no != transaction_no:
-                for row in rows:
-                    row[0] = actual_txn_no
+                # line_mode は 1 行 = 1 取引なので N 連番を一括で振り直す。
+                # 全行同じ番号にすると復旧後だけ複合仕訳に化ける。
+                for i, row in enumerate(rows):
+                    row[0] = actual_txn_no + i if line_mode else actual_txn_no
                 print(f"🔧 tab 復旧に伴い取引No を再採番: {transaction_no} → {actual_txn_no}")
             count = len(target_ws.get_all_values())
             # 自動拡容バグ対策: append が境界を跨ぐ前に空きバッファを確保し、
@@ -400,7 +540,13 @@ class SheetsOutputWriter:
         # 書込成功後に一度だけ実行——fn に入れるとローカル状態が二重更新される）。
         # actual_txn_no を使う（transaction_no ではない）: 復旧が起きていれば
         # 新表の実測値が正で、旧表基準の transaction_no を使うと欠番/誤番になる。
-        self._tab_next_txn[tab_name] = actual_txn_no + 1
+        #
+        # 消費した個数だけ進める。line_mode は 1 回の append で N 個消費するので
+        # `+1` のままだと 2 回目の append が 2 番から始まり **取引No が重複する**
+        # （AD-6 の Codex P0 指摘・実在バグ）。逆に既存 doc_type を
+        # `+ len(rows)` にすると複合仕訳の分だけ番号が飛ぶので、必ず条件付き。
+        self._tab_next_txn[tab_name] = actual_txn_no + (
+            len(rows) if line_mode else 1)
 
         start_row = pre_write_count + 1
         end_row = start_row + len(rows) - 1

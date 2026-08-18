@@ -15,7 +15,7 @@ except ImportError:
     vision = None
 from dotenv import load_dotenv
 from doc_types import (DocType, DOC_TYPE_CONFIG, DOC_TYPE_TAB_SUFFIX,
-                       ENV_FOLDER_MAP)
+                       ENV_FOLDER_MAP, LINE_MODE_DOC_TYPES)
 # 純関数モジュール（gspread / paddleocr 非依存）。依存は単方向で、
 # page_family 側は ocr_engine を import しない（定数は複製し、乖離は
 # test_page_family の突合テストが検出する）。
@@ -1806,11 +1806,15 @@ ENTRY_BUILDERS = {
 }
 
 # 逐行記帳（1 明細 = 1 仕訳）を行う doc_type。`_build_doc_result` が
-# result dict に `line_mode` を立て、T6 の `sheets_output` がそれを見て
-# A/B/F/T/H 列を行級へ切り替える（AD-6 の明示ゲート）。
+# result dict に `line_mode` を立て、`sheets_output` がそれを見て
+# A/B/F/G/H/L/T 列を行級へ切り替える（AD-6 の明示ゲート）。
 # **既存 doc_type にはキー自体を書かない** —— `entries_data.get("line_mode")`
 # は None（falsy）になり、既存の row は 1 バイトも変わらない。
-LINE_MODE_DOC_TYPES = frozenset({DocType.CREDIT_CARD, DocType.TRANSIT_IC})
+#
+# 実体は `doc_types` に置いてある（T6）。producer の本モジュールと
+# consumer の `sheets_output` が同じ集合を見る必要があり、`sheets_output` に
+# 本モジュールを import させると google.generativeai まで引き込むため。
+# ここは後方互換の再公開（既存の参照経路を壊さない）。
 
 
 def _is_line_mode(doc_type):
@@ -1875,8 +1879,13 @@ def _build_doc_result(doc_type, raw_data, entries):
     刻む `result["doc_type"]` は **この頁を解析した種別**（T3 以降。混載
     フォルダでは folder doc_type と異なりうる）。**タブ選択に使ってはいけない**
     —— タブは 1 ファイル 1 つに保つため `main` が渡す folder doc_type で
-    決まる（AD-T3-1）。現在この键の読み手は居らず、
-    `test_ocr_engine_mixed_folder` が意味と不使用の両方を固定している。
+    決まる（AD-T3-1）。`test_ocr_engine_mixed_folder` が意味を固定している。
+
+    **消費者（T6 以降）**: `sheets_output.append_entries` が異常検知の抑制で
+    この键を読む（行級 parent へそのまま引き継ぐ）。混載フォルダでは
+    nimoca の頁が `doc_type=credit_card` として `append_entries` に到達する
+    ため、引数の folder doc_type で券種を判定すると抑制が漏れる。
+    よってこの键は「頁の実際の種別」であり続けなければならない。
     """
     vendor = raw_data.get("vendor", "")
     if doc_type == DocType.SALARY_SLIP:

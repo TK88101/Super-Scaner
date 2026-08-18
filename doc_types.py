@@ -96,3 +96,18 @@ ENV_FOLDER_MAP = {
     "FOLDER_CREDIT_CARD_ID": DocType.CREDIT_CARD,
     "FOLDER_TRANSIT_IC_ID": DocType.TRANSIT_IC,
 }
+
+
+# 逐行記帳（1 明細 = 1 独立取引）を行う doc_type。
+#
+# **本モジュールに置く理由**: 読み手が `ocr_engine`（producer 側。予算・
+# サルベージ・行欠け検出の可否）と `sheets_output`（consumer 側。取引No の
+# 採番単位）に分かれるため。`ocr_engine` 側に置いたままだと
+# `sheets_output` が google.generativeai まで引き込むことになる。
+# 複製して突合テストで縛る手もあるが（`page_family` の EXCLUDE_DEST_* が
+# その形）、あれは「venv 非依存を保つ」ための妥協であって、両者とも本
+# モジュールを既に import している以上ここで複製する理由が無い。
+#
+# 既存 doc_type をこの集合に入れてはいけない —— 取引No の採番語義
+# （1 ファイル = 1 取引 か、1 明細行 = 1 取引 か）が変わる。
+LINE_MODE_DOC_TYPES = frozenset({DocType.CREDIT_CARD, DocType.TRANSIT_IC})

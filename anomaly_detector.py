@@ -1,7 +1,32 @@
 # anomaly_detector.py — 異常検出モジュール
 import re
 from config import UNKNOWN_ACCOUNT
+from doc_types import DocType
 from receipt_aggregation import coerce_tax_amount, TOTAL_MISMATCH_TOLERANCE_YEN
+
+
+# ── 逐行記帳 doc_type の「構造的な空欄」（Plan T6 §3.8・趙裁定 2026-08-18）──
+#
+# カード明細 / 交通系IC は 1 明細行 = 1 独立取引で、doc 級の取引先も T番号も
+# 券面に存在しない。既存の空欄チェックをそのまま当てると 300 行の明細で
+# 数百個のタグが立ち、AD-7 が守ろうとした「色の信号価値」が消える。
+#
+# 表に載っていない doc_type（既存 4 種）と `doc_type` キーを持たない旧経路・
+# 占位経路（`None`）は 1 つも成立しないので、既存の挙動は 1 バイトも動かない。
+#
+# `missing_vendor` は **transit_ic だけ**抑制する。nimoca の券面には店名欄が
+# 構造的に無い（`card_prompts.py` が merchant を「空文字でよい」と定義）＝
+# producer 契約上の空。クレカは merchant を「利用店名・摘要の主行」として
+# 要求しているので、空＝読み落とし＝人に見せるべき異常。同じ「空」でも
+# 意味が違うため抑制範囲を分ける。
+_VENDOR_OPTIONAL_DOC_TYPES = frozenset({DocType.TRANSIT_IC})
+
+# H列は両方とも空欄が正（AD-8）。加盟店の登録番号はカード明細に構造的に
+# 存在しない（F-11 / F-14）。形式不正も咎めない —— H列は
+# `sheets_output._resolve_invoice_cell` が返す判定結果のレンダリングであって
+# OCR が拾った生文字列ではないため、形式検査の対象そのものが無い。
+_INVOICE_OPTIONAL_DOC_TYPES = frozenset({DocType.CREDIT_CARD,
+                                         DocType.TRANSIT_IC})
 
 
 def detect_anomalies(entry, parent_data=None):
@@ -97,9 +122,10 @@ def detect_anomalies(entry, parent_data=None):
             "col": 1,
         })
 
-    # 取引先が空
+    # 取引先が空（逐行記帳の一部は構造的に空。冒頭の抑制表を参照）
+    doc_type = parent_data.get("doc_type")
     vendor = parent_data.get("vendor", "")
-    if not vendor:
+    if not vendor and doc_type not in _VENDOR_OPTIONAL_DOC_TYPES:
         flags.append({
             "type": "missing_vendor",
             "message": "取引先が空です",
@@ -109,7 +135,9 @@ def detect_anomalies(entry, parent_data=None):
 
     # T番号が空（適格請求書なし）
     raw_invoice = parent_data.get("invoice_num", "")
-    if not raw_invoice or not raw_invoice.strip():
+    if doc_type in _INVOICE_OPTIONAL_DOC_TYPES:
+        pass                      # H列は空欄が正（冒頭の抑制表を参照）
+    elif not raw_invoice or not raw_invoice.strip():
         flags.append({
             "type": "missing_invoice",
             "message": "T番号が空です",
