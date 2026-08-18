@@ -179,39 +179,80 @@ class UnwiredItemsTest(unittest.TestCase):
     # `_line_generation_config` が読み、`test_ocr_engine_line_budget` が
     # 「BULK=0 が予算 0 として SDK へ渡らない」ところまで固定している）。
     # 窓 2 項は廃案で config ごと削除（`RetiredItemsTest`）。
-    # `CC_TAX_TYPE_RENDERING` は**意図的に残す** —— builder は canonical の
-    # 税区分を出し、省略名への変換は T6 の出力層で行う（AD-11）。
-    UNWIRED = ("CC_TAX_TYPE_RENDERING",)
+    # T6 で `CC_TAX_TYPE_RENDERING` が結線された（`sheets_output.append_entries`
+    # が G列を書く直前に引く。`test_sheets_output_line_mode` が哨兵値の
+    # 差し替えで効き目を確認済み）。これで一覧は空になった。
+    #
+    # **空でも番人は死んでいない**: `test_the_watchdog_can_actually_see_a_wired_item`
+    # と `test_the_watchdog_sees_a_parenthesized_import` が検出能力そのものを
+    # 測り続ける。次に config へ「まだ読み手が無い」項目を足す人は、ここへ
+    # 名前を戻すこと。
+    UNWIRED = ()
 
-    # 結線されうる実装モジュール。T6 で `sheets_output.py` を足すこと
+    # 結線されうる実装モジュール
     WATCHED = ("page_family.py", "card_reconciliation.py",
                "invoice_classification.py", "page_dedup.py",
-               "card_entries.py", "card_prompts.py", "ocr_engine.py")
+               "card_entries.py", "card_prompts.py", "ocr_engine.py",
+               "sheets_output.py")
 
-    def _watched_sources(self):
+    @staticmethod
+    def _config_names_in(source):
+        """そのソースが読んでいる config 名の集合（AST 判定）。
+
+        **文字列一致にしてはいけない**。`from config import (A, B,\n C)` と
+        いう括弧付き複数行 import —— 名前が増えたときの最も普通の書き方 ——
+        は `"from config import A"` という部分文字列を含まないので、
+        substring 方式の番人は**無音ですり抜ける**。T6 で実際にこれを踏んだ
+        （`sheets_output` へ `CC_TAX_TYPE_RENDERING` を結線したのに番人が緑の
+        ままだった）。番人がすり抜ける瞬間は、番人が最も必要な瞬間である。
+        """
+        import ast
+
+        names = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.ImportFrom) and node.module == "config":
+                names.update(alias.name for alias in node.names)
+            elif (isinstance(node, ast.Attribute)
+                  and isinstance(node.value, ast.Name)
+                  and node.value.id == "config"):
+                names.add(node.attr)
+        return names
+
+    def _wired_config_names(self):
         import pathlib
 
-        return "\n".join(
-            pathlib.Path(os.path.dirname(__file__), name).read_text(encoding="utf-8")
-            for name in self.WATCHED)
+        names = set()
+        for name in self.WATCHED:
+            source = pathlib.Path(
+                os.path.dirname(__file__), name).read_text(encoding="utf-8")
+            names |= self._config_names_in(source)
+        return names
 
     def test_unwired_items_are_still_unread_by_the_implementation(self):
-        sources = self._watched_sources()
-        # `from config import X` だけでなく `config.X` も見る —— 後者の書き方で
-        # 結線されると番人がすり抜け、実装と一覧の食い違いが無音で固定される
-        newly_wired = [n for n in self.UNWIRED
-                       if ("from config import %s" % n in sources
-                           or "config.%s" % n in sources)]
+        wired = self._wired_config_names()
+        newly_wired = [n for n in self.UNWIRED if n in wired]
         self.assertEqual(
             newly_wired, [],
             "結線された項目がある。この一覧と Plan §9.5 の「読み取り点が未実装」"
             "注記を更新すること: %s" % newly_wired)
 
     def test_the_watchdog_can_actually_see_a_wired_item(self):
-        """番人が本当に噛むこと（一覧を空にしただけで緑になる番人を作らない）。"""
-        # Assert: T4 で実際に結線された項目は、番人の視野に入っている
-        self.assertIn("from config import CREDIT_ADJUST_CREDIT_ACCOUNT",
-                      self._watched_sources())
+        """番人が本当に噛むこと（一覧を空にしただけで緑になる番人を作らない）。
+
+        `UNWIRED` が空になっても、この 2 本が番人の検出能力を測り続ける。
+        """
+        # Assert: T4 / T6 で実際に結線された項目が、番人の視野に入っている
+        wired = self._wired_config_names()
+        self.assertIn("CREDIT_ADJUST_CREDIT_ACCOUNT", wired)
+        self.assertIn("CC_TAX_TYPE_RENDERING", wired)
+
+    def test_the_watchdog_sees_a_parenthesized_import(self):
+        """括弧付き複数行 import を見落とさないこと（T6 で踏んだすり抜け）。"""
+        source = ("from config import (ALPHA,\n"
+                  "                    BRAVO)\n"
+                  "value = config.CHARLIE\n")
+        self.assertEqual(self._config_names_in(source),
+                         {"ALPHA", "BRAVO", "CHARLIE"})
 
     def test_bulk_token_limit_is_the_measured_hard_ceiling(self):
         """65536 = gemini-2.5-flash の出力硬上限（実測 ＋ 趙拍板 2026-08-18）。

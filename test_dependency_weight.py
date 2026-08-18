@@ -55,6 +55,15 @@ _MUST_STAY_LIGHT = (
     # import 元が変わった瞬間に無音で外れる形だった。
     "ocr_test_fixtures",
     "test_credit_card_config",
+    # 異常検知も直接登録する（T6 の実施後評審で codex が指摘）。
+    # `test_anomaly_detector` の docstring は着手前から
+    # 「依存ゼロ（config / receipt_aggregation のみ）。系統 python3 で実行可」と
+    # **散文で契約を宣言**していたが、番人の視野には入っていなかった。
+    # T6 で `anomaly_detector` に `from doc_types import DocType` を足したので、
+    # 宣言だけの契約を機械が執行する形へ引き上げる。
+    "anomaly_detector",
+    "test_anomaly_detector",
+    "test_anomaly_detector_line_mode",
 )
 
 
