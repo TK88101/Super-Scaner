@@ -537,7 +537,7 @@ JCB の 3 行（9,238 / 3,494 / 1,578 円）が円貨額で記帳され、
 
 ### T6. `sheets_output` の `line_mode` ゲート（AD-6）
 
-`line_mode` 明示ゲート、A/B/F/T/H 列の行級化、取引No キャッシュを
+`line_mode` 明示ゲート、A/B/F/T 列の行級化、取引No キャッシュを
 `+ len(rows)` へ修正、復旧時の N 連番一括再割当て。
 
 **DoD**:
@@ -546,6 +546,28 @@ JCB の 3 行（9,238 / 3,494 / 1,578 円）が円貨額で記帳され、
 - **同一タブへ連続 2 回 append しても取引No が重複しない**（Codex P0）
 - 復旧発生時も N 連番が正しく再割当てされる
 - 既存 `test_sheets_output.py` が無修正で緑
+
+> **完了（2026-08-18）。実施 Plan は `docs/plans/2026-08-18-t6-line-mode-gate.md`**
+> —— 設計・12 タスクの DoD・Codex 起案時評審 3 ラウンド・`/simcodex` 実施後評審
+> 2 ラウンド・変異検証の結果が全部そこに在る。push 済（`78bdbd9`〜`35023f0`）。
+>
+> **上の本文は起案時の記録**。実装は列が増えている ——
+> 行級化したのは **A/B/F/G/H/L/T の 7 列**で、上の文面（A/B/F/T）は
+> T4 §10 の追加 5 件（G 税区分の省略名・H インボイス解決・L 貸方補助科目・
+> 未払金の `CREDIT_ONLY_ACCOUNTS` 豁免・金額 0 の占位行）を反映していない。
+>
+> **DoD を超えて実施したもの**:
+> - 異常検知の**行級化と抑制表**（当初 T8 の範囲。下記 T8 の註記を参照）
+> - `start_new_file` のファイル境界採番（Codex R3 の P0。当初 Plan の見落とし。
+>   `main` は 1 ファイルごとに `start_new_file` を呼ぶので、抑止しないと
+>   次のカード明細ファイルが同じ 1..N を名乗る）
+> - 番人の欠陥 2 件の修正（`UnwiredItemsTest` が括弧付き import を見落とす／
+>   `anomaly_detector` が脱 venv 番人の視野外）
+>
+> **対照群を壊すな**: `test_sheets_output.py` と `test_anomaly_detector.py` は
+> `git diff --exit-code` で byte-level 無変更に保ってある。これが
+> 「既存 4 doc_type の 28 列と異常検知が 1 バイトも変わっていない」ことの証拠。
+> 趙裁定（2026-08-18）で docstring 1 行の修正すら見送った。
 
 ### T7. `_apply_ocr_overrides` の doc_type 豁免（AD-3）
 
@@ -556,6 +578,25 @@ JCB の 3 行（9,238 / 3,494 / 1,578 円）が円貨額で記帳され、
 `detect_deduction_risks`（doc 級で 1 件に集約）、`_suppress_invoice_flags` 経路。
 
 **DoD**: ETC 300 行フィクスチャで赤系タグが 300 個付かない。
+
+> **範囲の変更（2026-08-18）**: 「行級化」そのものは **T6 で完了済み**。
+> `sheets_output.append_entries` が行級 parent で `detect_anomalies` を呼び、
+> `anomaly_detector` 側の `_VENDOR_OPTIONAL_DOC_TYPES` /
+> `_INVOICE_OPTIONAL_DOC_TYPES` が構造的な空欄を抑制する（T6 Plan §3.8）。
+> **上の DoD（300 行で赤系タグが 300 個付かない）は T6 時点で既に満たしている。**
+>
+> **T8 に残るのは 2 つ**:
+> 1. `detect_deduction_risks` —— 控除リスクを doc 級で 1 件に集約する**新機能**
+>    （行級化ではない）
+> 2. `_suppress_invoice_flags` —— T6 が置いた 2 つの抑制表を 1 枚の
+>    「フラグ種別 → 対象 doc_type」表へ**統合**する。T6 Plan §3.8 が
+>    この継目を明示的に T8 へ申し送っている
+>
+> 統合時の注意: 抑制表を `doc_types.LINE_MODE_DOC_TYPES` の別名にしないこと
+> （T6 の評審で提案され**駁回済み**。「逐行記帳である」と「券面に登録番号が
+> 無い」は別の軸で、別名化すると T番号を持つ逐行 doc_type が将来現れたとき
+> インボイス検査が無音で抑制される）。追随漏れは
+> `test_anomaly_detector_line_mode.SuppressionLedgerTest` が塞いである。
 
 ### T9. `main.process_file` の接線（AD-9）
 

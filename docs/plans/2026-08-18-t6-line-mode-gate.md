@@ -958,7 +958,8 @@ M2 と M5 は**それぞれ 1 件でしか死なない**。この 2 本を消す
 
 ### 進捗スナップショット（2026-08-18 更新）
 
-**T6-0 〜 T6-11 の 12 タスク すべて完了。全量 989 tests 緑。未 commit。**
+**T6-0 〜 T6-11 の 12 タスク すべて完了。実施後評審 2 ラウンドも完了。**
+**全量 992 tests 緑。push 済（`78bdbd9`〜`35023f0` の 4 commit）。**
 
 | ファイル | 状態 |
 |---|---|
@@ -975,8 +976,20 @@ M2 と M5 は**それぞれ 1 件でしか死なない**。この 2 本を消す
 | `docs/plans/2026-08-18-t6-line-mode-gate.md` | **新規**（本ファイル） |
 | `test_sheets_output.py` / `test_anomaly_detector.py` | **無修正**（A2 / T6-9 DoD の証拠） |
 
-**次の一手**: fatboyslim Phase 3（`/simcodex`）→ 辯論裁決 → 全量再走 →
-趙の拍板を待って commit。**`.env` 解禁は T7 が終わるまで不可**（趙裁定 08-17）。
+**次の一手**: **T7**（`_apply_ocr_overrides` の doc_type 豁免）。
+**`.env` 解禁は T7 が終わるまで不可**（趙裁定 08-17: T4 ＋ T6 ＋ T7）。
+
+**commit 分割**（各 commit を一時 worktree で checkout して実走・全て緑を確認済み。
+`.env` は gitignore なので symlink で貸す —— 無いと `config.py` が import 時に
+`GEMINI_API_KEY が見つかりません` で落ち、11 モジュールが ImportError になる）:
+
+| commit | 内容 | tests |
+|---|---|---|
+| `3adca95` | （基線） | 895 OK |
+| `78bdbd9` | golden 護欄 | 906 OK |
+| `bcf5883` | line_mode 結線 | 991 OK |
+| `caf1a5d` | 番人の欠陥 2 件 | 992 OK |
+| `35023f0` | 文書 | 992 OK |
 
 **`test_sheets_output_line_mode.py` に在る道具**（再実装しないこと）:
 
