@@ -346,7 +346,7 @@ class ZeroYieldExitsTest(unittest.TestCase):
         cases = [
             ({"missing": True}, "pypdf未導入"),
             ({"reader_fails": "open"}, "PDF読取失敗"),
-            ({"total": 3, "boom_pages": {1, 2, 3}}, "全頁"),
+            ({"total": 3, "boom_pages": {1, 2, 3}}, "全ページ"),
         ]
         for kw, expected in cases:
             with self.subTest(cause=expected):

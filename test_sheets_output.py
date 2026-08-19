@@ -565,14 +565,14 @@ class AppendEntriesSilentLossGuardTest(unittest.TestCase):
         # Arrange: main の部分エラー占位行など、_unrecognized を明示した
         # producer の memo は従来通り摘要へ通す（挙動維持の固定）
         data = self._data([], _unrecognized=True,
-                          memo="⚠ ページ処理エラー 2/8頁 手動再スキャン要")
+                          memo="⚠ ページ処理エラー 2/8ページ 手動再スキャン要")
         # Act
         _, _, _, _, written = _run_append_entries(
             DocType.RECEIPT, data, capture_written=True)
         # Assert
         self.assertEqual(len(written), 1)
         self.assertEqual(written[0][18],
-                         "⚠ ページ処理エラー 2/8頁 手動再スキャン要")
+                         "⚠ ページ処理エラー 2/8ページ 手動再スキャン要")
 
 
 def _call_append_entries(doc_type, data):

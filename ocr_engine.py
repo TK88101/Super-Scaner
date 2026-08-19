@@ -517,7 +517,7 @@ def _split_pdf_pages(file_path):
             呼出へ送る経路）へ落とさず `_page_error` を出すこと（§12.1②）。
     """
     if PdfReader is None or PdfWriter is None:
-        raise PdfSplitError("pypdf未導入のためPDFを頁分割できません")
+        raise PdfSplitError("pypdf未導入のためPDFをページ分割できません")
 
     try:
         reader = PdfReader(file_path)
@@ -558,7 +558,7 @@ def _split_pdf_pages(file_path):
         # いながらファイル全体を 1 回の Gemini 呼出へ送る、②が塞ぐと決めた
         # 事故再現経路そのもの。まだ 1 頁も yield していないので上の契約に
         # 反しない。
-        raise PdfSplitError("全頁のPDF分割に失敗しました",
+        raise PdfSplitError("全ページのPDF分割に失敗しました",
                             total_pages=total_pages)
 
 
@@ -2661,7 +2661,7 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                     print(f"[p{miss}] ❌ PDFページ分割失敗: この頁を取得でき"
                           f"ませんでした（占位行を記録します）")
                     yield _mark(_page_error_payload(
-                        "PDFページ分割失敗（この頁を取得できませんでした）",
+                        "PDFページ分割失敗（このページを取得できませんでした）",
                         miss, total, None))
 
                 # ページカバレッジ突合（IP-401 §8-中7）

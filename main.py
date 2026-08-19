@@ -664,7 +664,7 @@ def _process_file_impl(service, sheets_writer, file_path, uploader_name,
                 doc_type=doc_type,
                 entries_data=_build_unrecognized_placeholder(
                     uploader_name, filename,
-                    f"⚠ ページ処理エラー {error_pages}/{count}頁 "
+                    f"⚠ ページ処理エラー {error_pages}/{count}ページ "
                     f"[{failed_pages_str}] 手動再スキャン要"
                     + "".join(f" / p{n}: {note}"
                               for n, note in sorted(failed_page_notes.items()))),
