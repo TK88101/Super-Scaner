@@ -2217,6 +2217,30 @@ def _merge_audit_signals(*signals):
     return ";".join(parts) if parts else None
 
 
+# MF タブへ出す除外行の摘要（顧客が読む文言）。監査タブ行は摘要列を持たない
+# ので空でよいが、MF タブ行を空で渡すと sheets_output._write_unrecognized_row
+# が「⚠ 認識不能ページ」にフォールバックし、**正常な合計表ページが OCR 失敗と
+# 見分けがつかなくなる**（codex review P2 / 2026-08-19）。
+_EXCLUSION_MEMO_BY_FAMILY = {
+    page_family.FAMILY_CC_SUMMARY:
+        "⚠ 合計表ページ（明細が無いため仕訳を作成していません）",
+}
+
+
+def _exclusion_memo(disposition):
+    """除外行の摘要。MF タブ行だけが顧客の目に触れるので文言を持たせる。
+
+    未知の族が将来 MF タブへ回されたときも空にならないよう既定値を置く。
+    「摘要が空 → 認識不能に化ける」は静かに効く欠陥なので、族ごとの
+    登録漏れで再発しない形にしておく。
+    """
+    if getattr(disposition, "destination", "") != page_family.EXCLUDE_DEST_MF_TAB:
+        return ""
+    return _EXCLUSION_MEMO_BY_FAMILY.get(
+        getattr(disposition, "family", None),
+        "⚠ 仕訳対象外ページ（明細が無いため記帳していません）")
+
+
 def _resolve_card_disposition(doc_type, page_class, result, raw_data, prefix=""):
     """card 系頁の去向を `page_family` に裁決させる（T8-3 / Plan の P-B 位置）。
 
@@ -2254,6 +2278,11 @@ def _apply_family_signal(results, disposition, ocr_text):
     P-B の時点で載せると `_yield_line_mode_results` の `_with_audit_signal`
     に上書きされて消える（Codex 評審 HIGH-2）。頁単位で 1 行にしたいので
     先頭 result にだけ付けるのは既存の封筒シグナルと同じ方針。
+
+    **同居は実在する**（simplify 評審 2026-08-19 が実証）。`card_salvage.
+    page_marks` は「救済は経たが行数は充足」のとき `(None, "salvaged:X/Y")`
+    を返し、`_yield_line_mode_results` はそれを **entries を持つ同一 result**
+    へ載せる。つまり合成は防御ではなく現に効いている経路がある。
     """
     signal = getattr(disposition, "audit_signal", None) if disposition else None
     if not signal:
@@ -2261,9 +2290,11 @@ def _apply_family_signal(results, disposition, ocr_text):
         return
     for i, r in enumerate(results):
         if i == 0:
-            r = {**r,
-                 "_audit_signal": _merge_audit_signals(r.get("_audit_signal"), signal),
-                 "_ocr_text_len": len(ocr_text or "")}
+            # 形の出所は `_with_audit_signal` に一本化する。ここで dict を
+            # 組み直すと、シグナル欠落を防ぐために作った単一情報源が
+            # 増殖して同じ事故の芽になる（simplify 評審の指摘）。
+            r = _with_audit_signal(
+                r, _merge_audit_signals(r.get("_audit_signal"), signal), ocr_text)
         yield r
 
 
@@ -2407,17 +2438,16 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
         doc_type, page_class, result, raw_data, prefix)
     if disposition is not None and disposition.action == page_family.ACTION_EXCLUDE:
         # 無音にはしない。呼出側（main / local_test）が監査タブへ回す。
-        yield _blank_result(_ocr_text_len=len(ocr_text or ""),
+        yield _blank_result(memo=_exclusion_memo(disposition),
+                            _ocr_text_len=len(ocr_text or ""),
                             **page_family.exclusion_fields(disposition))
         return
 
     if not _is_line_mode(doc_type):
-        signal = getattr(disposition, "audit_signal", None) if disposition else None
-        if signal:
-            result = {**result,
-                      "_audit_signal": _merge_audit_signals(
-                          result.get("_audit_signal"), signal),
-                      "_ocr_text_len": len(ocr_text or "")}
+        # ここに族シグナルの合成は要らない。`_resolve_card_disposition` が
+        # 非 None を返すのは `CC_FAMILY_DOC_TYPES` の 2 型だけで、それは
+        # `LINE_MODE_DOC_TYPES` と同値だからこの枝では disposition が必ず
+        # None になる（simplify 評審が coverage で未実行を実証）。
         yield result
         return
     yield from _apply_family_signal(

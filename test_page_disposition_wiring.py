@@ -48,8 +48,15 @@ def _raw(rows=(), rows_on_page=None, **extra):
     return raw
 
 
-def _row(amount=1000, date="2023/01/05", desc="テスト加盟店"):
-    return {"date": date, "description": desc, "amount": amount}
+def _row(amount=1000, date="2023/01/05", merchant="テスト加盟店"):
+    """明細 1 行。**键名は生産が読むものに揃える**。
+
+    `card_entries._description` が読むのは `merchant` であり、
+    `description` は出力専用の键（入力としては誰も読まない）。誤ると
+    商家名が空の entry が黙って出来て、テストは緑のまま死んだ標本を
+    検証し続ける（`ocr_test_fixtures` の docstring が警告する漂移）。
+    """
+    return {"date": date, "merchant": merchant, "amount": amount}
 
 
 def _run(doc_type, raw, text, page_class=None):
@@ -92,6 +99,43 @@ class RiboPageIsExcludedTest(unittest.TestCase):
         self.assertIn("family_signal_with_entries:payment_method_notice", signals[0])
 
 
+class MfTabRowCarriesAReadableMemoTest(unittest.TestCase):
+    """MF タブへ出す除外行は顧客が読める摘要を持つ（codex review P2）。
+
+    監査タブ行は摘要列を持たないので memo は空でよい。しかし MF タブ行は
+    **顧客の目に触れる**。空のまま渡すと `sheets_output._write_unrecognized_row`
+    が「⚠ 認識不能ページ」にフォールバックし、**正常な合計表ページが
+    OCR 失敗と見分けがつかなくなる**。
+
+    合計表ページ（`FAMILY_CC_SUMMARY` → MF タブ）は T8 で**新たに有効化**
+    された経路なので、この欠落は T8 が持ち込んだもの。
+    """
+
+    _SUMMARY_TEXT = "TS3 ご利用代金合計表 1/1 お支払合計 44,490"
+
+    def test_summary_page_goes_to_the_mf_tab_with_a_memo(self):
+        pc = page_family.classify_page(self._SUMMARY_TEXT)
+        results = _run(DocType.CREDIT_CARD, _raw(), self._SUMMARY_TEXT, pc)
+
+        self.assertEqual(len(results), 1)
+        r = results[0]
+        self.assertTrue(r.get("_excluded_page"))
+        self.assertEqual(r.get("_exclude_destination"),
+                         page_family.EXCLUDE_DEST_MF_TAB)
+        self.assertTrue(
+            r.get("memo"),
+            "MF タブ行の摘要が空だと『⚠ 認識不能ページ』に化け、"
+            "正常な合計表が OCR 失敗と区別できなくなる")
+
+    def test_audit_tab_rows_do_not_need_a_memo(self):
+        """監査タブ行は摘要列を持たないので空でよい（無駄な文言を作らない）。"""
+        pc = page_family.classify_page(_RIBO_TEXT)
+        r = _run(DocType.CREDIT_CARD, _raw(), _RIBO_TEXT, pc)[0]
+        self.assertEqual(r.get("_exclude_destination"),
+                         page_family.EXCLUDE_DEST_AUDIT_TAB)
+        self.assertFalse(r.get("memo"))
+
+
 class ShortageBeatsExclusionTest(unittest.TestCase):
     """行欠けの疑いがある頁は除外しない（Codex 評審 MEDIUM-1）。
 
@@ -127,18 +171,13 @@ class AuditSignalsAreNotSwallowedTest(unittest.TestCase):
     def test_family_signal_survives_the_line_mode_pass(self):
         """族シグナルが `_yield_line_mode_results` を通り抜けても消えないこと。
 
-        **実装で判ったこと（2026-08-19）**: 現行の構造では族シグナルと行欠け
-        シグナルは**同じ result に載らない**。`_yield_line_mode_results` は
-        entries が在る頁では `yield result`（無シグナル）＋ 別途「提示行」を
-        出す形なので、行欠けの痕跡は後続の別 result に付く。一方 
-        `_with_audit_signal` による上書きが走るのは entries=0 の枝だけで、
-        そのとき族シグナルは（優先序 2 を通らないので）そもそも存在しない。
-
-        つまり Codex 評審 HIGH-2 の食い合いは**現行コードでは発生しない**。
-        `_merge_audit_signals` は「`_yield_line_mode_results` が将来
-        entries 有りでも `_with_audit_signal` を使うようになったとき」への
-        防御として残す。ここで固定するのは合成の有無ではなく
-        **族シグナルが生き残ること**そのもの。
+        **当初の分析は誤りだった**（simplify 評審 2026-08-19 が訂正）。
+        「行欠け(shortage)」の枝では確かに別 result に分かれるが、
+        `card_salvage.page_marks` にはもう一つの枝がある —— 「救済は経たが
+        行数は充足」のとき `(None, "salvaged:X/Y")` を返し、これは
+        **entries を持つ同一 result** に `_with_audit_signal` で載る。
+        つまり Codex 評審 HIGH-2 の食い合いは**現に起きうる**。
+        合成の実在経路は下の test_salvaged_and_family_signals_coexist が固定する。
         """
         pc = page_family.classify_page(_RIBO_TEXT)
         raw = _raw(rows=[_row()], rows_on_page=12)   # 記帳あり ＋ 行欠けあり
@@ -152,6 +191,26 @@ class AuditSignalsAreNotSwallowedTest(unittest.TestCase):
             "族シグナルが line-mode 通過で消えた")
         self.assertTrue(any(r.get("entries") for r in results),
                         "行欠けが在っても記帳は止めない")
+
+    def test_salvaged_and_family_signals_coexist(self):
+        """救済痕跡と族シグナルが**同一 result** に同居する実在経路。
+
+        `card_salvage.page_marks` は「救済は経たが行数は充足」のとき
+        `(None, "salvaged:X/Y")` を返し、`_yield_line_mode_results` が
+        それを entries 持ちの result に載せる。ここへ族シグナルを素直に
+        載せ直すと片方が消える —— `_merge_audit_signals` が防いでいるのは
+        この経路であって、仮想の将来ではない。
+        """
+        pc = page_family.classify_page(_RIBO_TEXT)
+        raw = _raw(rows=[_row()], rows_on_page=1)   # 申告 1 行・取得 1 行＝充足
+        raw[card_salvage.SALVAGED_KEY] = True
+        results = _run(DocType.CREDIT_CARD, raw, _RIBO_TEXT, pc)
+
+        merged = next((r["_audit_signal"] for r in results if r.get("_audit_signal")), "")
+        self.assertIn("salvaged", merged, "救済痕跡が消えた")
+        self.assertIn("family_signal_with_entries:payment_method_notice", merged,
+                      "族シグナルが消えた")
+        self.assertIn(";", merged, "片方が上書きで消えている")
 
 
 class LegacyDocTypesAreUntouchedTest(unittest.TestCase):

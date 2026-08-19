@@ -311,18 +311,17 @@ def _classify(ocr_text):
     if info_score:
         signals.add("info:%d" % info_score)
     # 強語彙は単独で 2 点（＝発火）。弱語彙は 1 点ずつで 2 語 AND を要求する。
-    # signals には revolving / installment を別々に残す（去向は 1 つで足りるが、
-    # 将来の監査分析で区別したくなる。Codex LOW-1 の修正採納）。
-    pm_strong = [tok for tok in _PAYMENT_METHOD_STRONG_TOKENS if tok in t]
-    pm_weak = [tok for tok in _PAYMENT_METHOD_WEAK_TOKENS if tok in t]
-    payment_method_score = 2 if pm_strong else len(pm_weak)
+    #
+    # revolving / installment の下位タグは**置かない**。Codex LOW-1 は
+    # 「将来の監査分析で区別したくなる」として分離を勧め一度は入れたが、
+    # simplify 評審が (1) 誰も読んでいない (2) 現行の強語彙 4 つは全て
+    # 「リボ」か「ペイフレックス」を含むので installment 側の枝が到達不能、
+    # の 2 点を実証した。去向は 1 つで足り、必要になってから足す。
+    pm_strong = any(tok in t for tok in _PAYMENT_METHOD_STRONG_TOKENS)
+    payment_method_score = 2 if pm_strong else sum(
+        1 for tok in _PAYMENT_METHOD_WEAK_TOKENS if tok in t)
     if payment_method_score:
         signals.add("payment_method:%d" % payment_method_score)
-        for tok in pm_strong:
-            signals.add("revolving" if "リボ" in tok or "ペイフレックス" in tok
-                        else "installment")
-        if not pm_strong and any("分割" in tok or "回数" in tok for tok in pm_weak):
-            signals.add("installment")
 
     has_detail_rows = _looks_like_detail_rows(t)
     if has_detail_rows:

@@ -36,6 +36,7 @@ from page_dedup import (  # noqa: E402
 )
 from page_family import (  # noqa: E402
     ACTION_BOOK,
+    CC_FAMILY_DOC_TYPES,
     ACTION_EXCLUDE,
     ACTION_UNRECOGNIZED,
     DEDUP_MODE_EXCLUDE,
@@ -303,6 +304,26 @@ class DateTokenPrecisionTest(unittest.TestCase):
         """回帰: 真の明細頁の拒否権は 1 ミリも弱めない。"""
         self.assertTrue(classify_page(_AMEX_HEAD + " " + _rows(20)).has_detail_rows)
         self.assertTrue(classify_page(_NIMOCA_HEAD + " " + _ic_rows(20)).has_detail_rows)
+
+
+class CardFamilyDocTypesMembershipTest(unittest.TestCase):
+    """`CC_FAMILY_DOC_TYPES` の成員を直接釘付ける（altitude 評審の指摘）。
+
+    この集合は `ocr_engine._resolve_card_disposition` の gate であり、
+    T8 の裁決がどの doc_type に効くかを決める唯一の場所。ENTRY_BUILDERS
+    等と違って import 時検査は無く、外れても「従来の挙動へ素通り」する
+    だけなので**壊れても静か**（無限リトライにはならない代わりに、
+    誰も気づかない）。値そのものを固定して漂移を可視化する。
+
+    増やすときは意図的にこのテストを直すこと。テストを直さずに通ったなら、
+    それは意図しない混入である。
+    """
+
+    def test_membership_is_exactly_the_two_card_doc_types(self):
+        from doc_types import DocType
+        self.assertEqual(
+            set(CC_FAMILY_DOC_TYPES),
+            {DocType.CREDIT_CARD, DocType.TRANSIT_IC})
 
 
 class PaymentMethodNoticeTest(unittest.TestCase):
