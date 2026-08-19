@@ -271,6 +271,52 @@ class PageGapTest(unittest.TestCase):
         self.assertEqual(v.severity, "high")
 
 
+class RiboPageZeroBaselineTest(unittest.TestCase):
+    """T8 実測（2026-08-19）: リボ頁の 0 円小計を検算基準にしてはいけない。
+
+    実測: アメックス 8 頁券面の p8（ペイフレックス＝リボ頁）を credit_card
+    として生産と同一経路に 3 回通したところ、Gemini は毎回
+    `printed_totals=[{"label": "今回ご請求金額", "amount": 0}]` と `rows=[]`
+    を返した。この「今回ご請求金額」は**リボ区画の小計**であって券面総額ではない。
+
+    現行実装ではこのラベルが `SECTION_UNKNOWN` へ落ち（`TOTAL_LABEL_SECTION`
+    は発行体で語義が違うラベルを敢えて登録しない）、`_choose_section_and_total`
+    の「unknown が 1 種類だけなら current_usage とみなす」フォールバックで
+    **0 円が検算基準に採用される**。明細 0 件なので 0 − 0 = 0 となり
+    `VERDICT_MATCH` / severity=None。8 頁のうち 1 頁しか見ていないのに
+    「検算一致」と表示される。偽の警告より悪い —— 除外対象の頁が
+    「正常に検算済み」に見えるため、誰も異常に気づけない。
+
+    **`PageGapTest` とは衝突しない。** あちらの「`n/N` は結算トリガーではない」
+    は印字合計が非 0（17,295）で観測済み明細がそれと一致する形であり、
+    F-1 の実測に基づく意図的な仕様。ここで問題にするのは
+    **印字合計 0 ＋ 明細 0 件 ＋ 頁欠**の三者が揃った場合だけ。
+    真に単頁・当月消費ゼロの券面（頁欠なし）は従来どおり一致でよい。
+
+    **これは既知の欠陥を固定する expectedFailure。**
+    `card_reconciliation` は現時点で生産経路に**未接線**（参照はテストのみ）
+    なので実害はゼロ。T9 で接線する際にこの欠陥を塞ぎ、**この装飾子を外すこと**
+    が T9 の完了条件。装飾子を付けたまま実装を直すと unexpected success で
+    赤くなるので、外し忘れは構造的に防がれる。
+    """
+
+    @unittest.expectedFailure
+    def test_zero_total_from_ribo_page_must_not_verify_as_match(self):
+        led = _ledger(total_pages=1)
+        led.observe_page(8, _ident(n=8, total=8),
+                         (_total("今回ご請求金額", 0, page=8),), [])
+
+        v = _only(led.finalize())
+        self.assertTrue(any("頁欠" in n for n in v.notes),
+                        "前提が崩れている: 8 頁中 1 頁しか観測していないはず")
+        self.assertEqual(v.printed_total, 0, "前提: 0 円が基準に採られている")
+        self.assertEqual(v.detail_sum, 0, "前提: 明細は 0 件")
+        self.assertNotEqual(
+            v.verdict, VERDICT_MATCH,
+            "リボ頁の 0 円小計を基準にした 0 対 0 を「検算一致」と"
+            "表示してはいけない（除外対象頁が正常検算済みに見える）")
+
+
 class CardIdentityTest(unittest.TestCase):
     """F-1: 1 PDF に 3 社分が混在する。頁ごとの帰属判定が要る。"""
 
