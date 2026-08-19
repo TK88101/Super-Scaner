@@ -29,6 +29,7 @@ FAMILY_CC_SUMMARY = "cc_summary"      # 請求合計・合計表のみ → MF �
 FAMILY_IC_HISTORY = "ic_history"      # 交通系IC 利用履歴 → 記帳
 FAMILY_POINTS_ONLY = "points_only"    # ポイント専用頁 → 監査タブ
 FAMILY_INFO_NOTICE = "info_notice"    # 案内・インフォメーション頁 → 監査タブ
+FAMILY_PAYMENT_METHOD_NOTICE = "payment_method_notice"  # リボ・分割の案内頁 → 監査タブ
 FAMILY_UNKNOWN = "unknown"            # いずれでもない → 赤い認識不能占位行
 
 STRENGTH_STRONG = "strong"
@@ -129,6 +130,23 @@ _POINTS_TOKENS = (
     "前月残高", "前回残高", "当月獲得", "当月末", "ポイント残高",
 )
 
+# 支払方式の案内（T8 / 要求 #6。2026-08-19 にアメックス p8 の実 OCR で
+# ヒットを確認した語だけを置く）。
+#
+# **強語彙**は単独で発火してよい。発行体固有の商品名か、他の文脈で出ない
+# 長い複合語に限る。**「リボ」単独は絶対に入れない** —— 加盟店名や広告文
+# （「ご利用はリボでお得」）に出うるため。社会保険料判定で「納入告知額」を
+# 単独発火させない裁決（CLAUDE.md）と同じ原理で、誤爆すると無関係な頁が
+# 監査タブへ沈む。
+_PAYMENT_METHOD_STRONG_TOKENS = (
+    "ペイフレックス", "あとリボ", "リボルビング払い", "リボルビング残高",
+)
+# **弱語彙**は 2 語以上の AND でのみ発火する。単独では明細頁の用語説明にも出る。
+_PAYMENT_METHOD_WEAK_TOKENS = (
+    "基本手数料率", "実質年率", "変更締切日", "分割払手数料", "ボーナス払い",
+    "支払回数",
+)
+
 # 案内（F-6 実測 ＋ 拡張候補）
 _INFO_TOKENS = (
     "インフォメーション", "web明細", "ご案内", "キャンペーン", "お知らせ",
@@ -161,7 +179,18 @@ ISSUER_TRANSIT_IC = "nimoca"
 #
 # 金額はカンマ有りに限定しない。nimoca の単価は 150〜1,300 円（F-7）で
 # 大半にカンマが付かず、限定すると当該頁で拒否権が消える。
-_RE_DATE_TOKEN = re.compile(r"(?:20\d{2}[/年.\-])?\d{1,2}[/月.\-]\d{1,2}日?")
+# T8-1: `.` 区切りは**年付きのときだけ**日付とみなす。
+# 年なしの `.` を日付として拾うと `基本手数料率 14.90` `実質年率 14.6` が
+# 日付 2 件に化け、リボ頁が閾値 5 に到達して has_detail_rows が真になる。
+# するとAD-0 優先序 3（行らしさは除外を拒否する）が発動し、明細を持たない
+# リボ頁が監査タブではなく赤い認識不能行へ落ちる（2026-08-19 実測）。
+# `1.19`（年なし月日）と `14.90`（小数）はトークン単体では区別できないので
+# 片方を捨てるしかない。参考資料 8 頁に `.` 区切り日付は一度も出現しないため
+# 年なし `.` を捨てる。将来出たら実物を添えて緩めること。
+_RE_DATE_TOKEN = re.compile(
+    r"20\d{2}[/年.\-]\d{1,2}[/月.\-]\d{1,2}日?"   # 年付き（`.` 可）
+    r"|\d{1,2}[/月\-]\d{1,2}日?"                    # 年なし（`.` は不可）
+)
 _RE_AMOUNT_TOKEN = re.compile(
     r"(?<![\d,.\-/])(?:\d{1,3}(?:,\d{3})+|\d{3,7})(?![\d,/\-])")
 MIN_DETAIL_DATE_TOKENS = 5
@@ -205,6 +234,7 @@ class PageClass:
     declared_totals: tuple = ()
     points_score: int = 0
     info_score: int = 0
+    payment_method_score: int = 0
     has_detail_rows: bool = False          # 「除外を拒否する」ためだけの値
     error: str = ""
 
@@ -280,6 +310,19 @@ def _classify(ocr_text):
     info_score = sum(1 for tok in _INFO_TOKENS if tok in t)
     if info_score:
         signals.add("info:%d" % info_score)
+    # 強語彙は単独で 2 点（＝発火）。弱語彙は 1 点ずつで 2 語 AND を要求する。
+    # signals には revolving / installment を別々に残す（去向は 1 つで足りるが、
+    # 将来の監査分析で区別したくなる。Codex LOW-1 の修正採納）。
+    pm_strong = [tok for tok in _PAYMENT_METHOD_STRONG_TOKENS if tok in t]
+    pm_weak = [tok for tok in _PAYMENT_METHOD_WEAK_TOKENS if tok in t]
+    payment_method_score = 2 if pm_strong else len(pm_weak)
+    if payment_method_score:
+        signals.add("payment_method:%d" % payment_method_score)
+        for tok in pm_strong:
+            signals.add("revolving" if "リボ" in tok or "ペイフレックス" in tok
+                        else "installment")
+        if not pm_strong and any("分割" in tok or "回数" in tok for tok in pm_weak):
+            signals.add("installment")
 
     has_detail_rows = _looks_like_detail_rows(t)
     if has_detail_rows:
@@ -304,6 +347,7 @@ def _classify(ocr_text):
         declared_totals=totals,
         points_score=points_score,
         info_score=info_score,
+        payment_method_score=payment_method_score,
         has_detail_rows=has_detail_rows,
     )
 
@@ -419,6 +463,13 @@ def _signal_family(pc):
     `has_detail_rows` を見ない生の族。entries があっても監査に残す注記の
     材料として使うため、拒否権とは分離してある。
     """
+    # 支払方式族を declared_totals より**前**に置く。リボ頁が
+    # 「今回ご請求金額 1,234」のようにカンマ付き合計を印字していると
+    # cc_summary（→ MF タブ）に取られ、趙裁定「#5/#6 は監査タブ」が
+    # 静かに破れるため。商品名は極めて特異なシグナルで、汎用の合計
+    # ラベルに譲る理由が無い。
+    if pc.payment_method_score >= 2:
+        return FAMILY_PAYMENT_METHOD_NOTICE
     if pc.declared_totals:
         return FAMILY_CC_SUMMARY
     if pc.points_score >= 2:
@@ -480,7 +531,8 @@ def resolve_page_disposition(dedup_verdict, entry_count, page_class, dedup_mode=
         # cc_summary は明細末尾に合計が印字されているだけの正常な形（F-3）なので
         # 注記しない。毎頁鳴ると監査タブが狼少年になる。
         audit = None
-        if signal_family in (FAMILY_POINTS_ONLY, FAMILY_INFO_NOTICE):
+        if signal_family in (FAMILY_POINTS_ONLY, FAMILY_INFO_NOTICE,
+                             FAMILY_PAYMENT_METHOD_NOTICE):
             audit = "family_signal_with_entries:%s" % signal_family
         if dup_reason:                      # mode == mark: 記帳しつつ注記を残す
             audit = "%s;%s" % (dup_reason, audit) if audit else dup_reason
@@ -505,7 +557,8 @@ def resolve_page_disposition(dedup_verdict, entry_count, page_class, dedup_mode=
         return Disposition(ACTION_EXCLUDE, family=family,
                            reason=_with_dup("cc_summary:total=%s" % totals),
                            destination=EXCLUDE_DEST_MF_TAB)
-    if family in (FAMILY_POINTS_ONLY, FAMILY_INFO_NOTICE):
+    if family in (FAMILY_POINTS_ONLY, FAMILY_INFO_NOTICE,
+                  FAMILY_PAYMENT_METHOD_NOTICE):
         return Disposition(ACTION_EXCLUDE, family=family, reason=_with_dup(family),
                            destination=EXCLUDE_DEST_AUDIT_TAB)
 

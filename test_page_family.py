@@ -47,12 +47,14 @@ from page_family import (  # noqa: E402
     FAMILY_CC_SUMMARY,
     FAMILY_IC_HISTORY,
     FAMILY_INFO_NOTICE,
+    FAMILY_PAYMENT_METHOD_NOTICE,
     FAMILY_POINTS_ONLY,
     FAMILY_UNKNOWN,
     STRENGTH_NONE,
     STRENGTH_STRONG,
     STRENGTH_WEAK,
     PageClass,
+    _RE_DATE_TOKEN,
     classify_page,
     exclusion_fields,
     resolve_family,
@@ -233,6 +235,157 @@ class EntriesBeatFamilySignalTest(unittest.TestCase):
         """シグナルが無い頁に監査ノイズを出さない（狼少年化の防止）。"""
         d = resolve_page_disposition(_dedup(), 8, classify_page(_AMEX_HEAD + " " + _rows(8)))
         self.assertIsNone(d.audit_signal)
+
+
+# T8-1 実測（2026-08-19）: リボ頁の構造を再現した合成テキスト。
+# 顧客実名・カード番号は含めない（実 OCR は scratchpad にのみ置く）。
+_RIBO_PAGE = (
+    "ペイフレックス登録状況 8/8ページ 明細書作成日 2023年1月19日 "
+    "登録プラン名 ペイフレックスあとリボ 登録日 2020年10月8日 "
+    "リボルビング払い利用可能枠 1,500,000 基本手数料率 14.90 実質年率 14.6 "
+    "あとリボ変更締切日 2023年1月30日 今回ご請求金額 0 前回締め日金額 0 "
+    "今回締め日金額 0 お支払い・ご入金・調整金額 0 365 366 2023 2020"
+)
+
+
+class DateTokenPrecisionTest(unittest.TestCase):
+    """T8-1: 手数料率の小数を日付として数えない。
+
+    実害（2026-08-19 実測）: アメックス p8（ペイフレックス＝リボ頁）は
+    真の日付が 3 件しか無いのに、`基本手数料率 14.90` と `実質年率 14.6` が
+    日付として拾われて 5 件に達し、`has_detail_rows` が真になる。
+    その結果 AD-0 優先序 3（行らしさは除外を拒否する）が発動し、
+    リボ頁が監査タブではなく**赤い認識不能行**になる。
+
+    **規則**（Plan §4 T8-1。`1.19` と `14.90` はトークン単体では区別不能なので
+    どちらかを捨てるしかない）:
+
+        `.` 区切りは年付き `20xx.m.d` のときだけ日付とみなす。
+        年なしの日付は `/` `-` `年月日` の 3 形式でのみ受理する。
+
+    年なし `.` を捨てて良い根拠: 参考資料 8 頁の実測で `.` 区切りの日付は
+    **一度も出現しない**（全て `2023年1月19日` `1月3日` 形式）。
+    将来 `.` 区切り券面が出たら、そのとき実物を添えて緩める。
+    """
+
+    def test_decimal_rates_are_not_dates(self):
+        for text in ("基本手数料率 14.90", "実質年率 14.6", "手数料 10.8", "1.19"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    _RE_DATE_TOKEN.findall(text), [],
+                    "小数・年なし . 区切りを日付として数えてはいけない")
+
+    def test_real_dates_are_still_found(self):
+        cases = {
+            "2023.1.19": "2023.1.19",      # 年付き . は日付
+            "2023.01.19": "2023.01.19",
+            "2023年1月19日": "2023年1月19日",
+            "2023/1/19": "2023/1/19",
+            "1月19日": "1月19日",
+            "1/19": "1/19",
+            "1-19": "1-19",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                found = _RE_DATE_TOKEN.findall(text)
+                self.assertEqual(len(found), 1, "日付 1 件のはず: %r" % (found,))
+                self.assertEqual(found[0], expected)
+
+    def test_ribo_page_loses_its_false_detail_rows(self):
+        """本題: 小数を除けばリボ頁の行らしさが消える。"""
+        pc = classify_page(_RIBO_PAGE)
+        self.assertFalse(
+            pc.has_detail_rows,
+            "リボ頁は明細行を持たない。行らしさが立つと優先序 3 で"
+            "赤い認識不能行に落ち、監査タブへ回せない")
+
+    def test_real_detail_page_keeps_its_veto(self):
+        """回帰: 真の明細頁の拒否権は 1 ミリも弱めない。"""
+        self.assertTrue(classify_page(_AMEX_HEAD + " " + _rows(20)).has_detail_rows)
+        self.assertTrue(classify_page(_NIMOCA_HEAD + " " + _ic_rows(20)).has_detail_rows)
+
+
+class PaymentMethodNoticeTest(unittest.TestCase):
+    """T8-2: リボ・分割払いの案内頁は記帳せず監査タブへ（要求 #6）。
+
+    実物（2026-08-19 実測）はアメックス p8「ペイフレックス登録・利用・
+    請求状況一覧」。券面に在るのは登録プラン名・登録日・利用可能枠・
+    基本手数料率・あとリボ変更締切日で、**明細行は構造的に存在しない**。
+    Gemini も 3 回とも `rows=[]` を返した。
+
+    去向が監査タブなのは趙裁定 2026-08-19。完全無痕にしないのは IP-401
+    不変式（頁が黙って消えない）のため。
+    """
+
+    def test_ribo_page_goes_to_the_audit_tab(self):
+        pc = classify_page(_RIBO_PAGE)
+        d = resolve_page_disposition(_dedup(), 0, pc)
+        self.assertEqual(d.action, ACTION_EXCLUDE)
+        self.assertEqual(d.destination, EXCLUDE_DEST_AUDIT_TAB)
+        self.assertEqual(d.family, FAMILY_PAYMENT_METHOD_NOTICE)
+
+    def test_entries_always_win_and_leave_a_branch_note(self):
+        """IP-401 gate: entries が在れば記帳する。ただし痕跡は残す。
+
+        「リボ頁なのに entries が組まれた」は最も知りたい事象なので、
+        記帳を止めない代わりに監査タブへ分岐 1 行を残す（Codex ラウンド 2）。
+        載せ忘れると偽 entry が無印で通る。
+        """
+        pc = classify_page(_RIBO_PAGE)
+        d = resolve_page_disposition(_dedup(), 6, pc)
+        self.assertEqual(d.action, ACTION_BOOK)
+        self.assertEqual(
+            d.audit_signal,
+            "family_signal_with_entries:%s" % FAMILY_PAYMENT_METHOD_NOTICE)
+
+    def test_the_word_ribo_alone_never_fires(self):
+        """加盟店名や広告文の「リボ」1 語で発火してはいけない。
+
+        社保判定で「納入告知額」を単独発火させない裁決と同じ原理。
+        誤爆すると無関係な明細頁が監査タブへ沈む。
+        """
+        for text in ("リボ", "リボ払い", "ご利用はリボでお得", "手数料"):
+            with self.subTest(text=text):
+                pc = classify_page(text + " " + _rows(3))
+                self.assertNotEqual(resolve_page_disposition(_dedup(), 0, pc).family,
+                                    FAMILY_PAYMENT_METHOD_NOTICE)
+
+    def test_a_strong_token_alone_is_enough(self):
+        """強語彙は単独で発火する。
+
+        **変異検証で見つけた盲点**（2026-08-19）: `_RIBO_PAGE` は弱語彙を
+        3 つ含むので、強語彙を全部削っても他のテストが緑のままだった。
+        商品名しか印字せず手数料率を載せない発行体の版面では、強語彙が
+        唯一の手がかりになる。ここが無いと「強語彙は飾り」になってしまう。
+        """
+        for text in ("ペイフレックスご利用状況", "あとリボのご案内",
+                     "リボルビング払いご利用残高"):
+            with self.subTest(text=text):
+                pc = classify_page(text)
+                self.assertEqual(
+                    resolve_page_disposition(_dedup(), 0, pc).family,
+                    FAMILY_PAYMENT_METHOD_NOTICE)
+
+    def test_weak_tokens_need_two(self):
+        """弱語彙は 1 つでは足りない（2 語 AND）。"""
+        one = classify_page("基本手数料率 14.90")
+        self.assertNotEqual(resolve_page_disposition(_dedup(), 0, one).family,
+                            FAMILY_PAYMENT_METHOD_NOTICE)
+        two = classify_page("基本手数料率 14.90 実質年率 14.6")
+        self.assertEqual(resolve_page_disposition(_dedup(), 0, two).family,
+                         FAMILY_PAYMENT_METHOD_NOTICE)
+
+    def test_other_families_are_untouched(self):
+        """回帰: 明細・ポイント・合計表の族を変えない。"""
+        self.assertEqual(resolve_page_disposition(
+            _dedup(), 5, classify_page(_AMEX_HEAD + " " + _rows(20))).family,
+            FAMILY_CC_DETAIL)
+        pts = classify_page("ポイント・インフォメーション 獲得ポイント 1,781")
+        self.assertEqual(resolve_page_disposition(_dedup(), 0, pts).family,
+                         FAMILY_POINTS_ONLY)
+        smry = classify_page("TS3 ご利用代金合計表 1/1 お支払合計 44,490")
+        self.assertEqual(resolve_page_disposition(_dedup(), 0, smry).family,
+                         FAMILY_CC_SUMMARY)
 
 
 class DetailRowVetoTest(unittest.TestCase):

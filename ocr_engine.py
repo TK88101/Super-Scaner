@@ -2204,8 +2204,71 @@ def _blank_result(date="", vendor="", **markers):
     }
 
 
+def _merge_audit_signals(*signals):
+    """監査シグナルを `;` で連結する。**どれも落とさない**。
+
+    `_with_audit_signal` は `"_audit_signal": reason` で無条件に上書きする。
+    族シグナル（`family_signal_with_entries:...`）と `card_salvage` の行欠け
+    シグナルは同じ頁で同時に立ちうるので、素直に載せ直すと**片方が黙って
+    消える**（Codex 評審 HIGH-2 で発覚）。監査タブは「人が異常に気づく
+    唯一の場所」なので、シグナルの欠落は IP-401 と同じ形の事故になる。
+    """
+    parts = [s for s in signals if s]
+    return ";".join(parts) if parts else None
+
+
+def _resolve_card_disposition(doc_type, page_class, result, raw_data, prefix=""):
+    """card 系頁の去向を `page_family` に裁決させる（T8-3 / Plan の P-B 位置）。
+
+    `page_family.resolve_page_disposition` が**唯一の裁決者**（AD-0）。
+    ここは多頭裁決を作らないための薄い接続で、判定条件は一切持たない。
+
+    None を返すのは「裁決しない＝従来どおりの経路へ流す」の意。
+    - `page_class` が無い（Vision 兜底・旧経路）
+    - card 系以外の doc_type（既存 4 型は 1 バイトも挙動を変えない）
+    - **除外裁決だが行欠けの疑いがある頁**
+
+    最後の 1 つが要点: 除外して監査タブへ静かに送ると、解析失敗で行を
+    落とした頁が「正常に除外された頁」に化ける。`_looks_like_detail_rows`
+    の docstring が宣言する「閾値の誤りは赤占位行の側へ倒す」と同じ方向で、
+    疑わしいときは**うるさい赤**を選ぶ（Codex 評審 MEDIUM-1）。
+    """
+    if page_class is None or doc_type not in page_family.CC_FAMILY_DOC_TYPES:
+        return None
+    entry_count = len(result.get("entries") or [])
+    disposition = page_family.resolve_page_disposition(None, entry_count, page_class)
+    if disposition.action != page_family.ACTION_EXCLUDE:
+        return disposition
+    shortage, _reason = card_salvage.page_marks(raw_data)
+    if shortage is not None:
+        print(f"{prefix}⚠️ 除外候補（{disposition.family}）だが行欠けの疑い "
+              f"→ 除外せず認識不能として可視化")
+        return None
+    print(f"{prefix}📋 {disposition.family} として除外（監査タブに記録）")
+    return disposition
+
+
+def _apply_family_signal(results, disposition, ocr_text):
+    """族シグナルを line-mode の**後**に先頭 result へ合成する。
+
+    P-B の時点で載せると `_yield_line_mode_results` の `_with_audit_signal`
+    に上書きされて消える（Codex 評審 HIGH-2）。頁単位で 1 行にしたいので
+    先頭 result にだけ付けるのは既存の封筒シグナルと同じ方針。
+    """
+    signal = getattr(disposition, "audit_signal", None) if disposition else None
+    if not signal:
+        yield from results
+        return
+    for i, r in enumerate(results):
+        if i == 0:
+            r = {**r,
+                 "_audit_signal": _merge_audit_signals(r.get("_audit_signal"), signal),
+                 "_ocr_text_len": len(ocr_text or "")}
+        yield r
+
+
 def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
-                        envelope_filter=False):
+                        envelope_filter=False, page_class=None):
     """1ページ分の解析結果を doc_type 別に整形して result dict を yield する。
 
     process_pipeline の「PDF 逐頁ループ」と「単ページ PDF/画像（尾段）」は
@@ -2335,10 +2398,31 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
         return
 
     result = _build_doc_result(doc_type, raw_data, builder(raw_data))
+
+    # ── T8-3: 頁の去向裁決（P-B）──
+    # 位置は `_build_doc_result` の後・`_is_line_mode` 分派の前。ここだけが
+    # `result["entries"]` を持ち、かつ逐頁ループと尾段の両方が通る
+    # （Plan §2.5 / §15.1 で P-A・P-C を排除済）。
+    disposition = _resolve_card_disposition(
+        doc_type, page_class, result, raw_data, prefix)
+    if disposition is not None and disposition.action == page_family.ACTION_EXCLUDE:
+        # 無音にはしない。呼出側（main / local_test）が監査タブへ回す。
+        yield _blank_result(_ocr_text_len=len(ocr_text or ""),
+                            **page_family.exclusion_fields(disposition))
+        return
+
     if not _is_line_mode(doc_type):
+        signal = getattr(disposition, "audit_signal", None) if disposition else None
+        if signal:
+            result = {**result,
+                      "_audit_signal": _merge_audit_signals(
+                          result.get("_audit_signal"), signal),
+                      "_ocr_text_len": len(ocr_text or "")}
         yield result
         return
-    yield from _yield_line_mode_results(result, raw_data, ocr_text, prefix)
+    yield from _apply_family_signal(
+        _yield_line_mode_results(result, raw_data, ocr_text, prefix),
+        disposition, ocr_text)
 
 
 def _yield_line_mode_results(result, raw_data, ocr_text, prefix=""):
@@ -2617,7 +2701,8 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                     # でなければ、Gemini の出力構造を別の型が読むことになる。
                     page_iter = _yield_page_results(
                         page_ocr.actual_doc_type, page_raw_data, ocr_text,
-                        ocr_conf, prefix=prefix, envelope_filter=True)
+                        ocr_conf, prefix=prefix, envelope_filter=True,
+                        page_class=page_ocr.page_class)
                     while True:
                         try:
                             entry = next(page_iter)
@@ -2758,7 +2843,8 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
         # 後の例外」は起きないが、builder が将来流式化すると成立し、そのときは
         # count>0 → Success → 歸檔で**真の無音欠落**になる。
         page_iter = _yield_page_results(page_ocr.actual_doc_type, raw_data,
-                                        ocr_text, ocr_conf)
+                                        ocr_text, ocr_conf,
+                                        page_class=page_ocr.page_class)
         while True:
             try:
                 entry = next(page_iter)

@@ -177,7 +177,7 @@ class PageFormattingExceptionIsolationTest(unittest.TestCase):
         calls = {"n": 0}
 
         def fake(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
-                 envelope_filter=False):
+                 envelope_filter=False, page_class=None):
             calls["n"] += 1
             if calls["n"] == failing_page_num:
                 # 下の for に yield があるため本関数は既に generator function。
@@ -185,7 +185,8 @@ class PageFormattingExceptionIsolationTest(unittest.TestCase):
                 # 実際の整形例外（next() の内側で発生）と同じタイミング。
                 raise ValueError("畸形 JSON: items が dict ではない")
             for entry in real(doc_type, raw_data, ocr_text, ocr_conf,
-                              prefix=prefix, envelope_filter=envelope_filter):
+                              prefix=prefix, envelope_filter=envelope_filter,
+                              page_class=page_class):
                 yield entry
 
         route = [
