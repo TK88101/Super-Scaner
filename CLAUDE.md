@@ -68,9 +68,11 @@ PaddleOCR 先抽文本，再按 `config.OCR_STRATEGY` (默认 "C") 路由：
 7. `tag_rules.py`: 异常 severity → U 列标签 (赤系/橙系/黄系)
 
 ### 文书类型（`doc_types.py`）
-`DocType` 六类：receipt / purchase_invoice / sales_invoice / salary_slip / credit_card / transit_ic。各类有专属 Gemini prompt (`ocr_engine.PROMPTS`)、专属 `_build_entries_from_*` 仕訳构造、专属默认科目。新增文书类型需同步：DocType 常量、DOC_TYPE_CONFIG、ENV_FOLDER_MAP、PROMPTS、`_build_entries_from_*`、**`ocr_engine.ENTRY_BUILDERS`**、DOC_TYPE_TAB_SUFFIX、**`card_reconciliation.RECON_POLICY`**。
+`DocType` 六类：receipt / purchase_invoice / sales_invoice / salary_slip / credit_card / transit_ic。各类有专属 Gemini prompt (`ocr_engine.PROMPTS`)、专属 `_build_entries_from_*` 仕訳构造、专属默认科目。新增文书类型需同步：DocType 常量、DOC_TYPE_CONFIG、ENV_FOLDER_MAP、PROMPTS、`_build_entries_from_*`、**`ocr_engine.ENTRY_BUILDERS`**、DOC_TYPE_TAB_SUFFIX、**`card_reconciliation.RECON_POLICY`**、**`local_test.FOLDER_TYPE_MAP`**。
 
 **`ENTRY_BUILDERS` 极易漏**：它是 `DocType → _build_entries_from_*` 的分发表 (`ocr_engine.py`)。写了 builder 函数却不注册进表，等于没写。历史危害：漏注册当时不会在启动时报错——`ENTRY_BUILDERS.get(doc_type)` 返回 `None` → 一行都不 yield → `main.process_file` 数到 `count==0` → 判 Failed → **保留文件不归档** → 3 秒后再次扫到 → 无限重试，每圈烧一次 Gemini 调用。现由 `ocr_engine._validate_doc_type_registries` 在 import 时对 `DocType.ALL` 校验五张注册表（PROMPTS / ENTRY_BUILDERS / DOC_TYPE_CONFIG / DOC_TYPE_TAB_SUFFIX / ENV_FOLDER_MAP），漏一处启动即 RuntimeError（配套测试 `test_doc_type_registries.py`）。
+
+**第 7 张表 `FOLDER_TYPE_MAP`（`local_test.py`）不在 import 时校验**：它把本地目录名映射到 doc_type，`ensure_dirs()` 照它建 `test_images/<名>/`、`scan_local_files()` 照它扫档。漏登记＝该 doc_type **无法本地验证**，且 `scan_local_files` 会静默素通不存在的目录——`main()` 的「测试文件未找到」提示只在**全部已登记目录都为空**时才出，所以只要 `receipt/` 里还有旧档就完全无音。生产路径无此表（`main.py` 用 `config.load_folder_map`），漏登记不会造成无限重试烧 Gemini，因此不做 import 时 RuntimeError，改由 `test_local_test_folder_map.py` 在 `unittest discover` 中变红（该文件的 docstring 记录了这个高度选择的理由）。
 
 **第 6 张表 `RECON_POLICY` 校验位置不同**：它在 `card_reconciliation.py`，由该模块自己的 `_validate_recon_policy()` 在 import 时校验 `DocType.ALL`（不在 `ocr_engine._validate_doc_type_registries` 里，去那儿找会找不到）。它声明每个 doc_type 的金额检算方针：`amount_required`（クレカ＝合计取不到就当 OCR 失败）/ `count_only`（nimoca＝券面结构上没有合计，只对件数）/ `n/a`（既存 4 类＝不做检算）。漏登记同样是启动即 RuntimeError，但破坏样式与 ENTRY_BUILDERS 不同——不写会让该 doc_type 的检算**静默不生效**，即逐行记帳漏了一行也没有任何外部检查器会发现。
 
