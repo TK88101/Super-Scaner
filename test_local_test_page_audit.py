@@ -199,6 +199,40 @@ class AuditSignalIsRecordedTest(unittest.TestCase):
         _, writer = _run([_page(_bookable(_audit_signal=""))])
         self.assertEqual(writer.rows_with_verdict(AUDIT_VERDICT_BRANCH), [])
 
+    def test_every_signalled_page_gets_its_own_branch_row(self):
+        """シグナルが**複数頁**に出たら、その頁数だけ分岐行が出ること。
+
+        既存の `test_an_audit_signal_produces_a_branch_row` は 1 頁にしか
+        シグナルを載せないので、「最初の 1 本だけ書いて以降は黙る」変異
+        （`if audit_signal and not branch_written:` の類）が生き残る。
+        救済は**頁ごとに独立に起きる**——6 頁のうち 3 頁が截断されたのに
+        監査タブに 1 行しか無ければ、残り 2 頁は「綺麗に成功した頁」と
+        区別が付かない。分岐行は「どの頁を読み直すか」の名簿であり、
+        名簿から漏れた頁は人手抽査の対象にならない。
+
+        頁番号・理由・OCR 長を**行ごとに違う値**にしてある。1 頁目の値を
+        全行へ複写する変異（ループ外で値を束縛する類）もこれで落ちる。
+        """
+        pages = [
+            _page(_bookable(), 1, 5),
+            _page(_bookable(_audit_signal="salvaged:58/62",
+                            _ocr_text_len=1111), 2, 5),
+            _page(_bookable(), 3, 5),
+            _page(_bookable(), 4, 5),
+            _page(_bookable(_audit_signal="envelope_signal_with_entries",
+                            _ocr_text_len=2222), 5, 5),
+        ]
+        ok, writer = _run(pages)
+
+        self.assertTrue(ok)
+        rows = writer.rows_with_verdict(AUDIT_VERDICT_BRANCH)
+        self.assertEqual(len(rows), 2,
+                         "シグナルの在る頁の数だけ分岐行が出ていない")
+        self.assertEqual([r["page_num"] for r in rows], [2, 5])
+        self.assertEqual([r["reason"] for r in rows],
+                         ["salvaged:58/62", "envelope_signal_with_entries"])
+        self.assertEqual([r["ocr_text_len"] for r in rows], [1111, 2222])
+
     def test_a_failed_audit_write_does_not_break_the_page(self):
         """監査書込が失敗しても記帳は成功のままにすること。
 
@@ -453,6 +487,44 @@ class ExcludedPageWriteFailureTest(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertNotIn("📨 除外ページ", writer.stdout)
+
+
+class ExcludedPageToMfTabCarriesItsReasonTest(unittest.TestCase):
+    """穴 4: MF タブ行きの除外ページが、**成功時に理由の文言を運ぶ**こと。
+
+    既存テストは `EXCLUDE_DEST_MF_TAB` の**失敗**経路しか見ていない
+    （書けなければ頁を失敗として数える）。成功経路が無いので、
+    `r.get("memo", "")` を `""` に潰す変異が生き残る —— 顧客の表には
+    金額も科目も文言も空の赤い行だけが残り、「なぜ仕訳が無いのか」を
+    読み取る手段が消える。この行き先は「顧客が必ず目にする場所へ
+    運用ルール違反を伝える」ためだけに存在するので、文言が落ちた時点で
+    行き先を分けた意味そのものが無くなる。
+    """
+
+    def test_the_mf_placeholder_carries_the_producer_memo(self):
+        """提示行の摘要が producer の memo の逐語であること。"""
+        result = _excluded_to_mf()
+        ok, writer = _run([_page(result)])
+
+        self.assertTrue(ok)
+        rows = _unrecognized_rows(writer)
+        self.assertEqual(len(rows), 1, "MF タブに提示行が 1 行出ていない")
+        self.assertEqual(rows[0]["memo"], result["memo"],
+                         "提示行が理由の文言を運んでいない")
+        self.assertEqual(rows[0]["entries"], [],
+                         "提示行が仕訳を持ち込んでいる（MF インポートを汚す）")
+        self.assertEqual(rows[0]["vendor"], "card.pdf",
+                         "どの原票の話か行から辿れない")
+
+    def test_the_mf_destination_writes_no_audit_row(self):
+        """MF 行きの除外は監査タブへ二重に書かないこと。
+
+        両方へ書くと除外の件数が行き先ごとに二重計上され、
+        `main._record_excluded_page` の「行き先は 1 つ」の語義と割れる。
+        """
+        _, writer = _run([_page(_excluded_to_mf())])
+        self.assertEqual(writer.rows_with_verdict(AUDIT_VERDICT_EXCLUDED), [],
+                         "MF 行きの除外が監査タブにも書かれている")
 
 
 class AuditWriteFailureIsNotNarrowedTest(unittest.TestCase):
