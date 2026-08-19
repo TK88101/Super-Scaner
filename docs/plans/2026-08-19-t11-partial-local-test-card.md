@@ -506,3 +506,129 @@ URL 欄が空の行で絞り込めばよい。
 | P2 | `local_test.py` docstring の CSV 記述 | `:4` 「Gemini API のみ」・`:16` 「MF_Import_Data.csv を確認」は Sheets 出力版の現状と不一致（既存の誤り。本変更が持ち込んだものではない） |
 | P2 | `missing_doc_types` 相当の述語が 3 箇所 | `ocr_engine._validate_doc_type_registries` ／ `card_reconciliation._validate_recon_policy` ／ 本テスト。各 1 行で YAGNI 圏内 |
 | P2 | 番人テストの分量 | 722 行。4 ラウンドの評審で積み上がった。妥当と判断したが、趙が過大と見るなら削る候補は §10 の「駁回」欄には無く、`UNREADABLE_SOURCES` の 12 例の一部 |
+
+---
+
+## 15. T8 着手前の必須 3 件の結果（2026-08-19 実施）
+
+### 15.1 件 1: `_yield_page_results` の分岐構造と、除外出口の挿入位置
+
+**通読した実物の構造**（`ocr_engine.py:2207-2342`）:
+
+```
+_yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix, envelope_filter)
+├ G1  raw_data 非 dict → _unrecognized、return          （型ゲート。全経路）
+├     _apply_ocr_overrides(...)
+├ G2  _is_social_insurance_notice → _excluded_page + MF_TAB、return
+│       ※ doc_type 不問・envelope_filter 不問・**entries 不問**（業務規則）
+├ B-RECEIPT （doc_type == RECEIPT）
+│  ├ page_results = _normalize_receipt_results(...)
+│  ├ is_envelope = envelope_filter and _is_envelope_page(...)
+│  ├ page_results 空 かつ is_envelope → _excluded_page + AUDIT_TAB、return
+│  ├ page_results 空          → _unrecognized、return
+│  ├ is_envelope（entries 有）→ 先頭に _audit_signal、全行 yield、return
+│  └ 全行 yield、return
+└ B-OTHER
+   ├ builder 無し → 何も yield せず return（防御的。到達しない想定）
+   ├ result = _build_doc_result(doc_type, raw_data, builder(raw_data))
+   │            ※ ここで `_unrecognized = not entries` が決まる（:1932）
+   ├ not _is_line_mode → yield result、return
+   └ yield from _yield_line_mode_results(result, raw_data, ocr_text, prefix)
+```
+
+**挿入位置の候補と、証拠による絞り込み**:
+
+| 候補 | 位置 | 判定 | 根拠 |
+|---|---|---|---|
+| P-A | G2 と同層（社保の直後） | **排除** | doc_type gate が無い。「ポイント」語はポイントカード提示の領収証券面に普通に出る。RECEIPT を巻き込んで誤爆する |
+| P-B | `_build_doc_result` の**後**、`_is_line_mode` 分派の直前 | **採用** | `result["entries"]` / `result["_unrecognized"]` を見られる唯一の位置。PDF 逐頁ループと尾段（単頁 PDF・画像）の**両方**を通る（尾段は `ocr_engine.py:2760` が既定 `envelope_filter=False` で同関数を呼ぶ） |
+| P-C | `_yield_line_mode_results` の内部 | **排除** | 同関数の docstring が「**ここが足すのは注記であって頁の去向ではない**…AD-0 / T9 の Disposition 軸には乗らない」と明記（`ocr_engine.py:2378-2380`）。去向を入れると T9 の設計と衝突する |
+
+**なぜ P-B なら「判定失敗時に真の明細頁を呑む」を構造的に防げるか**:
+P-B は `result["entries"]` を持つ。IP-401 が封筒判定に施したのと同じ
+「entries を組めていれば棄却経路は存在しない」ゲートをそのまま適用できる。
+判定が誤爆しても、明細行が 1 行でも取れている頁は絶対に除外へ落ちない。
+
+**消費側は無改修で足りる**（実測）:
+- `main.process_file:543` の `_excluded_page` 分岐は **doc_type を見ない**。
+  line_mode 由来の除外もそのまま監査タブへ落ちる
+- `error_pages` には数えず `count` には数えるので、全頁除外でも
+  `count>0 → Failed 無限リトライ` にならない（`main.py:530-565` のコメント）
+- `local_test.py:160` も同形（部分 T11 で揃え済み）
+
+**未確定（実測が要る）**: P-B のゲートを「entries 空のときだけ」にするか、
+社保と同じく entries を見ずに短絡させるか。判準は
+**「防ぐ誤りが〈Gemini が entries を組めない〉か〈Gemini が誤った entries を組む〉か」**。
+- #5 ポイント頁 → **前者と実測済**（§12 の真票 p6 が entries=0 → 認識不能）。
+  entries 空ゲートで足りる
+- #6 リボ頁 → **未実測**。§15.2 の p8 は円金額と日付を持つので、
+  Gemini が偽の明細を組む可能性を排除できない。推測で決めない
+
+### 15.2 件 2: 参考資料の版面（`アメックスカード明細/2023年1月.pdf`・全 8 頁）
+
+`pdftoppm -r 110` で全 8 頁を採取して実見した。**主副カード合印の実物**。
+
+| 頁 | 内容 |
+|---|---|
+| 1 | 券面ヘッダ ＋ お支払い金額内容（前回分口座振替 −635,375）＋ `今月ご利用額 西久保 智宏 様`（主カード区画の見出し）＋ 明細 4 行 |
+| 2-4 | 主カードの明細続き（p2 の下部に用語説明の長文） |
+| 5 | 主カード明細の続き → **`西久保　智宏　様　今月ご利用額合計　350,218`** → **`今月ご利用額　西久保　絵理　様`（副カード区画の見出し・会員番号 71016）** → 副カード明細 |
+| 6 | 副カード明細 4 行 → **`西久保　絵理　様　今月ご利用額合計　162,615`** → **`今回ご利用・ご請求金額合計　512,833`** |
+| 7 | **ポイント・インフォメーション**（#5 の実物） |
+| 8 | **ペイフレックス登録・利用・請求状況一覧**（#6 の実物） |
+
+検算: 350,218 ＋ 162,615 ＝ 512,833。**券面の 3 数値は厳密一致**。
+
+#### #4（各人小計を記録に入れない）の判定条件
+
+- 券面の逐語は **`<氏名> 様　今月ご利用額合計`**。ラベル自体に「合計」を含む
+- **構造特徴: 小計行・総額行は左端の日付欄が空**。真の明細行は必ず `M月D日` を持つ
+- 区画の切替は **`今月ご利用額 <氏名> 様` ＋ 会員番号**の 2 行（p1 と p5 に出現）
+- prompt 側は `card_prompts.py:159-160`「合計行・小計行を rows に入れないでください」
+  が**文面上は覆っている**（このラベルは字義どおり合計行）
+- **プログラム側の兜底は無い**（実測）。`ocr_engine._is_subtotal_line` は
+  領収書経路専用（`:1502` の `_build_entries_for_single_doc` からのみ）。
+  `card_entries.resolve_booking_kind` に小計行の分岐は無く、
+  `_CARRY_OVER_LABELS` にも「今月ご利用額合計」は当たらない。
+  Gemini が rows に入れてしまえば **350,218 がそのまま記帳される**
+
+#### #6（リボ・分割頁）の実際の見え方（p8）
+
+- 見出し: `ペイフレックス登録・利用・請求状況一覧（金額はすべて円）`
+- 表 1「ペイフレックス登録状況」: 登録プラン名 / **登録日 2020年10月8日** /
+  **リボルビング払い利用可能枠 1,500,000** / 基本手数料率 14.90 /
+  **あとリボ変更締切日 2023年1月30日**
+- 表 2「今回ペイフレックス請求金額明細」: 5 項目すべて **0**
+- 下半分は用語説明の長文
+
+**危険点**: この頁は**円金額と日付の両方を持つ**。
+「登録日 2020年10月8日 ／ 1,500,000」を明細 1 件として組まれると、
+存在しない 150 万円の仕訳が入る。§15.1 の未確定はここに由来する。
+
+#### #5 の実際の見え方（p7）
+
+- 見出し: `ポイント・インフォメーション`
+- `今回の獲得ポイント 18,980` / `今回のボーナス・ポイント 0` / `今回の調整ポイント 0`
+- `【獲得ポイント】カードの種類 / 会員番号 / ポイント数` / `◆獲得ポイント計 18,980`
+- **日付行なし・円貨なし**（18,980 はポイント数）。構造的に仕訳対象ゼロ
+
+### 15.3 件 3: P2 テスト 2 本（実施済・変異検証済）
+
+`test_local_test_page_audit.py` に 3 メソッドを追加（全量 1055 → **1058 tests 緑**）。
+
+| 追加 | 殺す変異 | 実測 |
+|---|---|---|
+| `AuditSignalIsRecordedTest.test_every_signalled_page_gets_its_own_branch_row` | 分岐行を先頭 1 本に限定（`if audit_signal and not _branch_done:`） | 変異 A で当該テストのみ FAIL |
+| `ExcludedPageToMfTabCarriesItsReasonTest.test_the_mf_placeholder_carries_the_producer_memo` | `r.get("memo", "")` → `""`（顧客に文言が届かない） | 変異 B で当該テストのみ FAIL |
+| `ExcludedPageToMfTabCarriesItsReasonTest.test_the_mf_destination_writes_no_audit_row` | MF 行きでも監査タブへ二重書き | 変異 C で当該テストのみ FAIL |
+
+既存 `test_an_audit_signal_produces_a_branch_row` は 1 頁にしかシグナルを
+載せないため「先頭 1 本だけ」変異が生存していた。MF 行きは**失敗経路**
+しか固定されておらず、成功経路の memo が空に潰れても誰も気づかなかった。
+
+### 15.4 この 3 件で見つかった **T8 スコープ外**の所見
+
+| P | 所見 | 詳細 |
+|---|---|---|
+| P1 | **主副カードで検算が「合計不整合」に落ちる**（T9） | `card_reconciliation.TOTAL_LABEL_SECTION`（`:97-105`）は「今月ご利用額合計」と「今回ご利用・ご請求金額合計」を**どちらも `SECTION_CURRENT_USAGE`** に登録している。2023年1月.pdf は同一区画に 350,218 / 162,615 / 512,833 の 3 値が並ぶ。`_choose_section_and_total`（`:681-688`）は `len(current) > 1` で **`"合計不整合"`** を返すので、健全な券面で偽の不整合が出る。頁ヘッダの `member_no` は全頁 71008（基本会員）なので、カード別バケツにも分かれない。**T9 で接線する前に決着が要る** |
+| P2 | #4 のプログラム側兜底が無い | 上記 §15.2。prompt 頼み。T8 で入れるかは Plan で決める |
