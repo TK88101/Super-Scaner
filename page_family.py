@@ -395,6 +395,57 @@ def _looks_like_detail_rows(t):
     return len(_RE_AMOUNT_TOKEN.findall(t)) >= MIN_DETAIL_AMOUNT_TOKENS
 
 
+# ── T8b: 同一頁の複数カード区画 ────────────────────────────────
+# 券面の構造:
+#   … 明細行 … → 「<氏名> 様 今月ご利用額合計 350,218」  ← 区画の**終わり**
+#              → 「今月ご利用額 <氏名> 様 会員番号 …」    ← 次の区画の**始まり**
+# この 2 つが同じ頁に在れば、その頁で区画が切り替わっている。
+#
+# 骨格照合にするのは PaddleOCR の崩れを吸収するため（実測: 「ご」→「乙」、
+# 「額」→「额」）。`_SIMPLIFIED_TRANS` の後でも「乙」は残るので `.{0,2}` で跨ぐ。
+_RE_USAGE_HEADING = re.compile(r"今月.{0,2}利用[额額]")
+_TOTAL_SUFFIX_WINDOW = 14      # 見出しの直後、この文字数以内に「合計」が在れば合計行
+
+
+def count_section_markers(ocr_text):
+    """この頁に在る「区画の境目」の数。**判定不能なら None**。
+
+    戻り値の意味:
+      - ``None`` … OCR テキストが空（判らない）。**健全と断じてはいけない**
+      - ``0``    … 境目なし（前頁からの続き）
+      - ``1``    … 区画頭 1 つだけ（単一区画の先頭頁）
+      - ``2`` 以上 … **この頁で区画が切り替わっている**
+
+    なぜ検査器がここに要るか（2026-08-19 の実測）: 主副カードが 1 通に
+    合印された券面で、Gemini が主カード分だけを報告し副カード 11 行・
+    146,671 円が消えた。しかも `rows_on_page` の自己申告も 8（＝取得数と
+    一致）だったため `card_salvage` の行欠け検出も沈黙した。
+    **被検査者の申告から検算基準を取ると、被検査者が漏らしたものは
+    その申告にも現れない。** だから券面テキストという独立の材料で数える。
+
+    会員番号を判定に使わない理由（実測）: 同じ p5 で `_extract_card_keys`
+    が拾えたのは主カードの 71008 だけで、副カードの 71016 は OCR が
+    ``016`` としか読めていなかった。**目標の場面でちょうど効かない**ので、
+    補助シグナルとしても入れない —— 検出力を足さずに誤報面だけ広げる。
+
+    純関数・例外を投げない（`page_family` の既存の約束）。
+    """
+    try:
+        raw = str(ocr_text or "")
+        if not raw.strip():
+            return None                      # unknown。0 と区別する
+        t = _collapse_spaces(
+            unicodedata.normalize("NFKC", raw).translate(_SIMPLIFIED_TRANS))
+        marks = 0
+        for m in _RE_USAGE_HEADING.finditer(t):
+            # 合計行も区画頭も等しく「境目」として数える。前者は区画の終わり、
+            # 後者は始まりで、どちらが在っても頁内に境目が在ることに変わりない。
+            marks += 1
+        return marks
+    except Exception:                        # noqa: BLE001 — 全域関数の約束
+        return None
+
+
 def _extract_card_keys(nfkc_text):
     """カード番号候補（facet）。マスク記号と桁の並びを保つため、空白を畳む前の
     NFKC 済みテキストから拾う。

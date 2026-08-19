@@ -36,6 +36,7 @@ from page_dedup import (  # noqa: E402
 )
 from page_family import (  # noqa: E402
     ACTION_BOOK,
+    count_section_markers,
     CC_FAMILY_DOC_TYPES,
     ACTION_EXCLUDE,
     ACTION_UNRECOGNIZED,
@@ -886,3 +887,67 @@ class ContractWithOcrEngineTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── T8b: 同一頁の複数カード区画 ─────────────────────────────────
+# 実測（2026-08-19・アメックス 8 頁の主副カード合印）を再現した合成テキスト。
+# 顧客実名・会員番号は伏せ、**OCR の崩れ方だけ**を保存する
+# （「ご」→「乙」、「額」→「额」。骨格照合がこれを吸収できねば意味が無い）。
+_SECTION_SWITCH_PAGE = (
+    "AMERICAN EXPRESS 利用代金明細書 518ペー 田中 太郎様 会员番号 ******71008 "
+    "1月3日 イデミツ アポロ シェル 7,254 1月5日 ソフトバク 10,000 "
+    "田中 太郎 様今月乙利用额合計 350,218 "          # ← 合計行（区画の終わり）
+    "今月ご利用额 田中 花子様 会员番号 016 "          # ← 区画頭（次の区画の始まり）
+    "12月21 ソフトバク 10,000 12月26 ローレル石販 7,454"
+)
+_SINGLE_SECTION_PAGE = (
+    "AMERICAN EXPRESS 利用代金明細書 118ペー 田中 太郎様 会员番号 ******71008 "
+    "今月ご利用额 田中 太郎様 "                        # ← 区画頭 1 つだけ
+    "12月11日 ETC 特別割引 九州 250 12月16日 ソフトバク 10,000"
+)
+_CONTINUATION_PAGE = (
+    "AMERICAN EXPRESS 利用代金明細書 218ペー 会员番号 ******71008 "
+    "12月18日 ETC 250 12月20日 セブンイレブン 2,246"   # ← マーカー無しの続き頁
+)
+
+
+class SectionSwitchDetectionTest(unittest.TestCase):
+    """T8b-1: 同一頁で区画が切り替わったことを検出する。
+
+    実害（2026-08-19 実測）: 主副カードが 1 通に合印された券面の p5 で、
+    Gemini が主カード分だけを報告し**副カード 11 行・146,671 円が
+    静かに消えた**。しかも `rows_on_page` の申告も 8（＝取得数と一致）
+    だったため `card_salvage` の行欠け検出も沈黙した。
+
+    検査器を Gemini の**外**に置くのがこの関数の役目。判定は券面の構造
+    （合計行＝区画の終わり ／ 区画頭＝次の始まり）に基づき、
+    会員番号には依存しない —— 実測で副カードの番号は OCR が
+    `016` としか読めておらず、押すと必ず漏れる。
+    """
+
+    def test_switch_page_is_detected(self):
+        self.assertGreaterEqual(count_section_markers(_SECTION_SWITCH_PAGE), 2,
+                                "合計行 ＋ 区画頭 で切替と判る")
+
+    def test_single_section_page_is_not_a_switch(self):
+        self.assertLess(count_section_markers(_SINGLE_SECTION_PAGE), 2,
+                        "区画頭 1 つだけの頁を切替と誤報してはいけない")
+
+    def test_continuation_page_has_no_marker(self):
+        self.assertEqual(count_section_markers(_CONTINUATION_PAGE), 0)
+
+    def test_ocr_corruption_is_absorbed(self):
+        """「ご」→「乙」「額」→「额」の崩れでも骨格で拾えること。"""
+        self.assertGreaterEqual(
+            count_section_markers("田中 様今月乙利用额合計 350,218 "
+                                  "今月ご利用额 花子様 1月1日 テスト 100"), 2)
+
+    def test_empty_text_is_unknown_not_healthy(self):
+        """OCR が取れなかった頁を「健全（0 個）」と断じない。
+
+        検査器は Gemini の外に在るが、**同じ OCR 入力に依存する**。
+        入力が空なら「区画は無い」ではなく「判らない」が正しい
+        （Codex 評審 HIGH-4）。
+        """
+        self.assertIsNone(count_section_markers(""))
+        self.assertIsNone(count_section_markers("   "))
