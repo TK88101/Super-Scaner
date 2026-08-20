@@ -113,5 +113,56 @@ class SchemaInvariantTest(unittest.TestCase):
                 self.assertIn("取得できた数ではなく券面に見えている数", prompt)
 
 
+class SectionScopeTest(unittest.TestCase):
+    """T8b-3: 「頁内の複数区画」と「跨頁の推測補完」を別の軸として書く。
+
+    実害（2026-08-19 実測）: 旧文の「**この 1 ページに見えているカード
+    1 枚分だけ**を報告してください」が、主副カード合印の券面で
+    **副カード 11 行・146,671 円を丸ごと落とさせた**。Gemini の失敗ではなく
+    指令どおりの動作である。しかも `rows_on_page` の申告も 8（＝取得数）
+    だったので行欠け検出も沈黙した。
+
+    ただし旧文の後半（他頁の情報で補わない）は **F-1（1 つの PDF に
+    3 社分の明細が混在する）への対策として正しい**。消すと別の事故が戻る。
+    2 つの軸を分けて両方残すのがこのテストの守る形（Plan §3.1）。
+    """
+
+    def test_the_one_card_limiter_is_gone(self):
+        """区画を限縮する旧文が復活していないこと。"""
+        self.assertNotIn("カード 1 枚分だけ", cp.CREDIT_CARD_PROMPT)
+
+    def test_all_sections_on_the_page_must_be_reported(self):
+        self.assertIn("すべての区画のすべての明細行", cp.CREDIT_CARD_PROMPT)
+
+    def test_cross_page_inference_is_still_forbidden(self):
+        """軸の分離であって緩和ではない。F-1 対策は残す。"""
+        self.assertIn("他ページの情報を推測で補わないでください",
+                      cp.CREDIT_CARD_PROMPT)
+
+    def test_rows_carry_their_section_index(self):
+        """区画を全部報告させるなら、行がどちらに属するかも要る。
+
+        `sec` が空だと T8b-2 の #2 検査（区画は複数・行は片側）が
+        distinct=0 で鳴り続け、監査タブが雑音で埋まる。
+        """
+        self.assertIn("sec", cp.CREDIT_CARD_PROMPT)
+        self.assertIn("どの区画に属するか", cp.CREDIT_CARD_PROMPT)
+
+    def test_rows_on_page_counts_every_section(self):
+        """甲（Plan §3.2）: 自己申告の側も区画で限縮させない。
+
+        ここを直さないと、Gemini が主カードだけ返したとき申告も 8 のままで
+        `card_salvage` の行欠け検出が沈黙する（実害そのものの形）。
+        """
+        self.assertIn("頁全体・全区画の合計", cp.CREDIT_CARD_PROMPT)
+
+    def test_transit_ic_prompt_is_untouched(self):
+        """nimoca に区画（sections）は無い。T8b-3 の変更を漏らさないこと。"""
+        for phrase in ("すべての区画のすべての明細行", "頁全体・全区画の合計",
+                       "どの区画に属するか"):
+            with self.subTest(phrase=phrase):
+                self.assertNotIn(phrase, cp.TRANSIT_IC_PROMPT)
+
+
 if __name__ == "__main__":
     unittest.main()
