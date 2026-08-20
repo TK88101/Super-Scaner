@@ -386,3 +386,105 @@ PaddleOCR 生テキストには区画切替も副カード 11 行も入ってい
 反証できた項目が無かった。
 
 **状態: 定稿**（実装可）。ただし §9 の 3 点は趙の拍板待ち。
+
+---
+
+## 11. 実施記録（T8b-2 / T8b-3 / T8b-4。2026-08-19）
+
+### 実装したもの
+
+| | 中身 | 置き場所 |
+|---|---|---|
+| T8b-2 判定 | `section_audit_signals(doc_type, ocr_text, raw_data)` ＋ `SECTION_AUDIT_DOC_TYPES` | `page_family.py`（純関数・venv 非依存） |
+| T8b-2 接線 | `_page_audit_signal` で族シグナルと合成 → `_apply_page_audit_signal` | `ocr_engine._yield_page_results` の line-mode 枝 |
+| T8b-3 | ① を 2 文に分割（頁内は全区画報告 ／ 跨頁は推測禁止）＋ `rows_on_page` に「頁全体・全区画の合計」 | `card_prompts.py` |
+| T8b-4 | 兜底を入れず現状を回帰固定（無兜底 ＋ 日付空が `missing_date` 赤系で拾う） | `test_card_total_row.py` |
+
+`_apply_family_signal` は `_apply_page_audit_signal` へ改名（族だけでなく区画
+シグナルも運ぶようになったため）。呼出点は 1 箇所で公開 API は無改変。
+
+### 実測による裏取り（合成 fixture ではなく真票の PaddleOCR 生テキスト）
+
+前 session が保存した p1〜p6 の生テキストで検出器を回した。Plan §9.5 の
+実測表と逐字一致し、`section_audit_signals` の出力も設計どおりだった。
+
+| 申告の形 | p1〜p4・p6 | p5 |
+|---|---|---|
+| 事故当時（sections=1・8 行すべて sec=0） | 全て沈黙（**誤報ゼロ**） | `section_undercount:2/1` ＋ `section_rows_missing:2/1` |
+| 修復後に期待する形（sections=2・行が両区画に分布） | — | 沈黙 |
+| Codex HIGH-3 の抜け道（sections=2 と申告し行は片側） | — | `section_rows_missing:2/1` |
+
+### 実施後評審の裁決（codex review ＋ simplify 4 視点）
+
+**駁回 1 件・採納 10 件**（うち 1 件は部分採納）。
+
+| 出所 | 深刻度 | 指摘 | 裁決 |
+|---|---|---|---|
+| codex | P3 → **P1 へ格上げ** | 追記したテストが `unittest.main()` guard の後ろに在り、直接実行で静默スキップ | **採納**。guard を末尾へ戻す（直接実行 16 → 19 件で実証） |
+| Reuse | P1 | `_section_index` が `card_reconciliation._coerce_int` の**第 2 の規則**になっている | **採納**。`card_entries.py:212` が同じ `sec` を `_coerce_int` で読んでいることを確認して統一。float `1.0` を「読めない」と数えて distinct を減らす偽陽性が実在した |
+| Simplification | P1 | dict guard が非対称で、**JSON 破損 ∧ OCR 空**のとき `()` を返す | **採納**。guard を先頭へ。2 つの独立信号が同時に落ちた頁が一番静かになる、IP-401 と同型の欠陥だった |
+| Altitude | P1 | EXCLUDE の早期 return が区画突合を跳ばす | **部分採納**（下記） |
+| Efficiency | P2 | NFKC 正規化が頁あたり 2 度走る | **採納（注記のみ）**。agent 自身が「正規化済み文字列を引き回すと結合が増え、得るのは sub-ms」と判定 |
+| Reuse | P2 | `_TOTAL_ROW` が `ocr_test_fixtures._cc_row` を使っていない | **採納** |
+| Reuse | P2 | `_sec_raw` が `_raw` の `**extra` を使っていない | **採納** |
+| Simplification | P2 | `getattr(disposition, …) if disposition else None` の ternary が no-op | **採納** |
+| Altitude | P2 | モジュール docstring が第 3 の責務（監査シグナル生成）を書いていない | **採納** |
+| Altitude | P2 | doc_type gate が未登録の表になっている | **採納**。`SECTION_AUDIT_DOC_TYPES` ＋ `DocType.ALL` を歩く動的テスト（7 枚の表と同じ轍を踏まない） |
+| Simplification | P2 | テスト 2 箇所の重複 | **駁回**。agent 自身が "defensible" と判定。純関数層と接線層で守る対象が違い、`test_section_audit` は venv 非依存を保つため重い側の fixture を import できない |
+
+### Altitude F3 を部分採納にした理由（T9 へ持ち越し）
+
+穴は**実在する**。実測で構成できた: `rows=[]`（entry_count=0）・OCR は区画頭と
+合計行を読めている（markers=2）・明細本体は `has_detail_rows` の閾値（日付 5
+＋ 金額 5）に届かない、という頁は `cc_summary` として MF タブへ落ち、
+区画突合の 2 本の信号（`section_undercount:2/0` ＋ `section_rows_missing:2/0`）が
+**1 つも消費されない**。しかも MF タブに出る文言は「合計表ページ」で、
+実際は読み落とした明細頁なのにそう見えない。
+
+今回直さなかったのは**消費側が塞がっている**から。`main.process_file` の
+除外分岐（`_excluded_page` → `_record_excluded_page` → `continue`）は
+`_audit_signal` の処理へ到達せず、しかも MF タブ行き（本ケース）は監査タブに
+何も書かない。producer 側に `_audit_signal` を積むだけでは**書き込まれない
+信号**になり、穴より質が悪い。塞ぐには `main` と `local_test` 双方の制御フローと
+「同一頁に監査 2 行」の語義を決める必要があり、T8b の範囲を超える。
+
+`test_page_disposition_wiring.ExcludedPageSkipsTheSectionAuditTest` に
+**expectedFailure で固定済**（`RiboPageZeroBaselineTest` と同じ運用）。
+変異検証済: 装飾子を外すと**目標断言**（区画信号の可視化）で落ち、前提断言
+（`_excluded_page`）は通る。**T9 の完了条件＝この装飾子を外すこと。**
+
+### 既知の限界（誇張しない）
+
+- 区画頭と合計行が同じ頁に揃うと markers=2 になるので、**1 頁で 1 区画が
+  完結する短い券面**は `section_undercount` が偽陽性になりうる。実測の
+  アメックス 6 頁・8 頁券面では起きない（p1 は区画頭のみで markers=1）。
+  閾値を上げると塞ぎたかった p5 が漏れるので、この向きで倒す。
+- 検出器が沈黙するのは `ocr_text` が空のときだけ。**非空だが内容が壊れて
+  いる**場合は markers=0 と数え、unknown にはならない。Plan §3.2 が
+  「OCR 入力段の欠落は unknown として可視化する」と書ける範囲はここまで。
+- T8b-3 の効果（Gemini が実際に全区画を返すか）はコードで検証できない。
+  **T8b-5 の真票回帰が唯一の判定手段**。
+
+### 評審の収束
+
+- codex review ラウンド 2（修正後の diff に対して）: **回帰の指摘ゼロ**
+  （"I did not identify any discrete regression in the changed code"）。
+- simplify は 1 ラウンドのみ（4 視点は全て実施済）。2 ラウンド目を回さなかった
+  理由: 同一の変更集合に対する 2 巡目は逓減し、修正後の独立検証は codex
+  ラウンド 2 が担っている。**early exit の判断であって省略ではない。**
+- 変異検証（実装を 1 箇所ずつ壊してテストが赤くなることの確認）:
+
+  | 変異 | 殺したテスト数 |
+  |---|---|
+  | 条件 #1（undercount）を殺す | 4 |
+  | 条件 #2（rows_missing）を殺す | 3 |
+  | 条件 #3（unknown）を黙らせる | 2 |
+  | dict guard を非対称形へ戻す | 5 |
+
+  4 変異とも赤くなり、復元で全緑に戻った。**3 本の条件はそれぞれ独立に
+  守られている**（1 本消しても他のテストが緑のまま、ということが無い）。
+
+### 残す P2（T9 で扱う）
+
+`page_family.py` が 755 行（上限 800）。本件で 116 行増えた。次に足す前に
+分割を検討すること。
