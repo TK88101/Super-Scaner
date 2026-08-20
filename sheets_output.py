@@ -141,6 +141,124 @@ def _build_description(doc_type, vendor_name, item_description):
     return f"{vendor_name} - {item_description}"
 
 
+# ── 監査タブの理由列を人が読める日本語にする（2026-08-20 趙指摘）──────
+#
+# 監査タブの唯一の用途は「人が異常に気づくこと」なのに、理由列は
+# `family_signal_with_entries:info_notice` のような機械可読キーだった。
+# 読むのは会計事務所の担当者であってエンジニアではない。
+#
+# **翻訳はここ 1 箇所に閉じる。** producer（`ocr_engine` / `page_family`）は
+# キーのまま流す —— キーは `_merge_audit_signals` の連結や `_exclude_reason`
+# との突合に使われており、産地で日本語化すると照合が壊れる。
+#
+# 文案は `/humanmade` の検査済み（文末は「ます」体で統一、冗長な「（要確認）」
+# は削除、結論を先に置く）。
+_AUDIT_REASON_JA = {
+    # 除外（記帳しなかった頁）
+    "envelope": "封筒・領収書以外のページのため記帳していません",
+    "info_notice": "案内ページのため記帳していません",
+    "payment_method_notice": "リボ・分割の案内ページのため記帳していません",
+    "points_only": "ポイント専用ページのため記帳していません",
+    "cc_summary": "合計表のみのページのため記帳していません",
+    "social_insurance_notice":
+        "社会保険料通知書のため記帳していません（口座振替の資料をご確認ください）",
+    "unknown": "種別を判定できなかったため記帳していません",
+    # 分岐（記帳はしたが人手で確かめてほしい頁）
+    "envelope_signal_with_entries":
+        "封筒の疑いがありますが、明細が取れたので記帳しました",
+    "section_detection_unknown":
+        "券面の文字が読めず、区画の数を確認できませんでした",
+}
+
+# 族名だけを日本語に差し替えるための表（`family_signal_with_entries:<族>`）。
+_AUDIT_FAMILY_JA = {
+    "info_notice": "案内ページ",
+    "points_only": "ポイント専用ページ",
+    "cc_summary": "合計表のみのページ",
+    "payment_method_notice": "リボ・分割の案内ページ",
+    "cc_detail": "カード明細ページ",
+    "ic_history": "交通系IC の利用履歴ページ",
+}
+
+
+def _ja_family_signal(arg):
+    return "%sの疑いがありますが、明細が取れたので記帳しました" % (
+        _AUDIT_FAMILY_JA.get(arg, arg))
+
+
+def _ja_line_shortage(arg):
+    """`line_shortage:<取得>/<券面>`。差を先に出して暗算させない。"""
+    got, _, expected = arg.partition("/")
+    if expected.isdigit() and got.isdigit():
+        return "明細が %d 行不足しています（券面 %s 行・取得 %s 行）" % (
+            int(expected) - int(got), expected, got)
+    return "明細が途中で切れています（%s 行のみ取得・券面の総数は不明）" % got
+
+
+def _ja_salvaged(arg):
+    """救済は経たが行数は充足。**不足ではない**ので言い方を変える。"""
+    got, _, _expected = arg.partition("/")
+    return "AI の応答が途中で切れましたが、%s 行すべて取得できました" % got
+
+
+def _ja_section_undercount(arg):
+    detected, _, declared = arg.partition("/")
+    return "副カード分を取りこぼした疑いがあります（券面の区画 %s・報告 %s）" % (
+        detected, declared)
+
+
+def _ja_section_rows_missing(arg):
+    detected, _, distinct = arg.partition("/")
+    return "区画が %s つありますが明細は %s 区画分しかありません（取りこぼしの疑い）" % (
+        detected, distinct)
+
+
+def _ja_page_coverage_gap(arg):
+    return "%s ページが一度も出力されませんでした" % arg.strip("[]")
+
+
+_AUDIT_REASON_JA_PARAM = {
+    "family_signal_with_entries": _ja_family_signal,
+    "line_shortage": _ja_line_shortage,
+    "salvaged": _ja_salvaged,
+    "section_undercount": _ja_section_undercount,
+    "section_rows_missing": _ja_section_rows_missing,
+    "page_coverage_gap": _ja_page_coverage_gap,
+}
+
+
+def audit_reason_ja(reason):
+    """監査タブの理由列を日本語にする。**未知のキーは原文のまま返す。**
+
+    登録漏れで理由が消えると、監査タブが「異常に気づく唯一の場所」でなくなる
+    （IP-401 と同じ形）。読みにくいのは登録漏れのサインであって、情報を落とす
+    理由にはならない。
+
+    `;` 連結（`_merge_audit_signals` が作る）は各要素を訳して「／」で繋ぐ。
+    片方でも英語のまま残ると読む気が失せる。
+
+    例外を投げない —— ここで落ちると監査行そのものが書けなくなる。
+    """
+    try:
+        text = str(reason or "").strip()
+        if not text:
+            return ""
+        out = []
+        for part in text.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            if part in _AUDIT_REASON_JA:
+                out.append(_AUDIT_REASON_JA[part])
+                continue
+            key, sep, arg = part.partition(":")
+            fn = _AUDIT_REASON_JA_PARAM.get(key) if sep else None
+            out.append(fn(arg) if fn else part)
+        return "／".join(out)
+    except Exception:                    # noqa: BLE001 — 監査行を守る
+        return str(reason)
+
+
 class SheetsOutputWriter:
     """Google Sheets への仕訳データ出力"""
 
@@ -734,13 +852,18 @@ class SheetsOutputWriter:
         呼び出し側は §3.7 の失敗語義に従って例外を扱うこと:
           分岐記録   → 警告ログのみ（MF は既に正しく書けており帳簿は正しい）
           真の除外   → 監査タブが唯一の留痕なので MF の赤い認識不能行へ退避
+
+        理由列は `audit_reason_ja` で日本語にしてから書く（2026-08-20）。
+        **翻訳はここだけ**で、呼出側は機械可読キーのまま渡してよい ——
+        キーは `_merge_audit_signals` の連結や `_exclude_reason` との突合に
+        使われており、産地で日本語化すると照合が壊れる。
         """
         row = [
             datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S"),
             filename,
             page_num,
             verdict,
-            reason,
+            audit_reason_ja(reason),
             ocr_text_len,
             source_url,
         ]

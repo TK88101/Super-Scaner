@@ -761,7 +761,14 @@ class AuditTabTest(unittest.TestCase):
         ws = writer.spreadsheet.worksheet(AUDIT_TAB_NAME)
         row = ws.appended[-1]
         self.assertEqual(len(row), len(AUDIT_HEADERS))
-        self.assertEqual(row[1:], ["r.pdf", 3, "除外", "envelope", 55, "https://x/3"])
+        # 2026-08-20: 理由列は日本語で書く（趙指摘「機械語は正常人が読めない」）。
+        # 呼出側は機械可読キーのまま渡し、`append_audit_row` が訳す。
+        self.assertEqual(
+            row[1:],
+            ["r.pdf", 3, "除外", "封筒・領収書以外のページのため記帳していません",
+             55, "https://x/3"])
+        self.assertNotIn("envelope", str(row),
+                         "機械キーが監査タブに漏れている（翻訳が効いていない）")
         self.assertRegex(row[0], r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}$")
 
     def test_existing_tab_with_wrong_header_is_not_overwritten(self):
