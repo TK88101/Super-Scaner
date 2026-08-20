@@ -44,6 +44,37 @@ venv311/bin/python -m unittest discover -p "test_*.py"     # 全部根目录测�
 
 根目录 `test_*.py` 与被测模块同名配对 (如 `test_anomaly_detector.py` ↔ `anomaly_detector.py`)。
 
+### Gemini 应答的记录再生（`gemini_record.py`）
+
+**Gemini 在 `temperature=0` 下仍然会摇。** 2026-08-20 用同一份 PDF、同一份代码
+跑了 3 次，TS CUBIC p8 的 54 行日期「有→全无→有」，`card_name` 充填
+「58/208 → 1/210」，连券面总行数的读数都从 58 变成 57。当时花了 3 轮
+monkey patch 观测才把「模型摇」和「代码退化」分开。**记录再生就是为了不再做这件事。**
+
+```bash
+python local_test.py --record fixtures/tscubic    # 叫真 Gemini，把应答录到磁盘
+python local_test.py --replay fixtures/tscubic    # 一次都不叫 Gemini，重现同样结果
+python local_test.py --replay fixtures/tscubic --accept-drift ocr   # 只放行 OCR 部位的差分
+```
+
+- **产品代码 0 行改动**。`ocr_engine.py` / `main.py` 里没有任何开关，
+  是 `gemini_record` 的 context manager 在运行时把函数换掉。
+  **绝对不要把它接进 `main.py`** —— 生产误入再生路径 = 无声写错客户的帐。
+  `test_gemini_record_replay.ProductionIsolationTest` 用 AST 看着这条。
+- 换掉的是 4 个函数（`_generate_content_with_retry` 与 3 个变体）。
+  **改名会让 patch 静静地不生效**（不报错、测试照样绿、却在叫真 Gemini）——
+  名单在 `gemini_record.PATCH_TARGETS`，`PatchTargetContractTest` 看着它。
+- 录音的键是**部位别哈希**（`text` / `prompt` / `ocr` / `image` / `config` /
+  `call_kind`）。不一致就抛异常并说清**哪个部位**变了。
+  `--accept-drift` 是明确的逃生口，**不可以拿 `--accept-drift prompt`
+  去验证 prompt 改动的效果** —— 那等于绕开你要验的东西。改了 prompt 就重录。
+- 录音里有客户真票的店名・金额・日期・卡号末 4 位。**本 repo 是 PUBLIC**，
+  `fixtures/` 已在 `.gitignore` 全数排除（与 `golden/` 同一政策）。
+  番人查的是 `git ls-files 'fixtures/**'` 为空，不是「规则在不在」——
+  规则挡不住 `git add -f` 和已经 tracked 的文件。
+- **丢了 fixture 要重录**，成本是一次全量真票跑（约 50 分钟）+ Gemini 调用费。
+- PaddleOCR 是否确定，用 `scripts/measure_ocr_determinism.py <PDF> [次数]` 测。
+
 ## 架构要点（需读多文件才能理解的部分）
 
 ### Generator Pipeline（内存是硬约束）
