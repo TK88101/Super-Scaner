@@ -1,5 +1,10 @@
 # page_family.py
-# クレカ／交通系IC 頁の族分類器 ＋ 頁の去向を決める唯一の裁決関数（Plan AD-0）。
+# クレカ／交通系IC 頁の族分類器 ＋ 頁の去向を決める唯一の裁決関数（Plan AD-0）
+# ＋ 頁単位の監査シグナル生成器（T8b-2。**処分には一切関与しない**）。
+#
+# 3 つ目は「唯一の裁決者」契約の例外ではない —— `section_audit_signals` は
+# `resolve_page_disposition` からも `Disposition` の構築からも呼ばれず、
+# 文字列を 1 本足すだけで頁を落とす力を持たない。
 #
 # 本モジュールの中心的な契約は 1 つだけ:
 #   **entries > 0 の頁に到達できる除外経路が存在しない。**
@@ -21,6 +26,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
+from card_reconciliation import _coerce_int
 from page_dedup import VERDICT_DUPLICATE
 
 # ── 族 ────────────────────────────────────────────────────────────
@@ -429,6 +435,12 @@ def count_section_markers(ocr_text):
     補助シグナルとしても入れない —— 検出力を足さずに誤報面だけ広げる。
 
     純関数・例外を投げない（`page_family` の既存の約束）。
+
+    正規化について: `_classify` の docstring は「NFKC 正規化は 1 回だけ」と
+    書くが、それは同関数**内**の話で、ここは同じ頁テキストに対する 2 度目の
+    正規化になる（simplify 評審 Efficiency）。正規化済み文字列を跨いで
+    引き回すと関数間の結合が増え、得られるのは 1 頁あたり sub-ms —— Gemini
+    往復が数百 ms 掛かる本経路では意味を持たないので、独立を選んでいる。
     """
     try:
         raw = str(ocr_text or "")
@@ -444,6 +456,110 @@ def count_section_markers(ocr_text):
         return marks
     except Exception:                        # noqa: BLE001 — 全域関数の約束
         return None
+
+
+# ── T8b-2: 区画の取りこぼしを Gemini の外から突合する ──────────────
+#
+# 監査タブの reason 列に出る機械可読キー。値は `<検出>/<申告>` の形。
+SIGNAL_SECTION_UNDERCOUNT = "section_undercount"
+SIGNAL_SECTION_ROWS_MISSING = "section_rows_missing"
+SIGNAL_SECTION_DETECTION_UNKNOWN = "section_detection_unknown"
+
+# この検査を効かせる doc_type。**表として名前を付ける**のは、この repo が
+# doc_type の並行表を 7 枚持ち、登録漏れで 2 度焼かれているため
+# （ENTRY_BUILDERS / RECON_POLICY。CLAUDE.md 参照）。
+# 漏れの被害は「その doc_type に監査警告が出ない」だけで記帳には触れないので、
+# import 時 RuntimeError ではなく `FOLDER_TYPE_MAP` と同じ**動的テスト**の段
+# （`test_section_audit.ScopeTest`）で見張る。
+SECTION_AUDIT_DOC_TYPES = frozenset({DOC_TYPE_CREDIT_CARD})
+
+
+def _section_index(row):
+    """`rows[].sec` を区画 index として読む。読めなければ None。
+
+    数値の読み方は**記帳側と同じ規則**に揃える（`card_entries.py:212` が
+    同じ `sec` を `_coerce_int` で読んでいる）。同一の raw_data を 2 通りの
+    規則で読むと、記帳側が「区画 1」と数えた行を検査側が「読めない」と数え、
+    distinct が減って `section_rows_missing` が**偽陽性で鳴る** ——
+    `card_salvage` の docstring が警告する食い違いの、このフィールド版。
+    実際 Gemini は `"1"`（文字列）も `1.0`（float）も返しうる。
+
+    bool は `_coerce_int` が弾く（`isinstance(True, int)` は真なので、
+    素の int 判定だと `sec: true` が区画 1 に化ける）。
+    """
+    return _coerce_int(row.get("sec")) if isinstance(row, dict) else None
+
+
+def section_audit_signals(doc_type, ocr_text, raw_data):
+    """区画の取りこぼしを**被検査者の外**から検査する（T8b-2）。監査シグナルの tuple。
+
+    2026-08-19 の実害: 主副カードが 1 通に合印された p5 で Gemini が主カード
+    分だけを報告し、**副カード 11 行・146,671 円が静かに消えた**。
+    `rows_on_page` の自己申告も 8（＝取得数と一致）だったため
+    `card_salvage` の行欠け検出も沈黙し、3 層すべてが無音になった。
+
+        検算の基準を被検査者自身の申告から取ってはならない。
+        被検査者が漏らしたものは、その申告にも現れない。（Plan §3.2）
+
+    検査は 3 本。1 本でも欠けると沈黙する経路が残る:
+
+    1. `markers > len(sections)` … 区画そのものを少なく申告した
+    2. `markers >= 2` かつ `rows[].sec` の distinct <= 1 … 区画は複数
+       申告しつつ行は片側だけ（Codex HIGH-3 の抜け道。`2 > 2` は偽なので
+       1 では鳴らない）
+    3. 検出 unknown なのに明細が在る … 検査器自身が OCR 入力を持たず
+       沈黙した（Codex HIGH-4）。0 個に丸めると**一番危ない頁だけ静かになる**
+
+    **返り値は警告であって処分ではない。** 呼出側は監査タブへ載せるだけで
+    記帳は止めない（趙拍板 2026-08-19 / IP-401）。偽陽性の帳簿被害はゼロ、
+    偽陰性は無音欠落なので、倒す向きは「疑わしきは鳴らす」で決まっている。
+
+    既知の限界（誇張しないこと）: 区画頭と合計行が同じ頁に揃うと markers=2
+    になるので、**1 頁で 1 区画が完結する短い券面**は `section_undercount`
+    が偽陽性になりうる。実測のアメックス 6 頁・8 頁券面では起きない
+    （p1 は区画頭のみで markers=1）。誤報を恐れて閾値を上げると、
+    塞ぎたかった p5 がそのまま漏れる。
+
+    `credit_card` 専用。nimoca の prompt に `sections` は無い（`_IC_TOP_FIELDS`）
+    ので、効かせると全頁が `section_undercount:1/0` で鳴り続ける。
+
+    純関数・例外を投げない（`page_family` の既存の約束）。ただし握り潰して
+    空を返すことはしない —— 「検査して問題なし」と区別がつかなくなるので、
+    壊れた入力は unknown として鳴らす。
+    """
+    if doc_type not in SECTION_AUDIT_DOC_TYPES:
+        return ()
+    try:
+        if not isinstance(raw_data, dict):
+            # 「応答が dict にならなかった」も検査不能の一種。ここを ocr_text の
+            # 中身に委ねると、**両方が同時に暗くなった頁**（JSON 破損 ∧ OCR 空）
+            # だけが静かになる —— 2 つの独立信号が同時に落ちるのは IP-401 と
+            # 同じ形で、この検査器が存在する理由そのものである。
+            return (SIGNAL_SECTION_DETECTION_UNKNOWN,)
+        rows = raw_data.get("rows")
+        rows = rows if isinstance(rows, list) else []
+        markers = count_section_markers(ocr_text)
+        if markers is None:
+            # OCR 入力が無く検査できない。明細を組んだ頁だけ可視化する
+            # （明細ゼロの頁まで鳴らすと監査タブが除外頁で埋まる）。
+            return (SIGNAL_SECTION_DETECTION_UNKNOWN,) if rows else ()
+
+        sections = raw_data.get("sections")
+        declared = len(sections) if isinstance(sections, list) else 0
+
+        signals = []
+        if markers > declared:
+            signals.append(
+                "%s:%d/%d" % (SIGNAL_SECTION_UNDERCOUNT, markers, declared))
+        if markers >= 2:
+            distinct = len({i for i in map(_section_index, rows)
+                            if i is not None})
+            if distinct <= 1:
+                signals.append("%s:%d/%d"
+                               % (SIGNAL_SECTION_ROWS_MISSING, markers, distinct))
+        return tuple(signals)
+    except Exception:                        # noqa: BLE001 — 全域関数の約束
+        return (SIGNAL_SECTION_DETECTION_UNKNOWN,)
 
 
 def _extract_card_keys(nfkc_text):

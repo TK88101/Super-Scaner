@@ -2272,8 +2272,24 @@ def _resolve_card_disposition(doc_type, page_class, result, raw_data, prefix="")
     return disposition
 
 
-def _apply_family_signal(results, disposition, ocr_text):
-    """族シグナルを line-mode の**後**に先頭 result へ合成する。
+def _page_audit_signal(disposition, doc_type, ocr_text, raw_data):
+    """この頁に載せる監査シグナルを 1 本にまとめる（族 ＋ 区画突合）。
+
+    族シグナルは `page_family` の裁決から、区画シグナルは `section_audit_signals`
+    から来る。**どちらも頁単位の注記**で、同じ頁で同時に立ちうるので
+    `_merge_audit_signals` を通す（片方が黙って消えるのが Codex HIGH-2 の形）。
+
+    `disposition` は None を取りうる（Vision 兜底など `page_class` が無い経路）。
+    区画突合はそこでこそ効かせたい —— OCR テキストが無い頁は検査器も沈黙し、
+    `section_detection_unknown` として可視化するのがその経路の唯一の痕跡になる。
+    """
+    return _merge_audit_signals(
+        getattr(disposition, "audit_signal", None),
+        *page_family.section_audit_signals(doc_type, ocr_text, raw_data))
+
+
+def _apply_page_audit_signal(results, signal, ocr_text):
+    """頁単位の監査シグナルを line-mode の**後**に先頭 result へ合成する。
 
     P-B の時点で載せると `_yield_line_mode_results` の `_with_audit_signal`
     に上書きされて消える（Codex 評審 HIGH-2）。頁単位で 1 行にしたいので
@@ -2284,7 +2300,6 @@ def _apply_family_signal(results, disposition, ocr_text):
     を返し、`_yield_line_mode_results` はそれを **entries を持つ同一 result**
     へ載せる。つまり合成は防御ではなく現に効いている経路がある。
     """
-    signal = getattr(disposition, "audit_signal", None) if disposition else None
     if not signal:
         yield from results
         return
@@ -2450,9 +2465,13 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
         # None になる（simplify 評審が coverage で未実行を実証）。
         yield result
         return
-    yield from _apply_family_signal(
+    # T8b-2: 区画の取りこぼしを Gemini の外から突合し、監査タブへ載せる。
+    # **記帳は止めない**（IP-401 / 趙拍板 2026-08-19）。ここは薄い接線で、
+    # 判定条件は 1 つも持たない（`_resolve_card_disposition` と同じ方針）。
+    yield from _apply_page_audit_signal(
         _yield_line_mode_results(result, raw_data, ocr_text, prefix),
-        disposition, ocr_text)
+        _page_audit_signal(disposition, doc_type, ocr_text, raw_data),
+        ocr_text)
 
 
 def _yield_line_mode_results(result, raw_data, ocr_text, prefix=""):

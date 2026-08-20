@@ -261,5 +261,122 @@ class BothCallSitesPassPageClassTest(unittest.TestCase):
                 % call.lineno)
 
 
+
+# 区画切替が在る頁の最小刺激（合計行 ＝ 区画の終わり ＋ 区画頭 ＝ 次の始まり）。
+# **版面そのものの判定は `test_section_audit` が持つ**。ここで見たいのは
+# 「検出結果が `_audit_signal` まで届くか」という接線だけなので、
+# 券面を丸ごと複製して 3 箇所目の標本を作らない（漂移の芽になる）。
+_SECTION_SWITCH_TEXT = ("田中 様今月ご利用額合計 350,218 "
+                        "今月ご利用額 花子様 1月1日 テスト 100")
+
+
+def _sec_raw(sections, rows, sec=0):
+    """`sections` 個の区画を申告し、`rows` 行すべてを区画 `sec` に属させた raw_data。"""
+    return _raw(rows=[dict(_row(), sec=sec) for _ in range(rows)],
+                rows_on_page=rows,
+                sections=[{"index": i, "label": "今月ご利用額", "subtotal": None}
+                          for i in range(sections)])
+
+
+def _signals(results):
+    return [r.get("_audit_signal", "") for r in results if r.get("_audit_signal")]
+
+
+class SectionAuditIsWiredTest(unittest.TestCase):
+    """T8b-2: 区画の突合結果が監査タブまで届く。**記帳は 1 行も減らない**。
+
+    純関数側（`page_family.section_audit_signals`）の判定は
+    `test_section_audit` が固定する。ここが見張るのは接線だけ ——
+    T8 の教訓そのもので、**判定は実装済なのに誰も呼んでいない**という
+    形の欠陥は判定側のテストでは捕まらない。
+    """
+
+    def test_undercount_reaches_the_audit_signal(self):
+        """p5 の形（券面 2 区画・申告 1 区画）で警告が出る。"""
+        results = _run(DocType.CREDIT_CARD, _sec_raw(1, 8), _SECTION_SWITCH_TEXT)
+        self.assertTrue(
+            any("section_undercount:2/1" in s for s in _signals(results)),
+            "取りこぼしが監査タブに届いていない")
+
+    def test_booking_is_never_stopped(self):
+        """IP-401: 警告が出ても entries は 1 件も減らない。"""
+        results = _run(DocType.CREDIT_CARD, _sec_raw(1, 8), _SECTION_SWITCH_TEXT)
+        booked = sum(len(r.get("entries") or []) for r in results)
+        self.assertEqual(booked, 8, "警告が記帳を削った")
+        self.assertFalse(any(r.get("_excluded_page") for r in results))
+
+    def test_single_section_page_stays_silent(self):
+        """単一カード券面で誤報しない（T8b-2 の DoD）。"""
+        text = "今月ご利用額 田中 太郎様 1月1日 テスト 100"
+        results = _run(DocType.CREDIT_CARD, _sec_raw(1, 4), text)
+        self.assertFalse([s for s in _signals(results) if "section_" in s])
+
+    def test_vision_fallback_page_is_marked_unknown(self):
+        """OCR テキストが無い経路（Vision 兜底）は unknown で可視化する。
+
+        `page_class` が無いので `disposition` は None になる。ここで
+        `getattr(None, ...)` を踏むと**頁ごと例外で消える**ので、
+        接線は disposition 無しでも成立しなければならない。
+        """
+        results = _run(DocType.CREDIT_CARD, _sec_raw(1, 4), "")
+        self.assertTrue(
+            any("section_detection_unknown" in s for s in _signals(results)))
+        self.assertEqual(sum(len(r.get("entries") or []) for r in results), 4)
+
+    def test_transit_ic_is_not_checked(self):
+        """nimoca の prompt に `sections` は無い。効かせると鳴り続ける。"""
+        results = _run(DocType.TRANSIT_IC, _sec_raw(0, 4), _SECTION_SWITCH_TEXT)
+        self.assertFalse([s for s in _signals(results) if "section_" in s])
+
+    def test_section_signal_coexists_with_the_family_signal(self):
+        """族シグナルと同居しても片方が消えない（Codex HIGH-2 と同じ形）。"""
+        text = _RIBO_TEXT + " " + _SECTION_SWITCH_TEXT
+        pc = page_family.classify_page(text)
+        results = _run(DocType.CREDIT_CARD, _sec_raw(1, 4), text, pc)
+
+        merged = next(iter(_signals(results)), "")
+        self.assertIn("section_undercount", merged, "区画シグナルが消えた")
+        self.assertIn("family_signal_with_entries", merged, "族シグナルが消えた")
+
+class ExcludedPageSkipsTheSectionAuditTest(unittest.TestCase):
+    """T8b-2 の既知の穴（simplify 評審 Altitude F3）。**T9 の完了条件**。
+
+    `_yield_page_results` は去向が EXCLUDE なら早期 return するので、
+    その頁では区画突合が消費されない。今それが安全なのは
+    `resolve_page_disposition` の優先序 3（行らしさは除外を拒否する）が
+    「EXCLUDE に落ちる頁は has_detail_rows=False」を保証しているからで、
+    **別関数の不変式に寄り掛かった安全性**である。検査器が「被検査者の外に
+    在る」ことの意味には、内部の制御フロー判断からも独立であることが含まれる。
+
+    到達条件（実測で構成可能）: Gemini が rows を 1 行も返さず（entry_count=0）、
+    OCR は区画見出しと合計行を読めていて（markers=2）、明細本体は
+    has_detail_rows の閾値（日付 5 ＋ 金額 5）に届かない。この頁は
+    `cc_summary` として MF タブへ提示行が出るが、**その提示行の文言は
+    「合計表ページ」** —— 実際は読み落とした明細頁なのに、そう見えない。
+
+    今回直さない理由: 消費側が塞がっている。`main.process_file` の除外分岐
+    （`_excluded_page` → `_record_excluded_page` → `continue`）は
+    `_audit_signal` の処理に到達せず、しかも MF タブ行き（本ケース）は
+    監査タブに何も書かない。producer 側に `_audit_signal` を積むだけでは
+    **書き込まれない信号**になり、穴より質が悪い。塞ぐには main と
+    local_test 双方の制御フローと「同一頁に監査 2 行」の語義を決める必要が
+    あり、T8b の範囲を超える（趙の拍板事項）。
+
+    **T9 でこの装飾子を外すこと。** 外し忘れると `unexpectedSuccesses=1` で
+    赤くなる（`RiboPageZeroBaselineTest` と同じ運用）。
+    """
+
+    @unittest.expectedFailure
+    def test_excluded_page_should_still_carry_the_section_signal(self):
+        pc = page_family.classify_page(_SECTION_SWITCH_TEXT)
+        results = _run(DocType.CREDIT_CARD, _sec_raw(0, 0), _SECTION_SWITCH_TEXT, pc)
+
+        self.assertTrue(any(r.get("_excluded_page") for r in results),
+                        "前提が崩れている: この頁は除外されるはず")
+        self.assertTrue(
+            any("section_" in (r.get("_audit_signal") or "") for r in results),
+            "除外頁でも区画の取りこぼしは可視化されるべき")
+
+
 if __name__ == "__main__":
     unittest.main()
