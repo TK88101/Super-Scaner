@@ -29,3 +29,8 @@ benchmark_results*.txt
 .playwright-mcp/
 # coverage.py 的計算暫存 (SQLite)。重跑即可再生成，不提交。
 .coverage
+
+# Claude Code のローカル状態（settings.local.json に SSH 鍵パスとサーバ IP、
+# memory に顧客の Drive / Sheets 識別子が入る。CLAUDE.md の「密钥文件绝不提交」
+# と同性質なので git 管理に載せない。2026-08-20 趙拍板）
+.claude/
