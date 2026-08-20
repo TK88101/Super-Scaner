@@ -168,6 +168,8 @@ _AUDIT_REASON_JA = {
         "封筒の疑いがありますが、明細が取れたので記帳しました",
     "section_detection_unknown":
         "券面の文字が読めず、区画の数を確認できませんでした",
+    # 重複ページ（T8d）
+    "dup_more_text": "重複元より文字数が多いため、追記の有無をご確認ください",
 }
 
 # 族名だけを日本語に差し替えるための表（`family_signal_with_entries:<族>`）。
@@ -217,6 +219,58 @@ def _ja_page_coverage_gap(arg):
     return "%s ページが一度も出力されませんでした" % arg.strip("[]")
 
 
+def _ja_duplicate_page(arg):
+    """`duplicate_page:<元の頁>`。**記帳しなかった**ことを先に言う。"""
+    return "%s ページ目と同じ内容のため記帳していません" % arg
+
+
+def _ja_dup_key_conflict(arg):
+    """重複と断じるには足りないが疑わしい（同じ頁番号・違う内容）。"""
+    return ("%s ページ目と同じカード・同じページ番号ですが内容が違います"
+            "（原票をご確認ください）" % arg)
+
+
+def _ja_dup_content_only(arg):
+    return ("%s ページ目と明細の中身が一致します"
+            "（重複の疑い。原票をご確認ください）" % arg)
+
+
+def _ja_dup_amount(arg):
+    try:
+        return "重複と判定した金額は %s 円です" % format(int(arg), ",")
+    except (TypeError, ValueError):
+        return "重複と判定した金額は %s 円です" % arg
+
+
+def _ja_dup_key(arg):
+    """照合キー。**人向けの文ではなく調査用の値**なので前置きを付ける。"""
+    return "照合キー: %s" % arg
+
+
+def _ja_date_year_from_page(arg):
+    """`date_year_from_page:<元の頁>@<作成日>@<埋めた行数>`。
+
+    このページに明細書作成日が印字されていないとき、同じ明細書の
+    先頭ページから年を決めた事実を残す。**ファイルにつき 1 回**。
+
+    行数を必ず入れる —— 1 行しか出さない設計なので、この 1 行から
+    **抜き取り検査の母集団が特定できる**必要がある。頁と作成日だけでは
+    「何行が対象か」が判らず、担当者が券面と突き合わせられない。
+    """
+    parts = arg.split("@")
+    origin = parts[0]
+    anchor = parts[1] if len(parts) > 1 else ""
+    count = parts[2] if len(parts) > 2 else ""
+    if anchor and count:
+        return ("このページに明細書作成日の印字がないため、%s 行の年を "
+                "%s ページ目の作成日 %s から決めました" % (count, origin, anchor))
+    if anchor:
+        return ("このページに明細書作成日の印字がないため、%s ページ目の"
+                "作成日 %s から年を決めました" % (origin, anchor))
+    return ("このページに明細書作成日の印字がないため、%s ページ目の"
+            "作成日から年を決めました" % origin)
+
+
 _AUDIT_REASON_JA_PARAM = {
     "family_signal_with_entries": _ja_family_signal,
     "line_shortage": _ja_line_shortage,
@@ -224,6 +278,12 @@ _AUDIT_REASON_JA_PARAM = {
     "section_undercount": _ja_section_undercount,
     "section_rows_missing": _ja_section_rows_missing,
     "page_coverage_gap": _ja_page_coverage_gap,
+    "duplicate_page": _ja_duplicate_page,
+    "dup_key_conflict": _ja_dup_key_conflict,
+    "dup_content_only": _ja_dup_content_only,
+    "dup_amount": _ja_dup_amount,
+    "dup_key": _ja_dup_key,
+    "date_year_from_page": _ja_date_year_from_page,
 }
 
 

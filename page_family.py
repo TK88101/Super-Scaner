@@ -27,7 +27,8 @@ import unicodedata
 from dataclasses import dataclass
 
 from card_reconciliation import _coerce_int
-from page_dedup import VERDICT_DUPLICATE
+from page_dedup import (VERDICT_CONTENT_ONLY, VERDICT_DUPLICATE,
+                        VERDICT_KEY_CONFLICT)
 
 # ── 族 ────────────────────────────────────────────────────────────
 FAMILY_CC_DETAIL = "cc_detail"        # クレカ明細行を含む頁 → 記帳
@@ -254,6 +255,11 @@ class Disposition:
     reason: str = ""
     destination: str = ""
     audit_signal: object = None            # 記帳しつつ監査に残す注記（None = 無し）
+    # この頁が重複と断じられたか。**理由文字列の前方一致で判定させない**ため
+    # の旗（T8d）。`ocr_engine._resolve_card_disposition` はこれを見て
+    # 「行欠けの疑いより先に重複を効かせる」分岐をする。reason が増えるたびに
+    # 呼出側の分岐を書き足し忘れる、という T8 で踏んだ形を作らない。
+    is_duplicate: bool = False
 
 
 # ── 分類（Gemini 呼出前。頁は落とせない）────────────────────────────
@@ -683,33 +689,47 @@ def resolve_page_disposition(dedup_verdict, entry_count, page_class, dedup_mode=
     if is_duplicate:
         origin = getattr(dedup_verdict, "origin_page", None)
         detail = getattr(dedup_verdict, "detail", "") or ""
-        dup_reason = "duplicate_page:orig=p%s" % (origin if origin is not None else "?")
+        dup_reason = "duplicate_page:%s" % (origin if origin is not None else "?")
         if detail:
             dup_reason = "%s;%s" % (dup_reason, detail)
         if mode != DEDUP_MODE_MARK:
             return Disposition(ACTION_EXCLUDE, family=resolve_family(pc, entry_count),
                                reason=dup_reason,
-                               destination=EXCLUDE_DEST_AUDIT_TAB)
+                               destination=EXCLUDE_DEST_AUDIT_TAB,
+                               is_duplicate=True)
+
+    # 1.5 近似一致は**検出であって処分ではない**（T8d）。
+    #     Gemini の非決定性で 1 行でも日付がぶれると duplicate が key_conflict へ
+    #     落ちる。接線しただけでは「重複を見逃したこと」が誰にも見えないので、
+    #     監査タブに痕跡だけ残す。去向は 1 ミリも変えない。
+    near_miss = "" if mode == DEDUP_MODE_OFF else _near_miss_signal(dedup_verdict)
 
     # 2. entries があれば必ず記帳する。ここに族の拒否権は存在しない。
     if _positive(entry_count):
         signal_family = _signal_family(pc)
         # cc_summary は明細末尾に合計が印字されているだけの正常な形（F-3）なので
         # 注記しない。毎頁鳴ると監査タブが狼少年になる。
-        audit = None
-        if signal_family in (FAMILY_POINTS_ONLY, FAMILY_INFO_NOTICE,
-                             FAMILY_PAYMENT_METHOD_NOTICE):
-            audit = "family_signal_with_entries:%s" % signal_family
-        if dup_reason:                      # mode == mark: 記帳しつつ注記を残す
-            audit = "%s;%s" % (dup_reason, audit) if audit else dup_reason
+        family_note = ("family_signal_with_entries:%s" % signal_family
+                       if signal_family in (FAMILY_POINTS_ONLY,
+                                            FAMILY_INFO_NOTICE,
+                                            FAMILY_PAYMENT_METHOD_NOTICE)
+                       else "")
+        # dup_reason は mode == mark のときだけ非空（記帳しつつ注記を残す）。
         return Disposition(ACTION_BOOK, family=resolve_family(pc, entry_count),
-                           audit_signal=audit)
+                           audit_signal=_join_reasons(
+                               near_miss, dup_reason, family_note) or None,
+                           is_duplicate=is_duplicate)
 
-    # mark モードで entries が無かった頁でも、重複だった事実は落とさない。
+    # entries が無かった頁でも、重複の痕跡は落とさない。
     # 落とすと「mark にしたのに重複の痕跡が監査に残らない」状態になり、
     # 偽陽性の調査手段が消える（mode を弱める目的そのものが達成できない）。
+    #
+    # **近似一致（near_miss）もここに含める。** 解析に失敗した頁こそ
+    # 「同じカードの同じ頁番号が既に来ている」という手がかりが要る
+    # （Codex 実施後評審 Round 2）。当初は記帳枝にしか載せておらず、
+    # entries 0 の頁で線索が消えていた。
     def _with_dup(reason):
-        return "%s;%s" % (dup_reason, reason) if dup_reason else reason
+        return _join_reasons(dup_reason, near_miss, reason)
 
     # 3. 行らしさが検出されたら、いかなる族も除外を主張できない。
     if pc.has_detail_rows:
@@ -731,6 +751,40 @@ def resolve_page_disposition(dedup_verdict, entry_count, page_class, dedup_mode=
     # 5. 何も判らない頁は赤い認識不能占位行へ（監査タブに沈めない）。
     return Disposition(ACTION_UNRECOGNIZED, family=FAMILY_UNKNOWN,
                        reason=_with_dup(pc.error or "unclassified"))
+
+
+def _join_reasons(*parts):
+    """空を落として `;` で連ねる（`ocr_engine._merge_audit_signals` と同規約）。
+
+    同じイディオムを分岐ごとに手書きすると、要素が増えるたびに 2 行ずつ
+    足す形になり、順序と空文字の扱いが箇所ごとにずれる。`ocr_engine` 側の
+    helper は依存方向の都合で使えない（`page_family` は純関数モジュール）。
+    """
+    return ";".join(p for p in parts if p)
+
+
+def _near_miss_signal(dedup_verdict):
+    """近似一致（重複と断じるには足りないが疑わしい）を監査タブ用の 1 語にする。
+
+    `page_dedup` は二重署名 AND 規則なので、Gemini の非決定性で 1 行でも
+    日付がぶれると `duplicate` が `key_conflict` へ落ちる。**接線しただけでは
+    「重複を見逃したこと」が誰にも見えない**ので、痕跡だけ残す。
+
+    `not_eligible` / `unique` は沈黙する —— 大半の頁がそれなので、
+    鳴らすと監査タブが狼少年になる。
+    """
+    kind = getattr(dedup_verdict, "kind", None)
+    key = _NEAR_MISS_KEY.get(kind)
+    if not key:
+        return ""
+    origin = getattr(dedup_verdict, "origin_page", None)
+    return "%s:%s" % (key, origin if origin is not None else "?")
+
+
+_NEAR_MISS_KEY = {
+    VERDICT_KEY_CONFLICT: "dup_key_conflict",
+    VERDICT_CONTENT_ONLY: "dup_content_only",
+}
 
 
 def exclusion_fields(disposition):

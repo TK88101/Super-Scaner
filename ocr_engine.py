@@ -6,7 +6,7 @@ import gc
 import time
 import unicodedata
 import http.client
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import google.generativeai as genai
 from google.api_core import exceptions as google_exceptions
 try:
@@ -20,6 +20,7 @@ from doc_types import (DocType, DOC_TYPE_CONFIG, DOC_TYPE_TAB_SUFFIX,
 # page_family 側は ocr_engine を import しない（定数は複製し、乖離は
 # test_page_family の突合テストが検出する）。
 import card_entries
+import card_file_state
 import card_prompts
 import card_salvage
 import page_family
@@ -2241,7 +2242,8 @@ def _exclusion_memo(disposition):
         "⚠ 仕訳対象外ページ（明細が無いため記帳していません）")
 
 
-def _resolve_card_disposition(doc_type, page_class, result, raw_data, prefix=""):
+def _resolve_card_disposition(doc_type, page_class, result, raw_data, prefix="",
+                              dedup_verdict=None):
     """card 系頁の去向を `page_family` に裁決させる（T8-3 / Plan の P-B 位置）。
 
     `page_family.resolve_page_disposition` が**唯一の裁決者**（AD-0）。
@@ -2260,10 +2262,26 @@ def _resolve_card_disposition(doc_type, page_class, result, raw_data, prefix="")
     if page_class is None or doc_type not in page_family.CC_FAMILY_DOC_TYPES:
         return None
     entry_count = len(result.get("entries") or [])
-    disposition = page_family.resolve_page_disposition(None, entry_count, page_class)
+    disposition = page_family.resolve_page_disposition(
+        dedup_verdict, entry_count, page_class)
     if disposition.action != page_family.ACTION_EXCLUDE:
         return disposition
-    shortage, _reason = card_salvage.page_marks(raw_data)
+    shortage, shortage_reason = card_salvage.page_marks(raw_data)
+    if disposition.is_duplicate:
+        # T8d / A-D1: 重複頁では行欠け guard を**迂回する**。
+        # `DUPLICATE` に到達した頁は原本と (日付, 金額) の並びも頁合計も
+        # 逐字一致している（二重署名 AND 規則）。原本側に行欠けがあれば
+        # 同じ痕跡が原本の監査行に既に出ているので、重複側を除外しても
+        # 新たに失う情報は無い。除外しなければ確実に二重計上になる。
+        #
+        # ただし**痕跡は潰さない**（Codex 評審 C5）。理由列に行欠けの
+        # キーも残して、原本を当たり直す手がかりを消さない。
+        if shortage_reason:
+            disposition = replace(
+                disposition,
+                reason="%s;%s" % (disposition.reason, shortage_reason))
+        print(f"{prefix}📋 重複ページとして除外（監査タブに記録）")
+        return disposition
     if shortage is not None:
         print(f"{prefix}⚠️ 除外候補（{disposition.family}）だが行欠けの疑い "
               f"→ 除外せず認識不能として可視化")
@@ -2314,7 +2332,8 @@ def _apply_page_audit_signal(results, signal, ocr_text):
 
 
 def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
-                        envelope_filter=False, page_class=None):
+                        envelope_filter=False, page_class=None,
+                        state=None, page_num=None):
     """1ページ分の解析結果を doc_type 別に整形して result dict を yield する。
 
     process_pipeline の「PDF 逐頁ループ」と「単ページ PDF/画像（尾段）」は
@@ -2443,6 +2462,31 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
         print(f"{prefix}⚠️ エントリビルダーが未登録: {doc_type}")
         return
 
+    # `state` は `page_class` と同じ形で既定値 `None` を持つ（生産の呼出点は
+    # AST 番人が縛る）。None のときは使い捨てを作る —— None 分岐を関数中に
+    # 散らすと、片方だけ書き忘れて半開状態になる。
+    state = state if state is not None else card_file_state.CardFileState()
+
+    # ── T8d: 重複頁の判定（A 章）──
+    # 判定は `page_dedup`、裁決は `page_family` にあり、ここは接線だけ。
+    # `token` は中身を見ない不透明な物体で、記帳できた頁だけ `remember` へ返す。
+    #
+    # **錨の解決より先に取る。** 逆順にすると `resolve_anchor` が書いた
+    # `row["date"]` が指紋の材料に混ざり、**同じ頁でも「継承できたか」で
+    # 指紋が変わる**。1 回目は継承できて 2 回目は run が閉じていた、という
+    # 並びで digest が割れ、重複頁が `duplicate` ではなく `key_conflict` へ
+    # 落ちて二重計上される（Codex 実施後評審 2026-08-20）。
+    # 指紋は Gemini の生出力だけから作る。
+    dedup_verdict, dedup_token = state.classify(
+        doc_type, page_num, ocr_text, raw_data)
+
+    # ── T8d: 明細書作成日の錨をファイル内で引き継ぐ（B 章）──
+    # 位置は builder の**前**。錨から確定した日付を `rows[*]["date"]` へ
+    # 直接書くので、builder より後ろに置くと 1 行も効かない。
+    # （`card.statement_date` には注入しない —— 注入すると自前の錨を持つ
+    #  頁の挙動まで変わり、改修前から日付が入っていた行が動く）
+    anchor_signal = state.resolve_anchor(doc_type, raw_data, ocr_text, page_num)
+
     result = _build_doc_result(doc_type, raw_data, builder(raw_data))
 
     # ── T8-3: 頁の去向裁決（P-B）──
@@ -2450,13 +2494,19 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
     # `result["entries"]` を持ち、かつ逐頁ループと尾段の両方が通る
     # （Plan §2.5 / §15.1 で P-A・P-C を排除済）。
     disposition = _resolve_card_disposition(
-        doc_type, page_class, result, raw_data, prefix)
+        doc_type, page_class, result, raw_data, prefix, dedup_verdict)
     if disposition is not None and disposition.action == page_family.ACTION_EXCLUDE:
         # 無音にはしない。呼出側（main / local_test）が監査タブへ回す。
         yield _blank_result(memo=_exclusion_memo(disposition),
                             _ocr_text_len=len(ocr_text or ""),
                             **page_family.exclusion_fields(disposition))
         return
+
+    # **記帳できた頁だけ**索引に登録する。`_unrecognized` に終わった頁を
+    # 入れると、後続の真の重複頁が除外され、その明細はどこにも 1 回も
+    # 記帳されない（`CardFileState.remember` の docstring）。
+    if result.get("entries"):
+        state.remember(dedup_token, page_num)
 
     if not _is_line_mode(doc_type):
         # ここに族シグナルの合成は要らない。`_resolve_card_disposition` が
@@ -2470,7 +2520,9 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
     # 判定条件は 1 つも持たない（`_resolve_card_disposition` と同じ方針）。
     yield from _apply_page_audit_signal(
         _yield_line_mode_results(result, raw_data, ocr_text, prefix),
-        _page_audit_signal(disposition, doc_type, ocr_text, raw_data),
+        _merge_audit_signals(
+            anchor_signal,
+            _page_audit_signal(disposition, doc_type, ocr_text, raw_data)),
         ocr_text)
 
 
@@ -2597,6 +2649,21 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
             ocr_strategy = config.OCR_STRATEGY
 
         mime_type = _get_mime_type(file_path)
+
+        # T8d: 1 ファイル分の頁跨ぎ状態を**ここで 1 個だけ**作る。
+        # 重複索引と明細書作成日の錨を持つ。頁ごとに作ると毎頁リセットされ、
+        # 接線したのに何も効かない（T8 と同じ「繋がって見えるが働かない」形）。
+        # `main` / `local_test` / `benchmark_ocr` の 3 消費者はどれも
+        # `process_pipeline` を通るので、ここに置けば全経路を同時に覆える。
+        file_state = card_file_state.CardFileState()
+        if start_page > 1 and doc_type in page_family.CC_FAMILY_DOC_TYPES:
+            # 局限: 途中頁から再開すると前頁が索引に入らないので、重複除外も
+            # 錨の引き継ぎも効かない。fail-open（＝改修前と同じ挙動）に倒れる
+            # だけで帳簿は壊れないが、黙って効かないのは避ける。
+            # `start_page` を渡すのは `local_test.py --start-page` だけで、
+            # `main.py` は渡さない（生産経路には無い）。
+            print(f"⚠️ {start_page} ページ目から再開するため、"
+                  f"重複ページの除外と明細書作成日の引き継ぎは効きません")
 
         # ── PDF: 1ページずつ yield（各ページ独立、全文書タイプ共通）──
         # Session 16 以前は非領収書 PDF のみ「全ページ OCR テキストを結合し
@@ -2751,7 +2818,8 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
                     page_iter = _yield_page_results(
                         page_ocr.actual_doc_type, page_raw_data, ocr_text,
                         ocr_conf, prefix=prefix, envelope_filter=True,
-                        page_class=page_ocr.page_class)
+                        page_class=page_ocr.page_class,
+                        state=file_state, page_num=idx)
                     while True:
                         try:
                             entry = next(page_iter)
@@ -2893,7 +2961,8 @@ def process_pipeline(file_path, doc_type=DocType.RECEIPT, ocr_strategy=None, sta
         # count>0 → Success → 歸檔で**真の無音欠落**になる。
         page_iter = _yield_page_results(page_ocr.actual_doc_type, raw_data,
                                         ocr_text, ocr_conf,
-                                        page_class=page_ocr.page_class)
+                                        page_class=page_ocr.page_class,
+                                        state=file_state, page_num=1)
         while True:
             try:
                 entry = next(page_iter)

@@ -30,7 +30,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 from doc_types import DocType  # noqa: E402
 from page_dedup import (  # noqa: E402
     DedupVerdict,
+    VERDICT_CONTENT_ONLY,
     VERDICT_DUPLICATE,
+    VERDICT_KEY_CONFLICT,
     VERDICT_UNIQUE,
     VERDICT_NOT_ELIGIBLE,
 )
@@ -885,9 +887,6 @@ class ContractWithOcrEngineTest(unittest.TestCase):
         self.assertEqual(page_family._SIMPLIFIED_TO_JP, ocr_engine._SIMPLIFIED_TO_JP)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 # ── T8b: 同一頁の複数カード区画 ─────────────────────────────────
 # 実測（2026-08-19・アメックス 8 頁の主副カード合印）を再現した合成テキスト。
@@ -951,3 +950,127 @@ class SectionSwitchDetectionTest(unittest.TestCase):
         """
         self.assertIsNone(count_section_markers(""))
         self.assertIsNone(count_section_markers("   "))
+
+
+# ── T8d: 重複頁の処分と近似一致の可視化 ────────────────────────────
+
+class DuplicateIsDeclaredNotGuessedTest(unittest.TestCase):
+    """重複除外は `Disposition` が**構造で**宣言する。
+
+    `_resolve_card_disposition` はこの旗を見て「行欠けの疑いより先に
+    重複を効かせる」分岐をする。理由文字列の前方一致で判定させると、
+    reason が増えるたびに呼出側の分岐を書き足し忘れる（T8 で踏んだ形）。
+    """
+
+    def test_a_duplicate_page_is_flagged(self):
+        d = resolve_page_disposition(
+            _dedup(VERDICT_DUPLICATE, 1), 0, classify_page(_AMEX_HEAD))
+        self.assertTrue(d.is_duplicate)
+        self.assertEqual(d.action, ACTION_EXCLUDE)
+
+    def test_a_duplicate_with_entries_is_still_flagged(self):
+        """既定（exclude）では entries があっても除外する（AD-1 の優先序 1）。"""
+        d = resolve_page_disposition(
+            _dedup(VERDICT_DUPLICATE, 1), 12, classify_page(_AMEX_HEAD))
+        self.assertTrue(d.is_duplicate)
+        self.assertEqual(d.action, ACTION_EXCLUDE)
+
+    def test_a_normal_exclusion_is_not_flagged(self):
+        """封筒・案内頁の除外に重複の旗が立ってはいけない。"""
+        pc = classify_page(_RIBO_PAGE)
+        d = resolve_page_disposition(_dedup(), 0, pc)
+        self.assertEqual(d.action, ACTION_EXCLUDE)
+        self.assertFalse(d.is_duplicate)
+
+    def test_mark_mode_books_but_still_flags(self):
+        d = resolve_page_disposition(
+            _dedup(VERDICT_DUPLICATE, 1), 12, classify_page(_AMEX_HEAD),
+            dedup_mode=DEDUP_MODE_MARK)
+        self.assertEqual(d.action, ACTION_BOOK)
+        self.assertTrue(d.is_duplicate)
+
+    def test_off_mode_flags_nothing(self):
+        d = resolve_page_disposition(
+            _dedup(VERDICT_DUPLICATE, 1), 12, classify_page(_AMEX_HEAD),
+            dedup_mode=DEDUP_MODE_OFF)
+        self.assertFalse(d.is_duplicate)
+
+    def test_the_reason_carries_the_origin_page(self):
+        d = resolve_page_disposition(
+            _dedup(VERDICT_DUPLICATE, 3), 0, classify_page(_AMEX_HEAD))
+        self.assertTrue(d.reason.startswith("duplicate_page:3"),
+                        "元の頁番号が理由に無い: %r" % d.reason)
+
+
+class NearMissIsVisibleButNeverBlocksTest(unittest.TestCase):
+    """近似一致は**検出であって処分ではない**。
+
+    Gemini の非決定性で 1 行でも日付がぶれると `duplicate` が
+    `key_conflict` へ落ちる。接線しただけでは「重複を見逃したこと」が
+    誰にも見えないので、監査タブに痕跡を残す。
+    **記帳は 1 行も止めない**（優先序 2 は不変）。
+    """
+
+    def _signal(self, kind, entry_count=12):
+        return resolve_page_disposition(
+            _dedup(kind, 1), entry_count, classify_page(_AMEX_HEAD))
+
+    def test_key_conflict_is_booked_with_a_note(self):
+        d = self._signal(VERDICT_KEY_CONFLICT)
+        self.assertEqual(d.action, ACTION_BOOK)
+        self.assertFalse(d.is_duplicate)
+        self.assertIn("dup_key_conflict:1", d.audit_signal or "")
+
+    def test_content_only_is_booked_with_a_note(self):
+        d = self._signal(VERDICT_CONTENT_ONLY)
+        self.assertEqual(d.action, ACTION_BOOK)
+        self.assertIn("dup_content_only:1", d.audit_signal or "")
+
+    def test_unique_says_nothing(self):
+        self.assertIsNone(self._signal(VERDICT_UNIQUE).audit_signal)
+
+    def test_not_eligible_says_nothing(self):
+        self.assertIsNone(self._signal(VERDICT_NOT_ELIGIBLE).audit_signal)
+
+    def test_a_near_miss_note_coexists_with_the_family_note(self):
+        """族シグナルと同居する。片方が黙って消えるのが Codex HIGH-2 の形。"""
+        pc = classify_page(_RIBO_PAGE)
+        d = resolve_page_disposition(_dedup(VERDICT_KEY_CONFLICT, 1), 6, pc)
+        signal = d.audit_signal or ""
+        self.assertIn("dup_key_conflict:1", signal)
+        self.assertIn("family_signal_with_entries:", signal)
+
+    def test_a_near_miss_never_blocks_a_page_without_entries(self):
+        """entries が無い頁でも、近似一致は去向を 1 ミリも変えない。"""
+        pc = classify_page(_AMEX_HEAD + " " + _rows(6))
+        base = resolve_page_disposition(_dedup(VERDICT_UNIQUE), 0, pc)
+        near = resolve_page_disposition(_dedup(VERDICT_KEY_CONFLICT, 1), 0, pc)
+        self.assertEqual(near.action, base.action)
+        self.assertEqual(near.destination, base.destination)
+
+    def test_a_near_miss_survives_on_a_page_with_no_entries(self):
+        """**解析に失敗した頁でこそ線索が要る**（Codex 実施後評審 Round 2）。
+
+        当初は記帳枝にしか載せておらず、entries 0 の頁
+        （`detail_rows_without_entries` / `cc_summary` / `unclassified`）で
+        「同じカードの同じ頁番号が既に来ている」という手がかりが消えていた。
+        """
+        pc = classify_page(_AMEX_HEAD + " " + _rows(6))
+        d = resolve_page_disposition(_dedup(VERDICT_KEY_CONFLICT, 1), 0, pc)
+        self.assertIn("dup_key_conflict:1", d.reason,
+                      "解析失敗頁で重複の線索が消えた: %r" % d.reason)
+
+    def test_a_near_miss_survives_on_an_excluded_summary_page(self):
+        pc = classify_page("TS3 ご利用代金合計表 1/1 お支払合計 44,490")
+        d = resolve_page_disposition(_dedup(VERDICT_CONTENT_ONLY, 2), 0, pc)
+        self.assertEqual(d.action, ACTION_EXCLUDE)
+        self.assertIn("dup_content_only:2", d.reason)
+
+    def test_a_unique_page_gets_no_extra_reason(self):
+        """否定対照: 近似一致でない頁の理由は従来どおり。"""
+        pc = classify_page(_AMEX_HEAD + " " + _rows(6))
+        d = resolve_page_disposition(_dedup(VERDICT_UNIQUE), 0, pc)
+        self.assertNotIn("dup_", d.reason)
+
+if __name__ == "__main__":
+    unittest.main()

@@ -176,17 +176,28 @@ class PageFormattingExceptionIsolationTest(unittest.TestCase):
         real = ocr_engine._yield_page_results
         calls = {"n": 0}
 
-        def fake(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
-                 envelope_filter=False, page_class=None):
+        def fake(doc_type, raw_data, ocr_text, ocr_conf, **kwargs):
+            """**キーワード引数は素通しする。**
+
+            ここを実引数で書き写すと、`_yield_page_results` に引数が
+            増えたとき mock だけが追従せず `TypeError` になる。しかもその
+            TypeError は `process_pipeline` の最外 except に握られて
+            **0 頁 yield** で終わる —— 症状が「頁が無音で消える」なので
+            原因が署名不一致だと気づきにくい（T8 で実際に起きた形。
+            本改修 T8d でも再現した）。
+
+            生産の呼出点が正しい引数を渡しているかは
+            `test_page_disposition_wiring.BothCallSitesPassTheFileStateTest`
+            の AST 番人が見張る。**署名の追従はそちらの仕事**で、
+            ここは例外の閉じ込めだけを見る。
+            """
             calls["n"] += 1
             if calls["n"] == failing_page_num:
                 # 下の for に yield があるため本関数は既に generator function。
                 # よって raise は「呼び出し時」ではなく「消費時」に届く——
                 # 実際の整形例外（next() の内側で発生）と同じタイミング。
                 raise ValueError("畸形 JSON: items が dict ではない")
-            for entry in real(doc_type, raw_data, ocr_text, ocr_conf,
-                              prefix=prefix, envelope_filter=envelope_filter,
-                              page_class=page_class):
+            for entry in real(doc_type, raw_data, ocr_text, ocr_conf, **kwargs):
                 yield entry
 
         route = [

@@ -317,6 +317,92 @@ class MemoryFootprintTest(unittest.TestCase):
         self.assertNotIn("2026/04/15", blob)
         self.assertLess(len(blob), 2000)
 
+class ReasonColumnStaysParseableTest(unittest.TestCase):
+    """理由列の値が区切り文字を含んでも日本語訳が壊れないこと。
+
+    監査タブの理由列は `;`（要素）/ `:`（キーと引数）/ `@`（引数の中）で
+    割る小言語になっている。`issuer` は Gemini がカード会社名を**逐語で**
+    返す欄なので、そこに区切りが混じると `sheets_output.audit_reason_ja`
+    の分割が壊れ、**その行だけ機械語のまま顧客の目に出る**
+    （趙が 2026-08-20 に指摘した状態への逆戻り）。
+    """
+
+    def _detail_for(self, issuer):
+        import page_dedup
+
+        raw = _raw(issuer=issuer)
+        fp = safe_fingerprint(_OCR, raw)
+        return page_dedup._detail(fp, fp)
+
+    def test_delimiters_in_the_issuer_are_stripped(self):
+        detail = self._detail_for("AMEX; Inc: 東京@本社")
+        value = detail[len("dup_key:"):detail.index(";dup_amount")]
+        for delim in (";", ":", "@"):
+            with self.subTest(delim=delim):
+                self.assertNotIn(delim, value,
+                                 "区切り文字が値に残っている: %r" % value)
+
+    def test_the_reason_still_splits_into_the_expected_keys(self):
+        """区切りが混じっても、キーの数と並びが変わらない。"""
+        detail = self._detail_for("AMEX; Inc: 東京@本社")
+        keys = [part.split(":")[0] for part in detail.split(";")]
+        self.assertEqual(keys, ["dup_key", "dup_amount"],
+                         "区切り文字がキー境界を壊した: %r" % detail)
+
+    def test_a_clean_issuer_is_untouched(self):
+        detail = self._detail_for("AMEX")
+        self.assertIn("dup_key:AMEX/", detail)
+
+class MaskedNumbersFromEveryIssuerAreUsableTest(unittest.TestCase):
+    """UC / JCB 型のマスク番号でも識別キーが作れること。
+
+    実施後評審（2026-08-20）で発覚: `_normalize_account` は区切りを落とすのに
+    `_visible_digits_in` の haystack は区切りを残していたため、**下 4 桁が
+    区切りを跨ぐ券面では照合が必ず失敗**していた。`account_key=""` →
+    `is_complete()` False → その券面では重複判定が**永久に不成立**。
+
+    既存テストが全ケース AMEX 型 `****-******-26003`（下 4 桁が区切りを
+    跨がない）だけを使っていたので緑のまま通っていた。UC と JCB は
+    `_normalize_account` の docstring 自身が実測の券面として名指ししている。
+    """
+
+    _CARDS = (
+        ("AMEX", "****-******-26003", "ご利用代金明細書 ****-******-26003 1/2 ページ"),
+        ("UC", "4542-3200-1424-2***", "UCカード 4542-3200-1424-2*** 1/2 ページ"),
+        ("JCB", "3541-0409-9687-2XXX", "JCB 3541-0409-9687-2XXX 1/2 ページ"),
+    )
+
+    def _fp(self, issuer, member_no, ocr):
+        raw = _raw(member_no=member_no, page="1/2", issuer=issuer)
+        return safe_fingerprint(ocr, raw)
+
+    def test_every_issuer_shape_yields_a_usable_key(self):
+        for issuer, member_no, ocr in self._CARDS:
+            with self.subTest(issuer=issuer):
+                fp = self._fp(issuer, member_no, ocr)
+                self.assertTrue(fp.identity.account_key,
+                                "識別キーが空。この券面では重複が一度も検出されない")
+                self.assertTrue(fp.is_eligible())
+
+    def test_a_rescanned_page_is_duplicate_for_every_issuer(self):
+        """接線の目的（二重計上の停止）が全券面で達成されること。"""
+        for issuer, member_no, ocr in self._CARDS:
+            with self.subTest(issuer=issuer):
+                idx = PageDedupIndex()
+                idx.remember(self._fp(issuer, member_no, ocr), 1)
+                verdict = idx.classify(self._fp(issuer, member_no, ocr), 3)
+                self.assertEqual(verdict.kind, VERDICT_DUPLICATE)
+                self.assertEqual(verdict.origin_page, 1)
+
+    def test_a_different_card_is_still_not_duplicate(self):
+        """偽陽性を作っていないこと（別カードは別物のまま）。"""
+        idx = PageDedupIndex()
+        idx.remember(self._fp("UC", "4542-3200-1424-2***",
+                              "UCカード 4542-3200-1424-2*** 1/2 ページ"), 1)
+        other = self._fp("UC", "4542-3200-9999-2***",
+                         "UCカード 4542-3200-9999-2*** 1/2 ページ")
+        self.assertNotEqual(idx.classify(other, 2).kind, VERDICT_DUPLICATE)
+
 
 if __name__ == "__main__":
     unittest.main()

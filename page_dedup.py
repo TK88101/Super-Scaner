@@ -140,12 +140,24 @@ def period_vetoes(a, b):
 
 
 def _visible_digits_in(haystack, account_key):
-    """会員番号の可視数字が OCR 本文にも出ているか（Gemini の裏取り）。"""
+    """会員番号の可視数字が OCR 本文にも出ているか（Gemini の裏取り）。
+
+    **haystack は `account_key` と同じ規則で正規化する。** `account_key` は
+    `_normalize_account` が区切りを落とした形なのに、haystack 側に区切りが
+    残っていると、下 4 桁が区切りを跨ぐ券面で照合が必ず失敗する。
+
+    実測（2026-08-20 の実施後評審）: UC `4542-3200-1424-2***` の下 4 桁は
+    `4242` だが、券面には `1424-2` と印字されているので区切りを残した
+    haystack には現れない。結果 `account_key=""` → `is_complete()` False →
+    **その券面では重複判定が永久に不成立**になっていた（JCB
+    `3541-0409-9687-2XXX` も同じ）。どちらも `_normalize_account` の
+    docstring が「実測の券面」として名指ししているものである。
+    """
     digits = "".join(c for c in account_key if c.isdigit())
     if len(digits) < MIN_VISIBLE_DIGITS:
         return False
     tail = digits[-MIN_VISIBLE_DIGITS:]
-    return tail in haystack
+    return tail in _RE_NON_KEY.sub("", haystack)
 
 
 def extract_page_identity(ocr_text, raw_data):
@@ -247,10 +259,31 @@ def safe_fingerprint(ocr_text, raw_data):
 
 
 def _detail(prev_fp, fp):
-    """監査タブ「理由」列に載せる構造化文字列（列は増やさない）。"""
+    """監査タブ「理由」列に載せる構造化文字列（列は増やさない）。
+
+    書式は **`キー:引数` を `;` で連ねる**（T8d）。監査タブの理由列は
+    `sheets_output.audit_reason_ja` が `;` で分割し `:` でキーと引数に
+    割って日本語へ訳す規約なので、`key=…` の形だと訳されず機械語のまま
+    顧客の目に残る（趙が 2026-08-20 に指摘した状態への逆戻り）。
+
+    区切りは `;`（要素）/ `:`（キーと引数）/ `@`（引数の中）の 3 種。
+    `issuer` は Gemini がカード会社名を**逐語で**返す欄なので、そこに
+    区切り文字が混じると分割が壊れ、**その行だけ機械語のまま顧客の目に
+    出る**（帳簿は無傷だが可読性が落ちる）。埋める値から区切りを落とす。
+    """
     more = ";dup_more_text" if fp.ocr_text_len > prev_fp.ocr_text_len * 1.05 else ""
     i = prev_fp.identity
-    return f"key={i.issuer}/{i.account_key}/{i.page_label};amt={fp.positive_total}{more}"
+    return "dup_key:%s/%s/%s;dup_amount:%d%s" % (
+        _safe_for_reason(i.issuer), _safe_for_reason(i.account_key),
+        _safe_for_reason(i.page_label), fp.positive_total, more)
+
+
+_RE_REASON_DELIM = re.compile(r"[;:@]")
+
+
+def _safe_for_reason(text):
+    """理由列の区切り文字を落とす（値がキーの境界を壊さないように）。"""
+    return _RE_REASON_DELIM.sub("", str(text or ""))
 
 
 class PageDedupIndex:

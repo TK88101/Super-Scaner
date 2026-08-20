@@ -198,5 +198,72 @@ class WritingStyleTest(unittest.TestCase):
                 self.assertLessEqual(len(audit_reason_ja(key)), 40)
 
 
+
+class DuplicatePageReasonTest(unittest.TestCase):
+    """重複ページ（T8d）。**複合形を丸ごと訳せること**が要点。
+
+    `page_dedup._detail` は `dup_key:…;dup_amount:…` を連ねるので、
+    単独キーだけ登録して満足すると、実際に監査タブへ出る文字列の
+    後半が機械語のまま残る（趙が 2026-08-20 に指摘した状態への逆戻り）。
+    """
+
+    def test_excluded_duplicate(self):
+        self.assertEqual(audit_reason_ja("duplicate_page:1"),
+                         "1 ページ目と同じ内容のため記帳していません")
+
+    def test_unknown_origin_page_still_reads(self):
+        self.assertEqual(audit_reason_ja("duplicate_page:?"),
+                         "? ページ目と同じ内容のため記帳していません")
+
+    def test_key_conflict(self):
+        self.assertIn("内容が違います", audit_reason_ja("dup_key_conflict:1"))
+
+    def test_content_only(self):
+        self.assertIn("重複の疑い", audit_reason_ja("dup_content_only:2"))
+
+    def test_amount_is_grouped(self):
+        self.assertEqual(audit_reason_ja("dup_amount:17295"),
+                         "重複と判定した金額は 17,295 円です")
+
+    def test_more_text_warns_about_handwriting(self):
+        self.assertIn("追記", audit_reason_ja("dup_more_text"))
+
+    def test_the_whole_compound_reason_is_japanese(self):
+        """実際に監査タブへ出る形（`page_family` ＋ `page_dedup._detail`）。"""
+        reason = ("duplicate_page:1;dup_key:AMEX/**********26003/1/6;"
+                  "dup_amount:17295;dup_more_text")
+        got = audit_reason_ja(reason)
+        for machine in ("duplicate_page:", "dup_key:", "dup_amount:",
+                        "dup_more_text"):
+            self.assertNotIn(machine, got,
+                             "機械語が残っている: %r → %r" % (machine, got))
+        self.assertIn("1 ページ目と同じ内容", got)
+        self.assertIn("17,295 円", got)
+
+
+class AnchorInheritanceReasonTest(unittest.TestCase):
+    """明細書作成日をどの頁から継いだか（T8d B 章）。"""
+
+    def test_origin_anchor_and_row_count_are_all_shown(self):
+        """**行数が要る。** 1 行しか出さないので、この 1 行から
+        抜き取り検査の母集団が特定できなければ意味がない。"""
+        got = audit_reason_ja("date_year_from_page:5@2026/05/15@57")
+        self.assertIn("5 ページ目", got)
+        self.assertIn("2026/05/15", got)
+        self.assertIn("57 行", got)
+        self.assertNotIn("date_year_from_page", got)
+        self.assertNotIn("@", got)
+
+    def test_origin_and_anchor_without_a_count_still_read(self):
+        got = audit_reason_ja("date_year_from_page:5@2026/05/15")
+        self.assertIn("5 ページ目", got)
+        self.assertIn("2026/05/15", got)
+        self.assertNotIn("date_year_from_page", got)
+
+    def test_a_missing_anchor_still_reads(self):
+        got = audit_reason_ja("date_year_from_page:5")
+        self.assertIn("5 ページ目", got)
+        self.assertNotIn("@", got)
+
 if __name__ == "__main__":
     unittest.main()

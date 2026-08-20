@@ -50,6 +50,10 @@ _MUST_STAY_LIGHT = (
     # T5: サルベージ解析は stdlib のみ（母 Plan §4 の「ocr_engine に積まない」）。
     "card_salvage",
     "test_card_salvage",
+    # T8d: 1 ファイル分の頁跨ぎ状態。重複索引と錨を持つが、判定は
+    # `page_dedup` / `card_entries` に在るので stdlib のみで足りる。
+    "card_file_state",
+    "test_card_file_state",
     # 標本と config 番人も直接登録する。これまでは「test_card_entries が
     # import しているから」という**間接的**な保護しかなく、T5/T6 で
     # import 元が変わった瞬間に無音で外れる形だった。
