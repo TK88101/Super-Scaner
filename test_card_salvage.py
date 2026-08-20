@@ -305,10 +305,10 @@ class DetectShortageTest(unittest.TestCase):
             with self.subTest(rows=label):
                 raw = {"rows": rows}
                 self.assertEqual(card_salvage._visible_rows(raw),
-                                 list(card_entries._rows(raw)))
+                                 list(card_entries._all_rows(raw)))
         raw = etc_rows_raw(12)
         self.assertEqual(card_salvage._visible_rows(raw),
-                         list(card_entries._rows(raw)))
+                         list(card_entries._all_rows(raw)))
 
     def test_expected_reads_numbers_the_same_way_as_the_reconciler(self):
         """券面申告の件数は検算側（`printed_totals[].count`）と同じ規則で読む。"""
@@ -334,7 +334,7 @@ class DetectShortageTest(unittest.TestCase):
         for label, raw in scenarios.items():
             with self.subTest(scenario=label):
                 self.assertEqual(card_salvage.detect_shortage(raw).got,
-                                 len(card_entries._rows(raw)))
+                                 len(card_entries._all_rows(raw)))
 
     def test_non_dict_raw_data_reports_nothing(self):
         for raw in (None, [], "x", 0):

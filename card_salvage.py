@@ -39,7 +39,7 @@ from typing import Any, List, NamedTuple, Optional
 # ずれる（過検出なら健全な頁に赤い提示行、過少検出なら行欠けが無音）。
 # どちらも venv 非依存モジュール（`test_dependency_weight` が見張る）なので
 # stdlib のみという本モジュールの性質は保たれる。
-from card_entries import _rows as _builder_rows
+from card_entries import _all_rows as _extracted_rows
 from card_reconciliation import _coerce_int
 
 # `ocr_engine` がサルベージ経由の raw_data に立てる内部旗。
@@ -214,14 +214,21 @@ def _salvage_array(text: str, i: int) -> List[Any]:
 # ============================================================
 
 def _visible_rows(raw_data: dict) -> List[dict]:
-    """**builder が実際に見る行**。数え方は builder へ委譲する。
+    """**券面から抽出できた行の全部**。数え方は `card_entries` へ委譲する。
 
     `len(raw_data["rows"])` を直に読んではいけない —— `rows` が dict のとき
     キー数を行数と誤認する（Gemini が schema を外した応答を返すと起きる）。
-    自前でフィルタを書くのも駄目で、記帳側と定義が割れた瞬間に
+    自前でフィルタを書くのも駄目で、抽出側と定義が割れた瞬間に
     「3 行記帳したのに券面3行中0行のみ取得」のような偽の警告が出る。
+
+    **`card_entries._rows`（会計対象）ではなく `_all_rows`（全行）を使う。**
+    ここが測るのは `rows_on_page`（券面に印字された行数）に対する**抽出の
+    完全性**であって、記帳したかどうかではない。インボイス再掲行は
+    会計対象から外すが**券面には印字されている**ので、こちらは数える。
+    会計側と揃えると、除外した分だけ「券面3行中2行のみ取得」という
+    嘘の行欠け警告が立つ（`test_card_reprint_section.ShortageCountingTest`）。
     """
-    return list(_builder_rows(raw_data))
+    return list(_extracted_rows(raw_data))
 
 
 def _expected_rows(raw_data: dict) -> Optional[int]:

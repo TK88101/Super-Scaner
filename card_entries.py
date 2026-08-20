@@ -168,17 +168,79 @@ def _card(raw_data):
     return _dict(_dict(raw_data).get("card"))
 
 
-def _rows(raw_data):
-    """明細行の list。dict でない要素は落とす（Gemini の型ゆれ対策）。"""
+def _all_rows(raw_data):
+    """券面から抽出できた明細行の**全部**。dict でない要素だけ落とす。
+
+    **数える側**（`card_salvage._visible_rows` → `rows_on_page` との突合）が
+    使う。券面にはインボイス再掲行も印字されているので、抽出の完全性を
+    測るこちらは再掲も数える。会計側は下の `_rows` を使うこと。
+    """
     rows = _dict(raw_data).get("rows")
     if not isinstance(rows, (list, tuple)):
         return ()
     return tuple(r for r in rows if isinstance(r, dict))
 
 
+def _sec_index(row):
+    """行の `sec` を index へ。**`sec` の解釈はここ 1 箇所に閉じる。**
+
+    Gemini は JSON 数値でなく "1" を返すことがある。文字列だからと未知扱いに
+    すると区画分離が効かなくなる。`True` は int の派生なので先に弾く。
+    """
+    if isinstance(row.get("sec"), bool):
+        return None
+    return _coerce_int(row.get("sec"))
+
+
+def _rows(raw_data):
+    """**会計対象**の明細行。インボイス再掲区画の行を除く。
+
+    **こちらが既定である**のは意図的である。将来 4 つ目の会計消費者が
+    素朴に `_rows()` を呼んでも、既定で正しい方を得る。生の全行が要る側だけが
+    明示的に `_all_rows()` を呼ぶ（`test_card_reprint_section` の AST 番人が
+    会計経路からの `_all_rows` 直呼びを禁じている）。
+
+    再掲区画（「上記に含まれる課税取引の明細」）は、既に上で計上済みの課税行を
+    消費税額表示のために並べ直しただけで、**新規取引ではない**。記帳すると
+    明細書 1 通あたりその分を過剰計上する（実測: 券面 97,004 に対し
+    明細合計 97,224。原票 TS CUBIC p4 / p9 で目視確認）。
+
+    **区画が報告されない券面では判別できない**（原票 p9 は `sections` が空で
+    出た）。その場合は落とさない —— 落とすと区画を報告しない券面の実在行が
+    消える。取りこぼしは金額検算が検出する側に倒す。
+    """
+    rows = _all_rows(raw_data)
+    reprint = {index for index, section in enumerate(_sections(raw_data))
+               if is_reprint_section_heading(_dict(section).get("label"))}
+    if not reprint:
+        return rows
+    return tuple(row for row in rows if _sec_index(row) not in reprint)
+
+
 def _matches(text, labels):
     """登録ラベルが入力に含まれるか（`section_for_label` と同じ判定形式）。"""
     return any(label in text for label in labels)
+
+
+# ── インボイス再掲区画 ────────────────────────────────────────────
+# 「上記に含まれる課税取引の明細」は、既に上で計上済みの課税行を消費税額
+# 表示のために再掲する区画（インボイス制度対応）。新規取引ではないので
+# 記帳にも検算にも入れてはならない。
+#
+# **白名単である。** 未知の見出しを再掲扱いにしない —— 誤判定は実在の経費を
+# 消すが、見逃しは過剰計上として金額検算が拾える（母 Plan 附録 B-1 の
+# 「誤検知と見逃しの非対称性」）。
+REPRINT_SECTION_LABELS = frozenset({
+    "上記に含まれる課税取引の明細",
+})
+
+
+def is_reprint_section_heading(label):
+    """区画**見出し**が再掲区画か。未知は `False`。"""
+    text = _norm(label).strip()
+    if not text:
+        return False
+    return _matches(text, REPRINT_SECTION_LABELS)
 
 
 # ── 区画 ──────────────────────────────────────────────────────────
@@ -214,9 +276,7 @@ def _section_of_row(row, sections, kind):
         # Gemini の `sec` 申告より優先する（混ぜると 933,680 が崩れる）
         return SECTION_PAYMENT_SUMMARY
 
-    # Gemini は JSON 数値でなく "1" を返すことがある。文字列だからと
-    # 未知区画に落とすと、`card_reconciliation` 側で区画分離が効かなくなる
-    index = None if isinstance(row.get("sec"), bool) else _coerce_int(row.get("sec"))
+    index = _sec_index(row)
     if index is None or not 0 <= index < len(sections):
         return SECTION_UNKNOWN
 
