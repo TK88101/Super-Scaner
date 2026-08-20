@@ -64,7 +64,11 @@ except ImportError:
 # **実際に読むキーだけ**を書く（`period` は `page_dedup` が読むので prompt には
 # 在るが、こちらは読まない。宣言と実装の一致を AST テストが双方向で見張る）
 CONSUMED_CARD_KEYS = ("issuer", "member_no", "statement_page",
-                      "statement_no", "card_name", "account_hint")
+                      "statement_no", "card_name", "account_hint",
+                      # 2026-08-20: 明細行の**年**を確定する錨（`_card_date`）。
+                      # 券面の日付欄は「12月18日」のように月日だけなので、
+                      # ここが読めないと年が Gemini の裁量になる
+                      "statement_date")
 CONSUMED_ROW_KEYS = ("line_no", "date", "month_day", "merchant", "note",
                      "amount", "foreign_amount", "currency", "fx_rate",
                      "kind", "sec", "category", "place_from", "place_to",
@@ -145,6 +149,9 @@ _NONBOOKABLE_LABEL = {
 }
 
 _RE_MONTH_DAY = re.compile(r"(\d{1,2})\D+(\d{1,2})")
+# 完全な年月日。**`_RE_MONTH_DAY` を完全日付に当ててはいけない** ——
+# `2023/12/22` は `23/12` に食いつき、月 23 という不正値になる。
+_RE_YMD = re.compile(r"(\d{4})\D(\d{1,2})\D(\d{1,2})")
 _RE_STATEMENT_PAGE = re.compile(r"(\d{1,3})\s*/\s*(\d{1,3})")
 
 
@@ -522,6 +529,9 @@ def _build(raw_data, doc_type, reference_date):
         if doc_type == DocType.TRANSIT_IC:
             entry["date"], entry["_year_estimated"] = _ic_date(
                 row, reference_date)
+        elif doc_type == DocType.CREDIT_CARD:
+            # 年だけを券面の錨（明細書作成日）で確定する。月日は Gemini を信じる。
+            entry["date"], entry["_year_estimated"] = _card_date(row, card)
 
         if kind == _KIND_UNCLASSIFIED_NEGATIVE:
             # ラベルで同定できない負数を `credit_adjust`（貸方 雑収入）に
@@ -586,6 +596,87 @@ def _build(raw_data, doc_type, reference_date):
 
 
 # ── 年の推定（nimoca には年が印字されていない。F-7）──────────────────
+def _parse_ymd(text):
+    """`2023/01/19` 形式を date に。読めなければ None（例外にしない）。"""
+    m = _RE_YMD.search(_norm(text))
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def _nearest_past(month, day, ref):
+    """`ref` を超えない直近の (month, day) を `YYYY/MM/DD` で返す。無ければ ""。
+
+    明細は**過去の記録**なので、基準日より未来になる月日は年跨ぎの徴候
+    （1 月に発行された明細書が 12 月の利用を載せる形）。前年に倒す。
+    """
+    for year in (ref.year, ref.year - 1):
+        try:
+            candidate = date(year, month, day)
+        except ValueError:
+            continue      # 2/30 や 2/29 が非閏年に当たった等
+        if candidate <= ref:
+            return candidate.strftime("%Y/%m/%d")
+    return ""
+
+
+def _month_day_of(row, printed):
+    """この行の (月, 日)。取れなければ None。
+
+    優先順は month_day → date。`month_day` は「年が無く月日だけのときの逐語」
+    という契約だが、Gemini が完全な日付を入れてくることもあるので両方見る。
+    """
+    raw = _norm(row.get("month_day"))
+    full = _parse_ymd(raw)
+    if full is not None:
+        return full.month, full.day
+    m = _RE_MONTH_DAY.search(raw)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    p = _parse_ymd(printed)
+    return (p.month, p.day) if p is not None else None
+
+
+def _card_date(row, card):
+    """(YYYY/MM/DD, 券面から補正したか) を返す。**年は券面の錨が決める。**
+
+    2026-08-20 の実害: 同じ券面を 2 日続けて処理したら、前日は 62 行すべて
+    正しく、当日は 7 行が空・18 行が 1 年ずれた（2023/12/22 ← 正 2022/12/22）。
+    アメックスの明細行の日付欄は「12月18日」のように**月日だけ**で、年は
+    頁頭の「明細書作成日」から倒推するしかない。そこを Gemini の裁量に
+    委ねると、頁ごとに「null を返す／推測して当てる／推測して外す」が割れる。
+
+    **空欄より無音の誤年の方が危険**。空欄は `missing_date` が赤にするが、
+    2023/12/22 は書式として正当なのでどの検知器も鳴らない。だから
+    `_ic_date` と違い、Gemini が入れた完全な日付でも**年は上書きする**。
+    月日の方は信じる（券面に明瞭に印字され、実測で外していない）。
+
+    錨（`statement_date`）が読めないときは**何もしない**。実行日で推すと、
+    2023 年の資料を 2026 年に処理したとき 12月18日 が 2025/12/18 に化ける
+    —— 直そうとした誤りより遠い。
+
+    局限: 利用日が作成日より後になる券面では前年へ倒れる。実物のアメックス
+    8 頁では作成日 2023/01/19 に対し最終利用日 2023/01/15 で成立する。
+    反例が出たら実物を添えて規則を見直すこと。
+    """
+    printed = str(row.get("date") or "").strip()
+    ref = _parse_ymd(card.get("statement_date"))
+    if ref is None:
+        return printed, False
+
+    md = _month_day_of(row, printed)
+    if md is None:
+        return printed, False
+
+    resolved = _nearest_past(md[0], md[1], ref)
+    if not resolved:
+        return printed, False
+    return resolved, resolved != printed
+
+
 def _ic_date(row, reference_date):
     """(YYYY/MM/DD, 推定したか) を返す。
 
@@ -600,16 +691,9 @@ def _ic_date(row, reference_date):
     if not m:
         return "", False
 
-    month, day = int(m.group(1)), int(m.group(2))
-    ref = reference_date or date.today()
-    for year in (ref.year, ref.year - 1):
-        try:
-            candidate = date(year, month, day)
-        except ValueError:
-            continue      # 2/29 が非閏年に当たった等
-        if candidate <= ref:
-            return candidate.strftime("%Y/%m/%d"), True
-    return "", False
+    resolved = _nearest_past(int(m.group(1)), int(m.group(2)),
+                             reference_date or date.today())
+    return (resolved, True) if resolved else ("", False)
 
 
 # ── 非記帳行の可視化（AD-T4-7）────────────────────────────────────
