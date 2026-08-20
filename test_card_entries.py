@@ -8,6 +8,7 @@
 これらは「明細相加 = 印字合計」が実券面で成立することを目視確認した数字で、
 負数行を含めて初めて一致する（`f464179` の負号バグはここで捕まる）。
 """
+import copy
 import os
 import sys
 import unittest
@@ -26,7 +27,8 @@ from ocr_test_fixtures import (                              # noqa: E402
     AMEX_B_P5_OCR, AMEX_B_P5_RAW, AMEX_B_RETURN_RAW,
     ENEOS_P1_POINT_SECTION_RAW, ENEOS_P2_OCR, ENEOS_P2_RAW,
     JCB_FX_NO_JPY_RAW, JCB_FX_RAW,
-    NIMOCA_P1_OCR, NIMOCA_P1_RAW, UC_P2_OCR, UC_P2_RAW,
+    NIMOCA_P1_OCR, NIMOCA_P1_RAW, TSCUBIC_ETC_P6_RAW, TSCUBIC_FUEL_P4_RAW,
+    UC_P2_OCR, UC_P2_RAW, _cc_row,
 )
 
 CC = DocType.CREDIT_CARD
@@ -601,6 +603,161 @@ class CreditCardBuilderTest(unittest.TestCase):
 
         # Assert
         self.assertEqual(entries[0]["description"], "福北高速 ＥＴＣ後納分")
+
+
+# ── 給油所型の欄取り違えの是正（案 D。2026-08-20）────────────────────
+class VendorColumnSwapTest(unittest.TestCase):
+    """F列に商品名・T列に店名が入る給油所型の取り違えを**表示欄だけ**で直す。
+
+    根因は prompt の merchant 定義（"利用店名・摘要の主行"）が両方を許すこと。
+    Gemini にも raw にも触らず、`_base_entry` が表示欄を組むその場で是正する。
+
+    **両方向で固定する**: 直す行が直ること と、直してはいけない行
+    （ETC・通常店名）が 1 バイトも動かないこと。T6-7 が踏んだ
+    「顧客の帳簿の見た目が黙って変わる」失敗様式の再発防止。
+    """
+
+    def _fuel(self):
+        return card_entries.build_entries_from_credit_card(TSCUBIC_FUEL_P4_RAW)
+
+    def test_vendor_becomes_the_station_name(self):
+        """V1: F列は元の T列（ステーション名）と**逐値**一致する。
+
+        「油種語が 0 件」では不十分 —— 空欄や OCR ゴミでも通ってしまう
+        （Codex 評審 P2）。
+        """
+        # Act
+        entries = self._fuel()
+
+        # Assert
+        self.assertEqual(entries[0]["debit_vendor"], "バイパス奈良中央SS")
+        self.assertEqual(entries[1]["debit_vendor"], "スーパーセルフ近江大橋SS")
+        self.assertEqual(entries[2]["debit_vendor"], "CSCネオス塚口")
+
+    def test_description_keeps_both_station_and_goods(self):
+        """V2: S列は「店名 商品名」（趙拍板 2026-08-20）。油種を落とさない。
+
+        F列だけ直して S列も店名にすると、帳簿で最も目に付く列から
+        `レギュラー` が消える —— 片方を直して片方を壊す（Codex 評審 P1）。
+        """
+        # Act
+        entries = self._fuel()
+
+        # Assert
+        self.assertEqual(entries[0]["description"], "バイパス奈良中央SS レギュラー")
+        self.assertEqual(entries[1]["description"],
+                         "スーパーセルフ近江大橋SS 洗車")
+        self.assertEqual(entries[2]["description"], "CSCネオス塚口 パーツ")
+
+    def test_memo_is_left_alone(self):
+        """V3: T列は触らない。F と重複するが、重複は誤りではない。"""
+        # Act
+        entries = self._fuel()
+
+        # Assert
+        self.assertEqual(entries[0]["memo"], "バイパス奈良中央SS")
+
+    def test_ordinary_merchant_row_is_untouched(self):
+        """逆方向の固定: 取り違えていない行は 1 バイトも変えない。"""
+        # Act
+        entry = self._fuel()[3]
+
+        # Assert
+        self.assertEqual(entry["debit_vendor"], "セブン-イレブン博多三井ビル店")
+        self.assertEqual(entry["description"], "セブン-イレブン博多三井ビル店")
+        self.assertEqual(entry["memo"], "")
+
+    def test_etc_rows_are_untouched(self):
+        """V5: ETC 頁に店名欄は無い。F=入口 / T=出口＋車種 は両方が実内容。
+
+        語彙表に ETC 語が紛れ込むと約 55 行が壊れる（Plan §1.4）。
+        """
+        # Act
+        entries = card_entries.build_entries_from_credit_card(TSCUBIC_ETC_P6_RAW)
+
+        # Assert
+        self.assertEqual(entries[0]["debit_vendor"], "ETC 東大阪入")
+        self.assertEqual(entries[0]["description"], "ETC 東大阪入")
+        self.assertEqual(entries[0]["memo"], "東大阪荒本 軽自動")
+        self.assertEqual(entries[1]["debit_vendor"], "ETC 紫川")
+
+    def test_raw_rows_are_not_mutated(self):
+        """Codex 評審 P1: raw を書き換えると検算側の逐語まで変わる。"""
+        # Arrange
+        before = copy.deepcopy(TSCUBIC_FUEL_P4_RAW)
+
+        # Act
+        card_entries.build_entries_from_credit_card(TSCUBIC_FUEL_P4_RAW)
+
+        # Assert
+        self.assertEqual(TSCUBIC_FUEL_P4_RAW, before)
+
+    def test_reconciliation_still_reads_the_raw_wording(self):
+        """検算集合は raw のまま。表示の都合で検算が動いてはいけない。"""
+        # Act
+        lines = card_entries.detail_lines_from_raw(TSCUBIC_FUEL_P4_RAW, CC)
+
+        # Assert
+        self.assertEqual(lines[0].description, "レギュラー")
+
+    def test_row_text_for_classification_reads_the_raw(self):
+        """V6: 記帳軸の判定は raw を読む。表示の組み替えの影響を受けない。"""
+        # Act
+        text = card_entries._row_text(TSCUBIC_FUEL_P4_RAW["rows"][0])
+
+        # Assert
+        self.assertIn("レギュラー", text)
+        self.assertIn("バイパス奈良中央SS", text)
+
+    def test_foreign_currency_suffix_survives_the_swap(self):
+        """外貨 suffix は入れ替え後も末尾に残る（AD-10）。"""
+        # Arrange
+        raw = {**TSCUBIC_FUEL_P4_RAW, "rows": [
+            _cc_row(1, "2026/04/10", "レギュラー", 5495,
+                    note="バイパス奈良中央SS", foreign_amount=57.6,
+                    currency="USD", fx_rate=160.384)]}
+
+        # Act
+        entries = card_entries.build_entries_from_credit_card(raw)
+
+        # Assert
+        self.assertEqual(entries[0]["description"],
+                         "バイパス奈良中央SS レギュラー 57.60USD @160.384")
+
+    def test_real_merchants_starting_with_a_goods_token_are_not_swapped(self):
+        """Codex 実施後評審 P1: 前方一致だと本物の取引先が破壊される。
+
+        `オイル` `タイヤ` `パーツ` `作業` `プレミアム` は実在の店名の接頭辞
+        でもある。**誤検知は取引先欄を壊すが、見逃しは商品名が残るだけで
+        店名は T列に在る** —— 誤検知の方が重いので完全一致で照合する。
+        """
+        # Arrange: いずれも「商品語で始まる**本物の店名**」＋ note 非空
+        names = ("パーツワン福岡店", "オイルボーイ博多店", "作業服センター博多",
+                 "タイヤ館 春日", "プレミアムアウトレット鳥栖",
+                 "ガソリンスタンド山田商会")
+        raw = {**TSCUBIC_FUEL_P4_RAW, "rows": [
+            _cc_row(i, "2026/04/10", name, 1000, note="ご利用分")
+            for i, name in enumerate(names, 1)]}
+
+        # Act
+        entries = card_entries.build_entries_from_credit_card(raw)
+
+        # Assert: 1 件も入れ替わらない
+        self.assertEqual([e["debit_vendor"] for e in entries], list(names))
+        self.assertEqual([e["description"] for e in entries], list(names))
+
+    def test_goods_label_without_a_note_is_left_alone(self):
+        """note が空なら入れ替えない —— 空の F列を作らない。"""
+        # Arrange
+        raw = {**TSCUBIC_FUEL_P4_RAW, "rows": [
+            _cc_row(1, "2026/04/10", "レギュラー", 5495)]}
+
+        # Act
+        entries = card_entries.build_entries_from_credit_card(raw)
+
+        # Assert
+        self.assertEqual(entries[0]["debit_vendor"], "レギュラー")
+        self.assertEqual(entries[0]["description"], "レギュラー")
 
 
 # ── AD-T4-11: account_hint の解決 ─────────────────────────────────

@@ -420,6 +420,60 @@ def _debit_account(row, card, doc_type):
 
 
 # ── 摘要（S列）。Gemini に整形させない ────────────────────────────
+# 給油所型の欄取り違え（案 D。2026-08-20）。
+#
+# 券面の「ご利用内容（備考）」欄と店名欄が独立して印字される給油所明細で、
+# Gemini が前者を merchant、後者を note に入れる。prompt の merchant 定義が
+# `"利用店名・摘要の主行"`（`card_prompts.py:103`）で**両方を許している**ため
+# 指示違反ではない。2026-08-20 の真票実測で 20/355 行。
+#
+# 店名欄の名称は券面ごとに違う（TS CUBIC =「ステーション名」/ ENEOS 個人
+# カード =「ご利用店名」）。prompt で片方だけ書いても直らないので、
+# 表示側で是正する。
+#
+# **raw は書き換えない。** 入れ替えると `detail_lines_from_raw` が読む検算側の
+# 逐語と、`_row_text` が読む記帳軸の判定材料まで変わる（Codex 評審 P1）。
+#
+# **ETC 語を入れてはいけない。** ETC 頁は 4 欄（利用年月日 / 利用内容 /
+# ご請求金額 / 摘要）で**店名欄が無く**、F=入口・T=出口＋車種 は両方が券面の
+# 実内容。入れると約 55 行が壊れる。
+#
+# **記帳軸の `_POINT_ADJUST_LABELS` 等とは別表にする。** 同じ表にすると
+# 片方への追加が他方を誤爆させる（`_CARRY_OVER_LABELS` の註と同じ理由）。
+#
+# **前方一致ではなく完全一致で照合する**（Codex 実施後評審 P1）。
+# `オイル` `タイヤ` `パーツ` `作業` `プレミアム` は実在の店名の接頭辞でもある
+# （`オイルボーイ博多店` `タイヤ館』 `パーツワン福岡店` `作業服センター』
+# `プレミアムアウトレット…`）。前方一致だと**本物の取引先が note で
+# 上書きされる** —— 誤検知は取引先欄を破壊するが、見逃しは「商品名のまま」
+# で済み店名は T列に残る。**誤検知の方が重い**ので厳しい側へ倒す。
+# 実測 20 行はすべて欄の値が商品語と完全一致で、完全一致でも 1 行も落ちない。
+_GOODS_LABELS = frozenset((
+    "レギュラー", "ハイオク", "軽油", "ケイユ", "フケイユ",
+    "灯油", "洗車", "手洗洗車", "オイル", "タイヤ",
+    "パーツ", "作業", "ガソリン", "プレミアム"))
+
+
+def _looks_swapped(row):
+    """給油所型の欄取り違えか（merchant が商品・役務語 かつ note が非空）。
+
+    **「note が店名らしいか」は条件に入れない。** 実測で `CSCネオス塚口` が
+    店名接尾辞（店 / SS / セルフ / 営業所 / 支店）を持たず、この条件を足すと
+    「パーツ」「作業」の 3 行を取りこぼす。脆い発見的規則を重ねない。
+
+    note が空のときに入れ替えないのは、**空の取引先欄を作らない**ため。
+    """
+    if not str(row.get("note") or "").strip():
+        return False
+    return _norm(str(row.get("merchant") or "").strip()) in _GOODS_LABELS
+
+
+def _debit_vendor(row):
+    """F列（借方取引先）。取り違え行では note（店名）を採る。"""
+    key = "note" if _looks_swapped(row) else "merchant"
+    return str(row.get(key) or "").strip()
+
+
 def _fx_suffix(row):
     """`57.60USD @160.384`。円貨と取り違えないよう通貨記号を必ず添える。"""
     foreign, currency = row.get("foreign_amount"), str(row.get("currency") or "")
@@ -444,9 +498,16 @@ def _description(row, doc_type):
 
     # 副行（ETC NO・入口/出口）は**摘要に入れない**。S列は帳簿で最も目に付く
     # 列で、ETC NO の羅列で埋めると読めなくなる。行級 memo（T列）へ回す
-    merchant = str(row.get("merchant") or "").strip()
+    #
+    # 例外は給油所型の取り違え（`_looks_swapped`）—— そこでは note が副行では
+    # なく**店名**なので、「店名 商品名」の形で両方を残す（趙拍板 2026-08-20）。
+    # F列だけ直して S列も店名にすると、帳簿で最も目に付く列から `レギュラー`
+    # が消える ＝ 片方を直して片方を壊す（Codex 評審 P1）。
+    base = str(row.get("merchant") or "").strip()
+    if _looks_swapped(row):
+        base = "%s %s" % (str(row.get("note") or "").strip(), base)
     suffix = _fx_suffix(row)
-    return "%s %s" % (merchant, suffix) if suffix else merchant
+    return "%s %s" % (base, suffix) if suffix else base
 
 
 def _memo(row, unresolved_hint, rejected_account=""):
@@ -477,7 +538,7 @@ def _base_entry(row, card, doc_type, booking_kind, line_kind, unresolved_hint,
         # 使わないので、これは T6 を待たずに**今すぐ効く**
         "debit_invoice": "",
         "date": str(row.get("date") or ""),
-        "debit_vendor": str(row.get("merchant") or "").strip(),
+        "debit_vendor": _debit_vendor(row),
         "memo": _memo(row, unresolved_hint, rejected_account),
         "description": _description(row, doc_type),
         "_booking_kind": booking_kind,

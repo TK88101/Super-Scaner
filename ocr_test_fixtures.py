@@ -250,6 +250,51 @@ AMEX_B_RETURN_RAW = {
 }
 
 
+# ── 給油所型の欄取り違え（Plan `2026-08-20-card-vendor-column-fix` §1.4）──
+# TS CUBIC p4 の券面は 8 欄で、店名欄の名は「**ステーション名**」（ENEOS 個人
+# カードは「ご利用店名」。券面ごとに名称が違う）。Gemini は「ご利用内容（備考）」
+# を merchant、「ステーション名」を note に入れる —— prompt の merchant 定義が
+# 「利用店名・摘要の主行」で両方を許すため**指示違反ではない**。
+# 2026-08-20 の真票実測で 20/355 行。
+TSCUBIC_FUEL_P4_RAW = {
+    "card": {
+        "issuer": "トヨタファイナンス", "member_no": "6900-0553-1626-9242",
+        "statement_page": "1/5", "period": "2026/05",
+        "statement_no": "", "statement_date": "2026/05/15",
+        "card_name": "ＥＮＥＯＳ ＢＵＳＩＮＥＳＳ Ⅱ",
+        "issuer_t_number": "T8010601027383", "account_hint": "",
+    },
+    "sections": [{"index": 0, "label": "今月ご利用額", "subtotal": 8808}],
+    "printed_totals": [{"label": "ご利用金額小計", "amount": 8808, "count": 4,
+                        "page": 4, "is_handwritten": False}],
+    "rows_on_page": 4, "total_amount": 8808,
+    "rows": [
+        # 取り違えの 3 形態: 油種 / 役務 / 部品。語彙表がどれか 1 つに
+        # 偏ると残りが黙って漏れるので、3 つとも標本に入れる
+        _cc_row(1, "2026/04/10", "レギュラー", 5495, note="バイパス奈良中央SS"),
+        _cc_row(2, "2026/04/15", "洗車", 500, note="スーパーセルフ近江大橋SS"),
+        _cc_row(3, "2026/04/22", "パーツ", 2700, note="CSCネオス塚口"),
+        # 取り違えていない行（店名が merchant に在る）。**触ってはいけない**
+        _cc_row(4, "2026/04/25", "セブン-イレブン博多三井ビル店", 113),
+    ],
+}
+
+# ETC 頁は 4 欄（利用年月日 / 利用内容 / ご請求金額 / 摘要）で**店名欄が無い**。
+# F=入口・T=出口＋車種 は取り違えではなく**両方が券面の実内容**。
+# 語彙表に ETC 語を入れると約 55 行が壊れる（Plan §1.4 / §3.3）
+TSCUBIC_ETC_P6_RAW = {
+    **TSCUBIC_FUEL_P4_RAW,
+    "sections": [{"index": 0, "label": "ＥＴＣご利用分", "subtotal": 970}],
+    "printed_totals": [{"label": "ご利用金額小計", "amount": 970, "count": 2,
+                        "page": 6, "is_handwritten": False}],
+    "rows_on_page": 2, "total_amount": 970,
+    "rows": [
+        _cc_row(1, "2026/04/11", "ETC 東大阪入", 760, note="東大阪荒本 軽自動"),
+        _cc_row(2, "2026/04/11", "ETC 紫川", 210, note="黒崎東出口 普通車"),
+    ],
+}
+
+
 # T5: 截断サルベージ用の大型標本。**関数**にしてあるのは、100 行を
 # module-level 定数にすると venv 非依存経路（`python3 -m unittest test_page_family`）
 # の import ごとに 100 dict を組み立てることになるため。
