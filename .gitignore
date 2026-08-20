@@ -12,6 +12,14 @@ SuperScaner.pem
 # 一次同樣的驗證而重新生成，這條會自動擋住，不必再判斷一次。
 golden/
 
+# fixtures/ = Gemini 應答的錄音 (record-replay)。內容為客戶真實票據的
+# 店名・金額・日期・卡號末 4 碼，以及 OCR 全文。與 golden/ 同性質。
+# 本 repo 是 PUBLIC，真實票據資料絕不進入 —— 這條是 golden/ 政策的延伸。
+# 番人測試 (test_gemini_record_replay.FixtureSecrecyTest) 檢查的不是
+# 「規則是否存在」而是「git ls-files 是否為空」—— 規則只擋一般 add，
+# 擋不住 git add -f 與已經 tracked 的檔案。
+fixtures/
+
 # --- 系統垃圾與緩存 ---
 __pycache__/
 *.pyc

@@ -25,6 +25,7 @@ Google Drive / Chatwork 不要。Gemini API のみで動作。
   test_images/processed/ へ shutil.move される（原本が消費される）。
 """
 
+import contextlib
 import os
 import sys
 import shutil
@@ -354,9 +355,7 @@ def process_local_file(file_info, sheets_writer, strategy=None, start_page=1):
     return True
 
 
-def main():
-    print("🚀 Super Scaner ローカルテストモード起動 (Sheets出力版)")
-
+def build_parser():
     parser = argparse.ArgumentParser(description="Super Scaner Local Test")
     parser.add_argument("--strategy", choices=["A", "B", "C"], default=None,
                         help="OCR strategy override (default: config.OCR_STRATEGY)")
@@ -364,7 +363,122 @@ def main():
                         help="Resume from this page (1-indexed). Applied to all scanned files.")
     parser.add_argument("--only-file", type=str, default=None,
                         help="Only process files whose name contains this substring.")
-    args = parser.parse_args()
+    parser.add_argument("--record", metavar="DIR", default=None,
+                        help="Gemini 応答を DIR へ録音する (実 Gemini を呼ぶ)")
+    parser.add_argument("--replay", metavar="DIR", default=None,
+                        help="DIR の録音を再生する (Gemini を 1 度も呼ばない)")
+    parser.add_argument("--accept-drift", metavar="部位", action="append",
+                        default=None,
+                        help="再生時、この部位の差分だけは許して続行する "
+                             "(--replay 専用。複数指定可)")
+    parser.add_argument("--record-overwrite", action="store_true",
+                        help="--record の出力先に既存の録音があっても消して録り直す")
+    return parser
+
+
+def check_record_flags(args):
+    """記録再生フラグの整合性を **Sheets へ繋ぐ前に** 検査する。
+
+    どのフラグも未指定なら `gemini_record` を **import すらしない** ——
+    通常実行に記録再生の機構が一切載らないようにするため
+    (Plan R-1: 誤って再生経路に入ると無音で帳簿が壊れる)。
+
+    Returns:
+        検証済みの accept-drift 部位のタプル (未使用なら空)。
+    """
+    if args.record and args.replay:
+        raise SystemExit("❌ --record と --replay は同時に使えません")
+    drift = tuple(args.accept_drift or ())
+    if drift and not args.replay:
+        raise SystemExit("❌ --accept-drift は --replay のときだけ意味があります")
+    if not (args.record or args.replay):
+        return ()
+
+    import gemini_record
+
+    unknown = [part for part in drift if part not in gemini_record.ALL_PARTS]
+    if unknown:
+        raise SystemExit(
+            f"❌ --accept-drift の部位が不正です: {', '.join(unknown)} / "
+            f"使えるのは {', '.join(gemini_record.ALL_PARTS)}")
+    return drift
+
+
+def open_gemini_record(args, drift, stack):
+    """`--record` / `--replay` を context として張る (既定は何もしない)。
+
+    Returns:
+        gemini_record.Session または None。
+    """
+    if not (args.record or args.replay):
+        return None
+
+    import gemini_record
+
+    if args.record:
+        print(f"🎙️ Gemini 応答を録音します: {args.record}")
+        print("   ※ 録音には顧客の実票の中身が入ります。fixtures/ は "
+              ".gitignore で全数排除されています")
+        return stack.enter_context(
+            gemini_record.recording(args.record,
+                                    overwrite=args.record_overwrite))
+
+    print(f"▶️ 録音を再生します (Gemini は呼びません): {args.replay}")
+    if drift:
+        print(f"   ⚠️ 差分を許す部位: {', '.join(drift)}")
+    return stack.enter_context(
+        gemini_record.replaying(args.replay, accept_drift=drift))
+
+
+def record_error_types(session):
+    """記録再生を使っているときだけ、その例外を「致命」として扱う。
+
+    使っていなければ空タプル ——`except ()` は何も捕まえないので、
+    従来の挙動が 1 バイトも変わらない。
+    """
+    if session is None:
+        return ()
+
+    import gemini_record
+
+    return (gemini_record.RecordError,)
+
+
+def process_all(files, sheets_writer, args, fatal):
+    """逐ファイル処理。致命例外だけは握り潰さずに投げ直す。
+
+    従来この loop は `except Exception` で全部を拾って `fail_count += 1` し、
+    先へ進んでいた。記録再生の不一致までそこに落ちると、
+    「一部のファイルが失敗しただけ」に見えたまま Sheets の flush まで到達する
+    —— Plan §5 が「すべて例外で停止」と定めた当のものが、静かに骨抜きになる
+    （Codex 実装評審 高 2）。
+
+    Returns:
+        (成功件数, 失敗件数)
+    """
+    success_count = 0
+    fail_count = 0
+    for file_info in files:
+        try:
+            if process_local_file(file_info, sheets_writer,
+                                  strategy=args.strategy,
+                                  start_page=args.start_page):
+                success_count += 1
+            else:
+                fail_count += 1
+        except fatal:
+            raise
+        except Exception as e:
+            print(f"❌ エラー: {file_info['name']} - {e}")
+            fail_count += 1
+    return success_count, fail_count
+
+
+def main():
+    print("🚀 Super Scaner ローカルテストモード起動 (Sheets出力版)")
+
+    args = build_parser().parse_args()
+    drift = check_record_flags(args)
 
     print(f"📂 テストフォルダ: {os.path.abspath(TEST_DIR)}")
     print("-" * 50)
@@ -403,21 +517,22 @@ def main():
         print(f"   - [{label}] {f['name']}")
 
     # 処理実行
-    success_count = 0
-    fail_count = 0
+    with contextlib.ExitStack() as stack:
+        session = open_gemini_record(args, drift, stack)
+        success_count, fail_count = process_all(
+            files, sheets_writer, args, record_error_types(session))
 
-    for file_info in files:
-        try:
-            if process_local_file(file_info, sheets_writer, strategy=args.strategy, start_page=args.start_page):
-                success_count += 1
-            else:
-                fail_count += 1
-        except Exception as e:
-            print(f"❌ エラー: {file_info['name']} - {e}")
-            fail_count += 1
+        # 取引No を Sheets に書き戻す
+        sheets_writer.flush()
 
-    # 取引No を Sheets に書き戻す
-    sheets_writer.flush()
+        if session is not None:
+            print(f"\n🎬 Gemini 呼出 {session.calls} 回 ({session.mode})")
+            for item in session.drifts:
+                print(f"   ⚠️ 差分を許して再生: seq={item['seq']} "
+                      f"部位={', '.join(item['parts'])}")
+            for item in session.reorders:
+                print(f"   ⚠️ 順序相違: {item['at'] + 1} 回目に "
+                      f"seq={item['seq']} を使用")
 
     # サマリー
     print("\n" + "=" * 50)
