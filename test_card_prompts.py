@@ -135,9 +135,17 @@ class SectionScopeTest(unittest.TestCase):
         self.assertIn("すべての区画のすべての明細行", cp.CREDIT_CARD_PROMPT)
 
     def test_cross_page_inference_is_still_forbidden(self):
-        """軸の分離であって緩和ではない。F-1 対策は残す。"""
-        self.assertIn("他ページの情報を推測で補わないでください",
+        """軸の分離であって緩和ではない。F-1 対策は残す。
+
+        2026-08-20 更新: 作用域を**明細行**へ限定した。旧文
+        「他ページの情報を推測で補わない」は情報一般を禁じており、
+        年の確定（月日だけの日付欄 ＋ 頁頭の作成日から倒推する作業）まで
+        巻き添えにして、同じ券面で 7 行が空・18 行が誤年になった。
+        経緯と回帰は `test_card_date_year` が持つ。
+        """
+        self.assertIn("他ページの明細行を推測で補わないでください",
                       cp.CREDIT_CARD_PROMPT)
+        self.assertIn("印字されていない明細行を", cp.CREDIT_CARD_PROMPT)
 
     def test_rows_carry_their_section_index(self):
         """区画を全部報告させるなら、行がどちらに属するかも要る。
@@ -162,6 +170,49 @@ class SectionScopeTest(unittest.TestCase):
                        "どの区画に属するか"):
             with self.subTest(phrase=phrase):
                 self.assertNotIn(phrase, cp.TRANSIT_IC_PROMPT)
+
+
+class DateYearRuleTest(unittest.TestCase):
+    """2026-08-20 の回帰対応: 年を確定する推理路を塞がない。
+
+    T8b-3 で F-1 対策として足した「このページに見えているものだけを使います」
+    が、**年の確定**まで巻き添えにした。アメックスの日付欄は「12月18日」の
+    ように月日だけで、年は頁頭の「明細書作成日」から倒推するしかない。
+    結果、同じ券面で頁ごとに「null を返す／推測して当てる／推測して外す」が
+    割れ、7 行が空・18 行が 1 年ずれた。
+
+    直し方は**緩和ではなく作用域の限定**。跨頁の禁止は「明細行を作るな」に
+    限り、年の確定は券面の錨から行わせる。プログラム側にも
+    `card_entries._card_date` の兜底を置いた（prompt が効かなくても直る）。
+    """
+
+    def test_credit_card_prompt_states_the_year_rule(self):
+        """錨の**名前**が schema に在るだけでは足りない。規則を明文で置く。
+
+        `statement_date` は元から出力フィールドとして書かれていた。それでも
+        Gemini は年を確定できなかった —— フィールドが在ることと、それを
+        使って年を決めよという指示が在ることは別である。
+        """
+        self.assertIn("日付の年は券面から確定してください", cp.CREDIT_CARD_PROMPT)
+        self.assertIn("明細書作成日から年を", cp.CREDIT_CARD_PROMPT)
+
+    def test_the_over_broad_restriction_is_gone(self):
+        """年の推理まで塞いだ一文が復活していないこと。"""
+        self.assertNotIn("見えているものだけ", cp.CREDIT_CARD_PROMPT)
+
+    def test_the_cross_page_row_ban_survives(self):
+        """F-1（1 つの PDF に別会社の明細が混在）対策は残す。"""
+        self.assertIn("他ページ", cp.CREDIT_CARD_PROMPT)
+        self.assertIn("推測で補わないでください", cp.CREDIT_CARD_PROMPT)
+
+    def test_transit_ic_still_forbids_guessing_the_year(self):
+        """nimoca には錨が無い。**逆の規則**をここへ持ち込ませない。
+
+        券面に作成日も期間も印字されていないので、年を推させると必ず
+        当て推量になる（F-7）。credit_card 側の修正が波及したら赤くする。
+        """
+        self.assertIn("年を推測しないでください", cp.TRANSIT_IC_PROMPT)
+        self.assertNotIn("明細書作成日", cp.TRANSIT_IC_PROMPT)
 
 
 if __name__ == "__main__":
