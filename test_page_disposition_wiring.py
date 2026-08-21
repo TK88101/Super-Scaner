@@ -340,7 +340,7 @@ class SectionAuditIsWiredTest(unittest.TestCase):
         self.assertIn("family_signal_with_entries", merged, "族シグナルが消えた")
 
 class ExcludedPageSkipsTheSectionAuditTest(unittest.TestCase):
-    """T8b-2 の既知の穴（simplify 評審 Altitude F3）。**T9 の完了条件**。
+    """T8b-2 の既知の穴（simplify 評審 Altitude F3）。**独立課題として持ち越し中**。
 
     `_yield_page_results` は去向が EXCLUDE なら早期 return するので、
     その頁では区画突合が消費されない。今それが安全なのは
@@ -363,8 +363,14 @@ class ExcludedPageSkipsTheSectionAuditTest(unittest.TestCase):
     local_test 双方の制御フローと「同一頁に監査 2 行」の語義を決める必要が
     あり、T8b の範囲を超える（趙の拍板事項）。
 
-    **T9 でこの装飾子を外すこと。** 外し忘れると `unexpectedSuccesses=1` で
-    赤くなる（`RiboPageZeroBaselineTest` と同じ運用）。
+    **旧記述の訂正（2026-08-21）**: かつてここには「T9 でこの装飾子を外すこと」
+    と書いてあった。趙は 2026-08-21 に**この 1 件を T9 から分離し、独立課題として
+    持ち越す**ことを裁定した（T9 の残りより T11 の機械判定を先に通すため）。
+    よってこれは「T9 の完了条件」ではない。着手時期は TBD。経緯は
+    `docs/plans/2026-08-21-t11-e2e-machine-verdict.md` §3.4。
+
+    **課題そのものは生きている。** 塞ぐときは装飾子を外すこと。外し忘れると
+    `unexpectedSuccesses=1` で赤くなる（`RiboPageZeroBaselineTest` と同じ運用）。
     """
 
     @unittest.expectedFailure
