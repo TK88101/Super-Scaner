@@ -42,3 +42,4 @@ benchmark_results*.txt
 # memory に顧客の Drive / Sheets 識別子が入る。CLAUDE.md の「密钥文件绝不提交」
 # と同性質なので git 管理に載せない。2026-08-20 趙拍板）
 .claude/
+dump/
