@@ -33,6 +33,7 @@ AUDIT_HEADERS = ["日時", "ファイル名", "ページ", "判定", "理由", "
 AUDIT_VERDICT_EXCLUDED = "除外"   # 仕訳を作らず MF 区にも書かなかったページ
 AUDIT_VERDICT_BRANCH = "分岐"     # MF には正常記帳したが封筒シグナルも命中した
 AUDIT_VERDICT_MISSING = "欠落"    # 一度も出力されなかったページ（無音欠落の疑い）
+AUDIT_VERDICT_TOTAL_MISMATCH = "合計不一致"  # 券面の請求合計と明細の和が食い違う
 
 if not AUDIT_TAB_NAME.startswith("_"):
     # import 時に落とす。命名規約を破ると監査タブが毎晩 22:00 に GAS へ削除され、
@@ -219,6 +220,29 @@ def _ja_page_coverage_gap(arg):
     return "%s ページが一度も出力されませんでした" % arg.strip("[]")
 
 
+def _ja_file_total_mismatch(arg):
+    """`file_total_mismatch:<券面>/<明細>/<差>`。**行が消えた疑い**を先に言う。
+
+    この行が出る典型は「明細が 1 行取れていない」であって、
+    金額の誤りではない。人に見てほしいのは原票との突合であり、
+    記帳内容を疑って時間を溶かしてほしいわけではない。
+    """
+    try:
+        printed, detail, diff = arg.split("/")
+        return ("券面の請求合計 %s 円に対し明細の合計は %s 円です（差 %s 円）。"
+                "行が取れていない可能性があるので原票と突合してください"
+                % (_ja_yen(printed), _ja_yen(detail), _ja_yen(diff)))
+    except Exception:                    # noqa: BLE001 — 監査行を守る
+        return "券面の合計と明細の合計が食い違っています（%s）" % arg
+
+
+def _ja_yen(text):
+    try:
+        return "{:,}".format(int(text))
+    except (TypeError, ValueError):
+        return str(text)
+
+
 def _ja_duplicate_page(arg):
     """`duplicate_page:<元の頁>`。**記帳しなかった**ことを先に言う。"""
     return "%s ページ目と同じ内容のため記帳していません" % arg
@@ -278,6 +302,7 @@ _AUDIT_REASON_JA_PARAM = {
     "section_undercount": _ja_section_undercount,
     "section_rows_missing": _ja_section_rows_missing,
     "page_coverage_gap": _ja_page_coverage_gap,
+    "file_total_mismatch": _ja_file_total_mismatch,
     "duplicate_page": _ja_duplicate_page,
     "dup_key_conflict": _ja_dup_key_conflict,
     "dup_content_only": _ja_dup_content_only,

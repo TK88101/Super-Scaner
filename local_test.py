@@ -40,7 +40,9 @@ load_dotenv()
 
 from ocr_engine import process_pipeline
 from sheets_output import (AUDIT_VERDICT_BRANCH, AUDIT_VERDICT_EXCLUDED,
-                           AUDIT_VERDICT_MISSING, SheetsOutputWriter)
+                           AUDIT_VERDICT_MISSING,
+                           AUDIT_VERDICT_TOTAL_MISMATCH, SheetsOutputWriter)
+import card_file_recon
 from ocr_engine import EXCLUDE_DEST_AUDIT_TAB, EXCLUDE_DEST_MF_TAB
 from doc_types import DocType, DOC_TYPE_CONFIG
 import config
@@ -136,6 +138,8 @@ def process_local_file(file_info, sheets_writer, strategy=None, start_page=1):
     # 「出力された頁」であり、欠落ではない。
     seen_page_nums = set()
     last_total_pages = 0
+    # ファイル単位の突合（Plan B-4）。main.process_file と同じ持ち方。
+    file_recon_obs = []
 
     for page in process_pipeline(file_path, doc_type=doc_type, ocr_strategy=strategy, start_page=start_page):
         r = page["result"]
@@ -144,6 +148,11 @@ def process_local_file(file_info, sheets_writer, strategy=None, start_page=1):
         seen_page_nums.add(page_num)
         last_total_pages = total_pages
         count += 1
+
+        # 除外頁・重複頁の観測も要る（`continue` より前で拾う）。
+        observation = r.get("_file_recon")
+        if observation is not None:
+            file_recon_obs.append(observation)
         # 再試可能なページエラーは Sheets へ書き込まない
         # （全頁失敗時は Failed を返しファイルを保持するため、
         #  次回再試行で同じページの占位行が重複生成されるのを防ぐ）
@@ -343,6 +352,13 @@ def process_local_file(file_info, sheets_writer, strategy=None, start_page=1):
         except Exception as e:
             print(f"⚠️ 部分エラー占位行の書き込み失敗: {e}")
         print(f"⚠️ 部分ページエラー: {error_pages}/{count}頁失敗 [{failed_pages_str}]（ファイルは歸檔、失敗頁は手動再スキャン要）")
+
+    # ファイル単位の突合（Plan B-4）。**main.process_file と同じ関数**を呼ぶ。
+    # 片方だけ直すと漂移する（`test_card_file_recon_wiring` が縛る）。
+    card_file_recon.report_and_record(
+        file_recon_obs, doc_type, file_name, "",
+        sheets_writer, AUDIT_VERDICT_TOTAL_MISMATCH,
+        had_page_errors=error_pages > 0)
 
     # 処理済みフォルダへ移動
     dest = os.path.join(PROCESSED_DIR, file_name)

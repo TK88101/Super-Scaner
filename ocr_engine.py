@@ -22,6 +22,7 @@ from doc_types import (DocType, DOC_TYPE_CONFIG, DOC_TYPE_TAB_SUFFIX,
 import card_entries
 import card_file_state
 import card_prompts
+import card_file_recon
 import card_salvage
 import page_family
 from receipt_aggregation import (
@@ -2331,6 +2332,38 @@ def _apply_page_audit_signal(results, signal, ocr_text):
         yield r
 
 
+def _with_file_recon(results, doc_type, raw_data, page_num, disposition):
+    """先頭 result にだけファイル検算の観測を載せる（Plan AD-3）。
+
+    **1 物理頁につき観測は最大 1 個**。`_yield_line_mode_results` は明細
+    result の後に行欠け提示用の `_blank_result` を追加で yield するので、
+    全 result に載せると同じ頁を二重に数える（Codex 評審 中-3）。
+
+    card 系以外の doc_type では**何も載せない** —— 既存 4 型の result は
+    1 バイトも変わらない（`RECON_POLICY` が n/a なので載せても無意味）。
+
+    `entries` には触れない。新しい dict を作って足すだけで、記帳に使う値は
+    1 バイトも変えない（`test_ocr_engine_file_recon` の snapshot 番人が固定）。
+    """
+    if doc_type not in page_family.CC_FAMILY_DOC_TYPES:
+        yield from results
+        return
+    # **「重複」だけでは足りない。「記帳されなかった」ことが条件**
+    # （codex 評審 2026-08-21）。`CREDIT_CARD_DEDUP_MODE="mark"` では
+    # `resolve_page_disposition` が重複頁を `ACTION_BOOK` のまま
+    # `is_duplicate=True` にする（`page_family.py:695`）——つまり明細は
+    # Sheets に**書かれる**。それを検算の両辺から落とすと、検算が突合して
+    # いる集合と Sheets の中身が食い違い、不一致を隠したり偽の不一致を
+    # 出したりする。落としてよいのは除外された頁だけ。
+    skip = (getattr(disposition, "is_duplicate", False)
+            and getattr(disposition, "action", None)
+            == page_family.ACTION_EXCLUDE)
+    observation = card_file_recon.observe_page(
+        raw_data, doc_type, page_num or 0, is_duplicate=bool(skip))
+    for i, r in enumerate(results):
+        yield {**r, "_file_recon": observation} if i == 0 else r
+
+
 def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
                         envelope_filter=False, page_class=None,
                         state=None, page_num=None):
@@ -2497,9 +2530,11 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
         doc_type, page_class, result, raw_data, prefix, dedup_verdict)
     if disposition is not None and disposition.action == page_family.ACTION_EXCLUDE:
         # 無音にはしない。呼出側（main / local_test）が監査タブへ回す。
-        yield _blank_result(memo=_exclusion_memo(disposition),
-                            _ocr_text_len=len(ocr_text or ""),
-                            **page_family.exclusion_fields(disposition))
+        yield from _with_file_recon(
+            [_blank_result(memo=_exclusion_memo(disposition),
+                           _ocr_text_len=len(ocr_text or ""),
+                           **page_family.exclusion_fields(disposition))],
+            doc_type, raw_data, page_num, disposition)
         return
 
     # **記帳できた頁だけ**索引に登録する。`_unrecognized` に終わった頁を
@@ -2518,12 +2553,14 @@ def _yield_page_results(doc_type, raw_data, ocr_text, ocr_conf, prefix="",
     # T8b-2: 区画の取りこぼしを Gemini の外から突合し、監査タブへ載せる。
     # **記帳は止めない**（IP-401 / 趙拍板 2026-08-19）。ここは薄い接線で、
     # 判定条件は 1 つも持たない（`_resolve_card_disposition` と同じ方針）。
-    yield from _apply_page_audit_signal(
-        _yield_line_mode_results(result, raw_data, ocr_text, prefix),
-        _merge_audit_signals(
-            anchor_signal,
-            _page_audit_signal(disposition, doc_type, ocr_text, raw_data)),
-        ocr_text)
+    yield from _with_file_recon(
+        _apply_page_audit_signal(
+            _yield_line_mode_results(result, raw_data, ocr_text, prefix),
+            _merge_audit_signals(
+                anchor_signal,
+                _page_audit_signal(disposition, doc_type, ocr_text, raw_data)),
+            ocr_text),
+        doc_type, raw_data, page_num, disposition)
 
 
 def _yield_line_mode_results(result, raw_data, ocr_text, prefix=""):

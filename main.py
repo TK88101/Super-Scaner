@@ -22,8 +22,9 @@ from ocr_engine import (
 from sheets_output import (
     APPEND_RESULT_PLACEHOLDER,
     AUDIT_VERDICT_BRANCH, AUDIT_VERDICT_EXCLUDED, AUDIT_VERDICT_MISSING,
-    JST, SheetsOutputWriter,
+    AUDIT_VERDICT_TOTAL_MISMATCH, JST, SheetsOutputWriter,
 )
+import card_file_recon
 from notifier import send_notification
 from doc_types import DocType, DOC_TYPE_CONFIG
 from page_progress import (
@@ -501,6 +502,9 @@ def _process_file_impl(service, sheets_writer, file_path, uploader_name,
 
     seen_page_nums = set()
     last_total_pages = 0
+    # ファイル単位の突合（Plan B-4）。producer が頁ごとに載せた観測を溜め、
+    # EOF で 1 度だけ結算する。**歸檔される経路でしか結算しない**（AD-6）。
+    file_recon_obs = []
 
     for page in process_pipeline(file_path, doc_type=doc_type):
         result = page["result"]
@@ -509,6 +513,12 @@ def _process_file_impl(service, sheets_writer, file_path, uploader_name,
         seen_page_nums.add(page_num)
         last_total_pages = total_pages
         count += 1
+
+        # 除外頁・重複頁の観測も要る（重複は「足さない」ために数える）。
+        # `continue` する経路より**前**で拾う。
+        observation = result.get("_file_recon")
+        if observation is not None:
+            file_recon_obs.append(observation)
 
         def _emit(outcome, reason):
             # 頁終局の進捗発射を一点に集約（発射時 UTC の刻印込み）。同一
@@ -707,6 +717,15 @@ def _process_file_impl(service, sheets_writer, file_path, uploader_name,
             file_status = STATUS_COMPLETED_COVERAGE_GAP
         else:
             file_status = STATUS_COMPLETED
+        # ファイル単位の突合（Plan B-4 / AD-6）。ここは `count > 0` の内側で
+        # `return True` の直前 —— つまり**ファイルが歸檔される経路だけ**。
+        # 全頁失敗（保持）や count==0 で呼ぶと、再スキャンのたびに監査タブへ
+        # 同じ行が増える（CLAUDE.md §3 の冪等要求）。
+        card_file_recon.report_and_record(
+            file_recon_obs, doc_type, filename, base_url,
+            sheets_writer, AUDIT_VERDICT_TOTAL_MISMATCH,
+            had_page_errors=error_pages > 0)
+
         progress.file_finished(file_status)
         return True
     else:
